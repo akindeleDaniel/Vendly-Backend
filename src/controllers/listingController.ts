@@ -19,3 +19,8 @@ export const updateListing = (req:Request, res:Response) =>{
     const updates = req.body
     res.send(`Listing ${id} would be updated with: ${JSON.stringify(updates)}`)
 }
+
+export const deleteListing = (req:Request, res:Response) =>{
+    const id = req.params.id
+    res.send(`Listing ${id} has been deleted`)
+}
