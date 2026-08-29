@@ -3,6 +3,7 @@ import listingRoutes from "./routes/listingRoutes.js"
 
 const app = express()
 
+app.use(express.json())
 app.use("/listings", listingRoutes)
 
 app.listen(3000, () => {
