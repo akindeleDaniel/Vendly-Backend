@@ -1,7 +1,9 @@
 import type { Request, Response } from "express";
+import prisma from "../lib/prisma.js";
 
-export const getAllListings = (req:Request, res:Response) =>{
-    res.send("This will be the listing endpoint")
+export const getAllListings = async (req:Request, res:Response) =>{
+    const listings = await prisma.listing.findMany()
+    res.send(listings)
 }
 
 export const getListingById  = (req:Request, res:Response) =>{
