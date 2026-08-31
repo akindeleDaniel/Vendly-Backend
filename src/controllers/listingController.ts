@@ -43,7 +43,12 @@ export const updateListing = async(req:Request, res:Response) =>{
     }
 }
 
-export const deleteListing = (req:Request, res:Response) =>{
-    const id = req.params.id
-    res.send(`Listing ${id} has been deleted`)
+export const deleteListing = async(req:Request, res:Response) =>{
+    const id = Number(req.params.id)
+    try{
+        await prisma.listing.delete({where: {id}})
+        res.send("Listing deleted successfully")
+    }catch(error){
+        res.status(404).send("Listing not found")
+    }
 }
