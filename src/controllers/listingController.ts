@@ -8,9 +8,15 @@ export const getAllListings = async (req:Request, res:Response) =>{
     res.send(listings)
 }
 
-export const getListingById  = (req:Request, res:Response) =>{
-    const id = req.params.id
-    res.send(`This will return listing number ${id}`)
+export const getListingById  = async (req:Request, res:Response) =>{
+    const id = Number(req.params.id)
+    const specificData = await prisma.listing.findUnique({where:{id}})
+
+    if(!specificData){
+        res.status(404).send("Listing not found")
+    }
+    
+    res.send(specificData)
 }
 
 export const createListing = async(req: Request, res:Response) =>{
