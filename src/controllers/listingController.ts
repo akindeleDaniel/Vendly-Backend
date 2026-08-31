@@ -1,9 +1,23 @@
 import type { Request, Response } from "express";
 import prisma from "../lib/prisma.js";
+import { Prisma } from "../generated/prisma/client.js";
 
 
 export const getAllListings = async (req:Request, res:Response) =>{
-    const listings = await prisma.listing.findMany()
+    const {category, search} = req.query
+    const filters:Prisma.ListingWhereInput /* a type that prisma created to fit this variable properly  it can be gotten from the erro description if it shows an error*/= {}
+    if(category){
+        filters.category = {contains: String(category), mode:"insensitive"}
+    }
+
+    if (search){
+        filters.title = {contains: String(search), mode:"insensitive"}
+    }
+
+    const listings =await prisma.listing.findMany({
+        where:filters
+    })
+
     res.send(listings)
 }
 
