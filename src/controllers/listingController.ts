@@ -1,5 +1,7 @@
 import type { Request, Response } from "express";
 import prisma from "../lib/prisma.js";
+import { stringify } from "node:querystring";
+import { title } from "node:process";
 
 export const getAllListings = async (req:Request, res:Response) =>{
     const listings = await prisma.listing.findMany()
@@ -11,9 +13,15 @@ export const getListingById  = (req:Request, res:Response) =>{
     res.send(`This will return listing number ${id}`)
 }
 
-export function createListing(req: Request, res:Response){
+export const createListing = async(req: Request, res:Response) =>{
     const {title, description, price, category} = req.body
-    res.send (`Received listing: ${title}, ${description}, ${price}, ${category}`)
+    const newListing = await prisma.listing.create({data:{
+        title,
+        description,
+        price,
+        category
+    }})
+    res.send (newListing)
 }
 
 export const updateListing = (req:Request, res:Response) =>{
