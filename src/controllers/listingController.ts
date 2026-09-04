@@ -23,10 +23,16 @@ export const getAllListings = async (req:Request, res:Response) =>{
 
 export const getListingById  = async (req:Request, res:Response) =>{
     const id = Number(req.params.id)
+
+    if(isNaN(id)){
+        res.status(400).send("Id has to be a number")
+        return
+    }
     const specificData = await prisma.listing.findUnique({where:{id}})
 
     if(!specificData){
         res.status(404).send("Listing not found")
+        return
     }
 
     res.send(specificData)
@@ -34,18 +40,54 @@ export const getListingById  = async (req:Request, res:Response) =>{
 
 export const createListing = async(req: Request, res:Response) =>{
     const {title, description, price, category} = req.body
-    const newListing = await prisma.listing.create({data:{
-        title,
-        description,
-        price,
-        category
-    }})
-    res.send (newListing)
+
+    if(!title || !description || !price || !category){
+        res.status(400).send("All areas must be filled")
+        return
+    }
+
+    if(isNaN(Number(price))){
+        res.status(400).send("Price has to be a number")
+        return
+    }
+
+    try{
+        const newListing = await prisma.listing.create({data:{
+            title,
+            description,
+            price: Number(price),
+            category
+        }})
+        res.send (newListing)
+    }catch(error){
+        res.status(500).send("Sorry there is an issue on our end")
+    }
+
 }
 
 export const updateListing = async(req:Request, res:Response) =>{
     const id = Number(req.params.id)
     const updates = req.body
+
+
+
+    if(isNaN(id)){
+        res.status(400).send("Id has to be a number")
+        return
+    }
+
+    if (updates.price !== undefined) {
+        if (isNaN(Number(updates.price))) {
+            res.status(400).send("Price has to be a number");
+            return;
+        }
+        if (Number(updates.price) === 0) {
+            res.status(400).send("Price cannot be 0");
+            return;
+        }
+        updates.price = Number(updates.price)
+    }
+
     try{
         const updatedListing = await prisma.listing.update({
             where:{id},
@@ -59,6 +101,12 @@ export const updateListing = async(req:Request, res:Response) =>{
 
 export const deleteListing = async(req:Request, res:Response) =>{
     const id = Number(req.params.id)
+
+     if(isNaN(id)){
+        res.status(400).send("Id has to be a number")
+        return
+    }
+
     try{
         await prisma.listing.delete({where: {id}})
         res.send("Listing deleted successfully")
