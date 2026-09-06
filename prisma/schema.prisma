@@ -21,5 +21,15 @@ model Listing {
   price Float
   category String
   createdAt DateTime @default(now())
+  userId Int
+  user User @relation(fields: [userId], references:[id])
+}
+
+model User {
+  id Int @id @default(autoincrement())
+  name String
+  email String @unique
+  passwordHash String
+  listings Listing[]
 }
 //npx prisma migrate dev --name init (run this command to actually migrate the schema into the database)
