@@ -29,7 +29,6 @@ export const getListingById  = async (req:Request, res:Response) =>{
         return
     }
     const specificData = await prisma.listing.findUnique({where:{id}})
-
     if(!specificData){
         res.status(404).send("Listing not found")
         return
