@@ -52,6 +52,7 @@ export const createListing = async(req: Request, res:Response) =>{
 
     try{
         const newListing = await prisma.listing.create({data:{
+            userId: req.user!.id,
             title,
             description,
             price: Number(price),
