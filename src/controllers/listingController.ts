@@ -137,3 +137,16 @@ export const deleteListing = async(req:Request, res:Response) =>{
         res.status(500).send("Sorry there is an issue on our end")
     }
 }
+
+export const getMyListings = async(req:Request, res:Response) =>{
+    const id = req.user!.id
+
+    try{
+        const listings =await prisma.listing.findMany({
+            where: {userId: id}
+        })
+        res.send(listings)
+    }catch(error){
+        res.status(500).send("Sorry there is an issue on our end")
+    }
+}
