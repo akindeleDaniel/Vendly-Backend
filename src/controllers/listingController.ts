@@ -69,11 +69,21 @@ export const updateListing = async(req:Request, res:Response) =>{
     const id = Number(req.params.id)
     const updates = req.body
 
-
-
     if(isNaN(id)){
         res.status(400).send("Id has to be a number")
         return
+    }
+    
+    const listing = await prisma.listing.findUnique({ where: { id } });
+
+    if (!listing) {
+        res.status(404).send("Listing not found");
+        return;
+    }
+
+    if (listing.userId !== req.user!.id) {
+        res.status(403).send("You are not allowed to edit this listing");
+        return;
     }
 
     if (updates.price !== undefined) {
@@ -95,7 +105,7 @@ export const updateListing = async(req:Request, res:Response) =>{
         })//whenever you use prisma.anything it returns the value 
         res.send(updatedListing)
     }catch (error){
-        res.status(404).send("Listing not found")
+        res.status(500).send("Sorry there is an issue on our end")
     }
 }
 
@@ -107,10 +117,23 @@ export const deleteListing = async(req:Request, res:Response) =>{
         return
     }
 
+    const listing = await prisma.listing.findUnique({ where: { id } });
+
+    if (!listing) {
+        res.status(404).send("Listing not found");
+        return;
+    }
+
+    if (listing.userId !== req.user!.id) {
+        res.status(403).send("You are not allowed to delete this listing");
+        return;
+    }
+
+
     try{
         await prisma.listing.delete({where: {id}})
         res.send("Listing deleted successfully")
     }catch(error){
-        res.status(404).send("Listing not found")
+        res.status(500).send("Sorry there is an issue on our end")
     }
 }
