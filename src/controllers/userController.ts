@@ -60,6 +60,11 @@ export const loginUser = async(req: Request, res: Response) =>{
     }
     const token = jwt.sign({id: existingUser.id}, process.env.JWT_SECRET, {expiresIn:"1h"})
 
-    
-    res.send({message: "Login Successful", token})
+    res.cookie("token", token, {
+        httpOnly:true,
+        secure: process.env.NODE_ENV === "production", // tells the cookie that for development it doesn't need to be secure, but for production it will need to be secure
+        sameSite:"lax",
+        maxAge: 3600000
+    })
+    res.send({message: "Login Successful"})
 }

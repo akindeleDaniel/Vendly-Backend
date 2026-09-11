@@ -3,17 +3,10 @@ import jwt from "jsonwebtoken"
 
 export function authMiddleware (req: Request, res:Response, next:NextFunction){
     
-    const authHeader = req.headers.authorization
-    if(!authHeader){
-        res.status(401).send("Login first")
-        return
-    }
-
+    const cookieToken = req.cookies.token
     
-    const token = authHeader.split(" ")[1]
-
-    if(!token){
-        res.status(400).send("Error occured")
+    if(!cookieToken){
+        res.status(401).send("Login first")
         return
     }
 
@@ -23,7 +16,7 @@ export function authMiddleware (req: Request, res:Response, next:NextFunction){
             throw new Error("JWT_SECRET is not set");
         }
 
-        const decoded = jwt.verify(token, process.env.JWT_SECRET)
+        const decoded = jwt.verify(cookieToken, process.env.JWT_SECRET)
 
         req.user = decoded as {id: number}
         next()
