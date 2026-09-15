@@ -68,3 +68,7 @@ export const loginUser = async(req: Request, res: Response) =>{
     })
     res.send({message: "Login Successful"})
 }
+
+export const checkAuth = (req: Request, res: Response) => {
+    res.send({message: "Authenticated"})   
+}
