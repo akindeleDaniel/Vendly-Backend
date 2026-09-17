@@ -26,6 +26,18 @@ export const createUser = async(req: Request, res: Response) => {
             email,
             passwordHash
         }})
+
+        if (!process.env.JWT_SECRET) {
+            throw new Error("JWT_SECRET is not set");
+        }
+        const token = jwt.sign({id: newUser.id}, process.env.JWT_SECRET, {expiresIn:"1h"})
+
+        res.cookie("token", token, {
+            httpOnly:true,
+            secure: process.env.NODE_ENV === "production",
+            sameSite:"lax",
+            maxAge: 3600000
+        })
         res.send({message:"Registration successful"})
     }catch(error){
         res.status(500).send({message:"Sorry there is an issue on our end"})

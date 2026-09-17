@@ -71,7 +71,7 @@ export const updateListing = async(req:Request, res:Response) =>{
 
     if(isNaN(id)){
         res.status(400).send({message:"Id has to be a number"})
-        return
+        return 
     }
     
     const listing = await prisma.listing.findUnique({ where: { id } });
