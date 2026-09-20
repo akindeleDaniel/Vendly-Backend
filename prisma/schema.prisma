@@ -31,5 +31,11 @@ model User {
   email String @unique
   passwordHash String
   listings Listing[]
+  role Role  
+}
+
+enum Role {
+  CONSUMER
+  SELLER
 }
 //npx prisma migrate dev --name init (run this command to actually migrate the schema into the database)
