@@ -4,9 +4,9 @@ import type { Request, Response } from "express"
 import jwt from "jsonwebtoken"
 
 export const createUser = async(req: Request, res: Response) => {
-    const {name, email, password} = req.body
+    const {name, email, password, role} = req.body
 
-    if(!name || !email || !password){
+    if(!name || !email || !password || !role){
         res.status(400).send({message:"All areas are required"})
         return
     }
@@ -24,7 +24,8 @@ export const createUser = async(req: Request, res: Response) => {
         const newUser = await prisma.user.create({data:{
             name,
             email,
-            passwordHash
+            passwordHash,
+            role
         }})
 
         if (!process.env.JWT_SECRET) {
@@ -78,7 +79,10 @@ export const loginUser = async(req: Request, res: Response) =>{
         sameSite:"lax",
         maxAge: 3600000
     })
-    res.send({message: "Login Successful"})
+    res.send({
+        message: "Login Successful",
+        role: existingUser.role
+    })
 }
 
 export const checkAuth = (req: Request, res: Response) => {
