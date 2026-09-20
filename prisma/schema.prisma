@@ -31,11 +31,21 @@ model User {
   email String @unique
   passwordHash String
   listings Listing[]
-  role Role  
+  role Role 
+  sellerProfile SellerProfile?  
 }
 
 enum Role {
   CONSUMER
   SELLER
+}
+
+model SellerProfile {
+  id Int @id @default(autoincrement())
+  userId Int @unique
+  user User @relation(fields: [userId], references: [id])
+  businessName String
+  location String
+  logoUrl String
 }
 //npx prisma migrate dev --name init (run this command to actually migrate the schema into the database)

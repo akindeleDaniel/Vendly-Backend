@@ -1,0 +1,37 @@
+import prisma from "../lib/prisma.js"
+import type { Request, Response } from "express"
+import { Prisma } from "../generated/prisma/client.js"
+
+
+export const createSeller = async(req: Request, res: Response) => {
+    const {businessName, location, logoUrl} = req.body
+
+    if(!businessName || !location || !logoUrl){
+        res.status(400).send({message:"All areas are required"})
+        return
+    }
+
+    const user = await prisma.user.findUnique({where:{id: req.user!.id}})
+
+    if(!user || user.role !== "SELLER"){
+        res.status(403).send({message:"Only sellers can create a store profile"})
+        return
+    }
+
+    try{
+        await prisma.sellerProfile.create({data:{
+            userId: req.user!.id,
+            businessName,
+            location,
+            logoUrl
+        }})
+        res.status(201).send({message:"Seller profile created"})
+    }catch(error){
+        if(error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002"){
+            res.status(400).send({message: "You already have a seller profile"})
+            return
+        }
+
+        res.status(500).send({message:"Sorry there is an issue on our end"})
+    }
+}
