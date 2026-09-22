@@ -1,5 +1,6 @@
 import type { Request, Response } from "express"
 import prisma from "../lib/prisma.js"
+import shuffleArray from "../lib/shuffle.js"
 import { Prisma } from "../generated/prisma/client.js"
 
 const allowedCategories = ["Food", "Fashion", "Electronics", "Groceries", "Home", "Beauty", "Other"]
@@ -24,7 +25,7 @@ export const getAllListings = async (req:Request, res:Response) =>{
         where:filters
     })
 
-    res.send(listings)
+    res.send(shuffleArray(listings))
 }
 
 export const getListingById  = async (req:Request, res:Response) =>{
