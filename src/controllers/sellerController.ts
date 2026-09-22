@@ -1,6 +1,7 @@
 import prisma from "../lib/prisma.js"
 import type { Request, Response } from "express"
 import { Prisma } from "../generated/prisma/client.js"
+import { makeSlug } from "../lib/generateSlug.js"
 
 export const createSeller = async(req: Request, res: Response) => {
     const {businessName, location, logoUrl} = req.body
@@ -10,12 +11,20 @@ export const createSeller = async(req: Request, res: Response) => {
         return
     }
 
+    let slug = makeSlug(businessName)
+    const existingSlug = await prisma.sellerProfile.findUnique({where:{slug}})
+
+    if(existingSlug){
+        slug = `${slug}-${req.user!.id}`
+    }
+
     try{
         await prisma.sellerProfile.create({data:{
             userId: req.user!.id,
             businessName,
             location,
-            logoUrl
+            logoUrl,
+            slug
         }})
         res.status(201).send({message:"Seller profile created"})
     }catch(error){

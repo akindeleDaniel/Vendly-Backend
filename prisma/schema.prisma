@@ -48,5 +48,6 @@ model SellerProfile {
   businessName String
   location String
   logoUrl String
+  slug String @unique
 }
 //npx prisma migrate dev --name init (run this command to actually migrate the schema into the database)
