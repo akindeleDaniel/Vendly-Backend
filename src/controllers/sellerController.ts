@@ -80,3 +80,27 @@ export const updateSeller = async(req: Request, res: Response) => {
         res.status(500).send({message:"Sorry there is an issue on our end"})
     }
 }
+
+export const getPublicShop = async (req: Request, res: Response) => {
+    const slug = String(req.params.slug)
+
+    try{
+        const profile = await prisma.sellerProfile.findUnique({where:{slug}})
+
+        if(!profile){
+            res.status(404).send({message:"Store not found"})
+            return
+        }
+
+        const listings = await prisma.listing.findMany({
+            where:{userId: profile.userId}
+        })
+
+        res.send({
+            profile,
+            listings
+        })
+    }catch(error){
+        res.status(500).send({message:"Sorry there is an issue on our end"})
+    }
+}
