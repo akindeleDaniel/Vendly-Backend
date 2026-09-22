@@ -9,3 +9,5 @@ function shuffleArray<T>(array: T[]): T[] {
 }
 
 export default shuffleArray
+
+//this loop or shuffle is called the Fisher-Yates shuffleArray
