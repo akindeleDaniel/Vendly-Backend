@@ -20,6 +20,7 @@ model Listing {
   description String
   price Float
   category String
+  imageUrl String
   createdAt DateTime @default(now())
   userId Int
   user User @relation(fields: [userId], references:[id])

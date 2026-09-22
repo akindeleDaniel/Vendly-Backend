@@ -1,7 +1,13 @@
-import type { Request, Response } from "express";
-import prisma from "../lib/prisma.js";
-import { Prisma } from "../generated/prisma/client.js";
+import type { Request, Response } from "express"
+import prisma from "../lib/prisma.js"
+import { Prisma } from "../generated/prisma/client.js"
 
+const allowedCategories = ["Food", "Fashion", "Electronics", "Groceries", "Home", "Beauty", "Other"]
+
+function isInvalidPrice(price: unknown){
+    const amount = Number(price)
+    return isNaN(amount) || amount <= 0
+}
 
 export const getAllListings = async (req:Request, res:Response) =>{
     const {category, search} = req.query
@@ -38,15 +44,20 @@ export const getListingById  = async (req:Request, res:Response) =>{
 }
 
 export const createListing = async(req: Request, res:Response) =>{
-    const {title, description, price, category} = req.body
+    const {title, description, price, category, imageUrl} = req.body
 
-    if(!title || !description || !price || !category){
+    if(!title || !description || !price || !category || !imageUrl){
         res.status(400).send({message:"All areas must be filled"})
         return
     }
 
-    if(isNaN(Number(price))){
-        res.status(400).send({message:"Price has to be a number"})
+    if(isInvalidPrice(price)){
+        res.status(400).send({message:"Price must be a number greater than 0"})
+        return
+    }
+
+    if(!allowedCategories.includes(category)){
+        res.status(400).send({message:"Category is not valid"})
         return
     }
 
@@ -56,9 +67,10 @@ export const createListing = async(req: Request, res:Response) =>{
             title,
             description,
             price: Number(price),
-            category
+            category,
+            imageUrl
         }})
-        res.send(newListing)
+        res.status(201).send(newListing)
     }catch(error){
         res.status(500).send({message:"Sorry there is an issue on our end"})
     }
@@ -67,41 +79,71 @@ export const createListing = async(req: Request, res:Response) =>{
 
 export const updateListing = async(req:Request, res:Response) =>{
     const id = Number(req.params.id)
-    const updates = req.body
+    const {title, description, price, category, imageUrl} = req.body
 
     if(isNaN(id)){
         res.status(400).send({message:"Id has to be a number"})
         return 
     }
     
-    const listing = await prisma.listing.findUnique({ where: { id } });
+    const listing = await prisma.listing.findUnique({ where: { id } })
 
     if (!listing) {
-        res.status(404).send({message:"Listing not found"});
-        return;
+        res.status(404).send({message:"Listing not found"})
+        return
     }
 
     if (listing.userId !== req.user!.id) {
-        res.status(403).send({message:"You are not allowed to edit this listing"});
-        return;
+        res.status(403).send({message:"You are not allowed to edit this listing"})
+        return
     }
 
-    if (updates.price !== undefined) {
-        if (isNaN(Number(updates.price))) {
-            res.status(400).send({message:"Price has to be a number"});
-            return;
+    if (price !== undefined) {
+        if (isInvalidPrice(price)) {
+            res.status(400).send({message:"Price must be a number greater than 0"})
+            return
         }
-        if (Number(updates.price) === 0) {
-            res.status(400).send({message:"Price cannot be 0"});
-            return;
-        }
-        updates.price = Number(updates.price)
+    }
+
+    if (category !== undefined && !allowedCategories.includes(category)) {
+        res.status(400).send({message:"Category is not valid"})
+        return
+    }
+
+    if (imageUrl === "" || category === "" || title === "" ||description
+        === ""
+    ) {
+        res.status(400).send({message:"All areas must be filled"})
+        return
+    }
+
+    const data: Prisma.ListingUpdateInput = {}
+
+    if (title !== undefined) {
+        data.title = title
+    }
+    if (description !== undefined) {
+        data.description = description
+    }
+    if (price !== undefined) {
+        data.price = Number(price)
+    }
+    if (category !== undefined) {
+        data.category = category
+    }
+    if (imageUrl !== undefined) {
+        data.imageUrl = imageUrl
+    }
+
+    if (Object.keys(data).length === 0) {
+        res.status(400).send({message:"Provide at least one field to update"})
+        return
     }
 
     try{
         const updatedListing = await prisma.listing.update({
             where:{id},
-            data: updates
+            data
         })//whenever you use prisma.anything it returns the value 
         res.send(updatedListing)
     }catch (error){
@@ -117,16 +159,16 @@ export const deleteListing = async(req:Request, res:Response) =>{
         return
     }
 
-    const listing = await prisma.listing.findUnique({ where: { id } });
+    const listing = await prisma.listing.findUnique({ where: { id } })
 
     if (!listing) {
-        res.status(404).send({message:"Listing not found"});
-        return;
+        res.status(404).send({message:"Listing not found"})
+        return
     }
 
     if (listing.userId !== req.user!.id) {
-        res.status(403).send({message:"You are not allowed to delete this listing"});
-        return;
+        res.status(403).send({message:"You are not allowed to delete this listing"})
+        return
     }
 
 
