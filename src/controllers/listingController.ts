@@ -82,7 +82,7 @@ export const createListing = async(req: Request, res:Response) =>{
         res.status(400).send({message:"Category is not valid"})
         return
     }
-    
+
     try{
         const sellerProfile = await prisma.sellerProfile.findUnique({where:{userId: req.user!.id}})
     
@@ -90,7 +90,7 @@ export const createListing = async(req: Request, res:Response) =>{
             res.status(400).send({message:"Set up your store before creating a listing"})
             return
         }
-        
+
         const newListing = await prisma.listing.create({data:{
             userId: req.user!.id,
             title,
