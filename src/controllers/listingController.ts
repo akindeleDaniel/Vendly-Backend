@@ -22,10 +22,31 @@ export const getAllListings = async (req:Request, res:Response) =>{
     }
 
     const listings =await prisma.listing.findMany({
-        where:filters
+        where:filters,
+        include:{
+            user:{
+                select:{
+                    sellerProfile:{
+                        select:{
+                            slug:true,
+                            businessName:true
+                        }
+                    }
+                }
+            }
+        }
     })
 
-    res.send(shuffleArray(listings))
+    const listingsWithShop = listings.map((listing) => {
+        const {user, ...rest} = listing
+        return {
+            ...rest,
+            sellerSlug: user.sellerProfile?.slug ?? null,
+            sellerName: user.sellerProfile?.businessName ?? null
+        }
+    })
+
+    res.send(shuffleArray(listingsWithShop))
 }
 
 export const getListingById  = async (req:Request, res:Response) =>{
@@ -61,8 +82,15 @@ export const createListing = async(req: Request, res:Response) =>{
         res.status(400).send({message:"Category is not valid"})
         return
     }
-
+    
     try{
+        const sellerProfile = await prisma.sellerProfile.findUnique({where:{userId: req.user!.id}})
+    
+        if(!sellerProfile){
+            res.status(400).send({message:"Set up your store before creating a listing"})
+            return
+        }
+        
         const newListing = await prisma.listing.create({data:{
             userId: req.user!.id,
             title,
