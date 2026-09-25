@@ -49,5 +49,7 @@ model SellerProfile {
   location String
   logoUrl String
   slug String @unique
+  latitude Float?
+  longitude Float?
 }
 //npx prisma migrate dev --name init (run this command to actually migrate the schema into the database)
