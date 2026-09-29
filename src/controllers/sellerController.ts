@@ -3,6 +3,7 @@ import type { Request, Response } from "express"
 import { Prisma } from "../generated/prisma/client.js"
 import { makeSlug } from "../lib/generateSlug.js"
 import { buildLocation } from "../lib/nigeriaLocation.js"
+import { geocodeLocation } from "../lib/geocoding.js"
 
 export const createSeller = async(req: Request, res: Response) => {
     const {businessName, state, lga, logoUrl} = req.body
@@ -18,6 +19,8 @@ export const createSeller = async(req: Request, res: Response) => {
         res.status(400).send({ message: "Invalid state or LGA" })
         return
     }
+
+    const coordinates = await geocodeLocation(location)
     
     let slug = makeSlug(businessName)
     const existingSlug = await prisma.sellerProfile.findUnique({where:{slug}})
@@ -34,7 +37,9 @@ export const createSeller = async(req: Request, res: Response) => {
             lga,
             location,
             logoUrl,
-            slug
+            slug,
+            latitude: coordinates?.latitude ?? null,
+            longitude: coordinates?.longitude ?? null
         }})
         res.status(201).send({message:"Seller profile created"})
     }catch(error){
@@ -75,13 +80,6 @@ export const updateSeller = async(req: Request, res: Response) => {
         return
     }
 
-    const location = buildLocation(state, lga)
-
-    if (!location) {
-        res.status(400).send({ message: "Invalid state or LGA" })
-        return
-    }
-
     try{
         const existingProfile = await prisma.sellerProfile.findUnique({
             where:{userId: req.user!.id}
@@ -102,9 +100,19 @@ export const updateSeller = async(req: Request, res: Response) => {
             return
         }
 
+        const locationChanged = newState !== existingProfile.state || newLga !== existingProfile.lga
+        const shouldGeocode = locationChanged || existingProfile.latitude === null || existingProfile.longitude === null
+        const coordinates = shouldGeocode ? await geocodeLocation(location) : null
+        const coordinateData = shouldGeocode
+            ? {
+                latitude: coordinates?.latitude ?? null,
+                longitude: coordinates?.longitude ?? null
+            }
+            : {}
+
         const updatedProfile = await prisma.sellerProfile.update({
             where:{userId: req.user!.id},
-            data:{businessName, state, lga, logoUrl, location}
+            data:{businessName, state, lga, logoUrl, location, ...coordinateData}
         })
 
         res.send(updatedProfile)

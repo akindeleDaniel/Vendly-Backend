@@ -2,17 +2,17 @@ import { lgas, states } from "nigerian-states-and-lgas"
 
 export function buildLocation(state: string, lga: string): string | null {
     if (!state || !lga) {
-        return "All areas are required"
+        return null
     }
 
     const validStates = states()
     if (!validStates.includes(state)) {
-        return "Invalid state or LGA"
+        return null
     }
 
     const lgasInState = lgas(state)
     if (!lgasInState || !lgasInState.includes(lga)) {
-        return "Invalid state or LGA"
+        return null
     }
 
     return `${lga}, ${state}`
