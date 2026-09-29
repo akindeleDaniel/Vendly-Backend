@@ -46,6 +46,8 @@ model SellerProfile {
   userId Int @unique
   user User @relation(fields: [userId], references: [id])
   businessName String
+  state String
+  lga String
   location String
   logoUrl String
   slug String @unique

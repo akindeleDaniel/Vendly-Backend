@@ -2,15 +2,23 @@ import prisma from "../lib/prisma.js"
 import type { Request, Response } from "express"
 import { Prisma } from "../generated/prisma/client.js"
 import { makeSlug } from "../lib/generateSlug.js"
+import { buildLocation } from "../lib/nigeriaLocation.js"
 
 export const createSeller = async(req: Request, res: Response) => {
-    const {businessName, location, logoUrl} = req.body
+    const {businessName, state, lga, logoUrl} = req.body
 
-    if(!businessName || !location || !logoUrl){
+    if(!businessName || !logoUrl || !state || !lga){
         res.status(400).send({message:"All areas are required"})
         return
     }
+    
+    const location = buildLocation(state, lga)
 
+    if (!location) {
+        res.status(400).send({ message: "Invalid state or LGA" })
+        return
+    }
+    
     let slug = makeSlug(businessName)
     const existingSlug = await prisma.sellerProfile.findUnique({where:{slug}})
 
@@ -22,6 +30,8 @@ export const createSeller = async(req: Request, res: Response) => {
         await prisma.sellerProfile.create({data:{
             userId: req.user!.id,
             businessName,
+            state,
+            lga,
             location,
             logoUrl,
             slug
@@ -53,30 +63,52 @@ export const getMySellerProfile = async (req: Request, res: Response) => {
 }
 
 export const updateSeller = async(req: Request, res: Response) => {
-    const {businessName, location, logoUrl} = req.body
+    const {businessName, state, lga, logoUrl} = req.body
 
-    if(businessName === undefined && location === undefined && logoUrl === undefined){
+    if(businessName === undefined && state === undefined && logoUrl === undefined && lga === undefined){
         res.status(400).send({message:"Provide at least one field to update"})
         return
     }
 
-    if(businessName === "" || location === "" || logoUrl === ""){
+    if(businessName === "" || state === "" || logoUrl === "" || lga === ""){
         res.status(400).send({message:"Fields cannot be empty"})
         return
     }
 
+    const location = buildLocation(state, lga)
+
+    if (!location) {
+        res.status(400).send({ message: "Invalid state or LGA" })
+        return
+    }
+
     try{
-        const updatedProfile = await prisma.sellerProfile.update({
-            where:{userId: req.user!.id},
-            data:{businessName, location, logoUrl}
+        const existingProfile = await prisma.sellerProfile.findUnique({
+            where:{userId: req.user!.id}
         })
-        res.send(updatedProfile)
-    }catch(error){
-        if(error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2025"){
-            res.status(404).send({message:"Store profile not found"})
+
+        if(!existingProfile){
+            res.status(404).send({ message: "Store profile not found" })
             return
         }
 
+        const newState = state ?? existingProfile.state
+        const newLga = lga ?? existingProfile.lga
+
+        const location = buildLocation(newState, newLga)
+
+        if (!location) {
+            res.status(400).send({ message: "Invalid state or LGA" })
+            return
+        }
+
+        const updatedProfile = await prisma.sellerProfile.update({
+            where:{userId: req.user!.id},
+            data:{businessName, state, lga, logoUrl, location}
+        })
+
+        res.send(updatedProfile)
+    }catch(error){
         res.status(500).send({message:"Sorry there is an issue on our end"})
     }
 }

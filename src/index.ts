@@ -5,6 +5,7 @@ import listingRoutes from "./routes/listingRoutes.js"
 import userRoutes from "./routes/userRoutes.js"
 import cookieParser from "cookie-parser"
 import sellerRoutes from "./routes/sellerRoutes.js"
+import { lgas, states } from "nigerian-states-and-lgas"
 
 const app = express()
 
@@ -20,4 +21,5 @@ app.use("/seller", sellerRoutes)
 
 app.listen(3000, () => {
     console.log("Server is running on port 3000")
+    console.log(lgas("Niger"), states())
 })
