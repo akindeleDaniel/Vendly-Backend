@@ -17,7 +17,7 @@ export async function geocodeLocation(location: string): Promise<{ latitude: num
     const url = new URL("https://api.geoapify.com/v1/geocode/search")
     url.searchParams.set("text", location)
     url.searchParams.set("filter", "countrycode:ng")
-    url.searchParams.set("limit", "1")
+    url.searchParams.set("limit", "1")//this says "give me atmost one result"
     url.searchParams.set("apiKey", apiKey)
 
     try {
