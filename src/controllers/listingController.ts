@@ -3,7 +3,26 @@ import prisma from "../lib/prisma.js"
 import shuffleArray from "../lib/shuffle.js"
 import { Prisma } from "../generated/prisma/client.js"
 
-const allowedCategories = ["Food", "Fashion", "Electronics", "Groceries", "Home", "Beauty", "Other"]
+const allowedCategories = [
+        "Food & Grocery",
+        "Fashion & Clothing", 
+        "Electronics", 
+        "Phones & Accessories", 
+        "Beauty & Personal Care",
+        "Health & Wellness",
+        "Home & Furniture",
+        "Computers & Accessories", 
+        "Sports & Fitness",
+       "Books & Stationery", 
+       "Baby & Kids",
+       "Automotive",
+       "Jewelry & Accessories",
+       "Toys & Games",
+       "Pet Supplies",
+       "Arts, Crafts & Hobbies",
+       "Tools & Hardware",
+       "Other"
+]
 
 function isInvalidPrice(price: unknown){
     const amount = Number(price)
