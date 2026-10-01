@@ -6,6 +6,7 @@ import { buildLocation } from "../lib/nigeriaLocation.js"
 import { geocodeLocation } from "../lib/geocoding.js"
 import { haversineDistance } from "../lib/distance.js"
 import { getDrivingRouteDistances, getRouteCandidateLimit } from "../lib/routeMatrix.js"
+import { getCanonicalCategory } from "../lib/categories.js"
 
 function hasValidCoordinates<T extends { latitude: number | null; longitude: number | null }>(
     shop: T
@@ -138,6 +139,14 @@ export const updateSeller = async(req: Request, res: Response) => {
 
 export const getPublicShop = async (req: Request, res: Response) => {
     const slug = String(req.params.slug)
+    const search = req.query.search
+
+    if (search !== undefined && typeof search !== "string") {
+        res.status(400).send({ message: "Search must be a string" })
+        return
+    }
+
+    const searchTerm = typeof search === "string" ? search.trim() : ""
 
     try{
         const profile = await prisma.sellerProfile.findUnique({
@@ -160,7 +169,12 @@ export const getPublicShop = async (req: Request, res: Response) => {
         }
 
         const listings = await prisma.listing.findMany({
-            where:{userId: profile.userId}
+            where:{
+                userId: profile.userId,
+                ...(searchTerm
+                    ? { title: { contains: searchTerm, mode: "insensitive" as const } }
+                    : {})
+            }
         })
 
         res.send({
@@ -173,15 +187,24 @@ export const getPublicShop = async (req: Request, res: Response) => {
 }
 
 export const getCategoryShops = async (req: Request, res: Response) => {
-    const category = req.query.category
+    const category = getCanonicalCategory(req.query.category)
+    const search = req.query.search
     const latitudeQuery = req.query.latitude
     const longitudeQuery = req.query.longitude
 
-    if (typeof category !== "string" || !category.trim()) {
-        res.status(400).send({ message: "A category is required" })
+    if (!category) {
+        res.status(400).send({
+            message: req.query.category === undefined ? "A category is required" : "Category is not valid"
+        })
         return
     }
 
+    if (search !== undefined && typeof search !== "string") {
+        res.status(400).send({ message: "Search must be a string" })
+        return
+    }
+
+    const searchTerm = typeof search === "string" ? search.trim() : ""
     const hasLatitude = latitudeQuery !== undefined
     const hasLongitude = longitudeQuery !== undefined
 
@@ -223,18 +246,47 @@ export const getCategoryShops = async (req: Request, res: Response) => {
 
     try {
         const shops = await prisma.sellerProfile.findMany({
-            where: {
-                user: {
-                    listings: {
-                        some: {
-                            category: {
-                                contains: category.trim(),
-                                mode: "insensitive"
+            where: searchTerm
+                ? {
+                    AND: [
+                        {
+                            user: {
+                                listings: {
+                                    some: {
+                                        category: { equals: category, mode: "insensitive" }
+                                    }
+                                }
+                            }
+                        },
+                        {
+                            OR: [
+                                { businessName: { contains: searchTerm, mode: "insensitive" } },
+                                { location: { contains: searchTerm, mode: "insensitive" } },
+                                { state: { contains: searchTerm, mode: "insensitive" } },
+                                { lga: { contains: searchTerm, mode: "insensitive" } },
+                                {
+                                    user: {
+                                        listings: {
+                                            some: {
+                                                category: { equals: category, mode: "insensitive" },
+                                                title: { contains: searchTerm, mode: "insensitive" }
+                                            }
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+                : {
+                    user: {
+                        listings: {
+                            some: {
+                                category: { equals: category, mode: "insensitive" }
                             }
                         }
                     }
-                }
-            },
+                },
             select: {
                 id: true,
                 businessName: true,

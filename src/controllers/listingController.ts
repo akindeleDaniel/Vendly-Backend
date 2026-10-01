@@ -2,27 +2,7 @@ import type { Request, Response } from "express"
 import prisma from "../lib/prisma.js"
 import shuffleArray from "../lib/shuffle.js"
 import { Prisma } from "../generated/prisma/client.js"
-
-const allowedCategories = [
-        "Food & Grocery",
-        "Fashion & Clothing", 
-        "Electronics", 
-        "Phones & Accessories", 
-        "Beauty & Personal Care",
-        "Health & Wellness",
-        "Home & Furniture",
-        "Computers & Accessories", 
-        "Sports & Fitness",
-       "Books & Stationery", 
-       "Baby & Kids",
-       "Automotive",
-       "Jewelry & Accessories",
-       "Toys & Games",
-       "Pet Supplies",
-       "Arts, Crafts & Hobbies",
-       "Tools & Hardware",
-       "Other"
-]
+import { categories, getCanonicalCategory } from "../lib/categories.js"
 
 function isInvalidPrice(price: unknown){
     const amount = Number(price)
@@ -32,12 +12,26 @@ function isInvalidPrice(price: unknown){
 export const getAllListings = async (req:Request, res:Response) =>{
     const {category, search} = req.query
     const filters:Prisma.ListingWhereInput /* a type that prisma created to fit this variable properly  it can be gotten from the erro description if it shows an error*/= {}
-    if(category){
-        filters.category = {contains: String(category), mode:"insensitive"}
+
+    if (category !== undefined) {
+        const canonicalCategory = getCanonicalCategory(category)
+
+        if (!canonicalCategory) {
+            res.status(400).send({ message: "Category is not valid" })
+            return
+        }
+
+        filters.category = { equals: canonicalCategory, mode: "insensitive" }
     }
 
-    if (search){
-        filters.title = {contains: String(search), mode:"insensitive"}
+    if (search !== undefined && typeof search !== "string") {
+        res.status(400).send({ message: "Search must be a string" })
+        return
+    }
+
+    const searchTerm = typeof search === "string" ? search.trim() : ""
+    if (searchTerm) {
+        filters.title = { contains: searchTerm, mode: "insensitive" }
     }
 
     const listings =await prisma.listing.findMany({
@@ -97,7 +91,7 @@ export const createListing = async(req: Request, res:Response) =>{
         return
     }
 
-    if(!allowedCategories.includes(category)){
+    if(!categories.includes(category)){
         res.status(400).send({message:"Category is not valid"})
         return
     }
@@ -153,7 +147,7 @@ export const updateListing = async(req:Request, res:Response) =>{
         }
     }
 
-    if (category !== undefined && !allowedCategories.includes(category)) {
+    if (category !== undefined && !categories.includes(category)) {
         res.status(400).send({message:"Category is not valid"})
         return
     }
