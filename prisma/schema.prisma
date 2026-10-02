@@ -19,11 +19,13 @@ model Listing {
   title String
   description String
   price Float
+  stockQuantity Int
   category String
   imageUrl String
   createdAt DateTime @default(now())
   userId Int
   user User @relation(fields: [userId], references:[id])
+  cartItems CartItem[]
 }
 
 model User {
@@ -33,7 +35,8 @@ model User {
   passwordHash String
   listings Listing[]
   role Role 
-  sellerProfile SellerProfile?  
+  sellerProfile SellerProfile? 
+  cart Cart?
 }
 
 enum Role {
@@ -53,5 +56,23 @@ model SellerProfile {
   slug String @unique
   latitude Float?
   longitude Float?
+}
+
+model Cart{
+  id Int @id @default(autoincrement())
+  userId Int @unique
+  user User @relation(fields: [userId], references:[id])
+  cartItems CartItem[]
+}
+
+model CartItem{
+  id Int @id @default(autoincrement())
+  cartId Int
+  cart Cart @relation(fields: [cartId], references:[id])
+  listingId Int
+  listing Listing @relation(fields: [listingId], references:[id])
+  quantity Int
+
+  @@unique([cartId, listingId])
 }
 //npx prisma migrate dev --name init (run this command to actually migrate the schema into the database)

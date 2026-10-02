@@ -22,6 +22,6 @@ export function authMiddleware (req: Request, res:Response, next:NextFunction){
         next()
         
     }catch(error){
-        res.status(401).send("Invalid or expired token. Please log in again.")
+        res.send({message:"Invalid or expired token. Please log in again."})
     }
 }
