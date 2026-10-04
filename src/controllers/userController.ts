@@ -3,48 +3,75 @@ import prisma from "../lib/prisma.js"
 import type { Request, Response } from "express"
 import jwt from "jsonwebtoken"
 
-export const createUser = async(req: Request, res: Response) => {
-    const {name, email, password, role} = req.body
+export const createUser = async (req: Request, res: Response) => {
+    const { name, email, password, role } = req.body;
 
-    if(!name || !email || !password || !role){
-        res.status(400).send({message:"All areas are required"})
-        return
+    if (!name || !email || !password || !role) {
+        res.status(400).send({ message: "All areas are required" });
+        return;
     }
 
-    const emailCheck = await prisma.user.findUnique({where:{email}})
+    const emailCheck = await prisma.user.findUnique({
+        where: { email }
+    });
 
-    if (emailCheck){
-        res.status(400).send({message:"The email has already been registered"})
-        return
+    if (emailCheck) {
+        res.status(400).send({
+            message: "The email has already been registered"
+        });
+        return;
     }
 
-    const passwordHash = await bcrypt.hash(password, 10)
+    const passwordHash = await bcrypt.hash(password, 10);
 
-    try{
-        const newUser = await prisma.user.create({data:{
-            name,
-            email,
-            passwordHash,
-            role
-        }})
+    try {
+        const newUser = await prisma.$transaction(async (tx) => {
+            const user = await tx.user.create({
+                data: {
+                    name,
+                    email,
+                    passwordHash,
+                    role
+                }
+            });
+
+            if (role === "CONSUMER") {
+                await tx.cart.create({
+                    data: {
+                        userId: user.id
+                    }
+                });
+            }
+
+            return user;
+        });
 
         if (!process.env.JWT_SECRET) {
             throw new Error("JWT_SECRET is not set");
         }
-        const token = jwt.sign({id: newUser.id}, process.env.JWT_SECRET, {expiresIn:"1h"})
+
+        const token = jwt.sign(
+            { id: newUser.id },
+            process.env.JWT_SECRET,
+            { expiresIn: "1h" }
+        );
 
         res.cookie("token", token, {
-            httpOnly:true,
+            httpOnly: true,
             secure: process.env.NODE_ENV === "production",
-            sameSite:"lax",
+            sameSite: "lax",
             maxAge: 3600000
-        })
-        res.send({message:"Registration successful"})
-    }catch(error){
-        res.status(500).send({message:"Sorry there is an issue on our end"})
-    }
-}
+        });
 
+        res.send({ message: "Registration successful" });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).send({
+            message: "Sorry there is an issue on our end"
+        });
+    }
+};
 
 export const loginUser = async(req: Request, res: Response) =>{
     const {email, password} = req.body

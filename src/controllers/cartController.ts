@@ -73,7 +73,9 @@ export async function addToCart(req: Request, res: Response) {
     }
 
     if (!Number.isInteger(quantity) || quantity < 1) {
-        res.status(400).send({ message: "Quantity must be at least 1" });
+        res.status(400).send({
+            message: "Quantity must be at least 1"
+        });
         return;
     }
 
@@ -83,15 +85,19 @@ export async function addToCart(req: Request, res: Response) {
         });
 
         if (!listing) {
-            res.status(404).send({ message: "This Listing was not found" });
+            res.status(404).send({
+                message: "This Listing was not found"
+            });
             return;
         }
 
         if (listing.stockQuantity === 0) {
-            res.status(409).send({ message: "This listing has been sold out" });
+            res.status(409).send({
+                message: "This listing has been sold out"
+            });
             return;
         }
-        
+
         if (quantity > listing.stockQuantity) {
             res.status(409).send({
                 message: `Only ${listing.stockQuantity} units currently available`
@@ -99,16 +105,15 @@ export async function addToCart(req: Request, res: Response) {
             return;
         }
 
-        let cart = await prisma.cart.findUnique({
+        const cart = await prisma.cart.findUnique({
             where: { userId: id }
         });
 
         if (!cart) {
-            cart = await prisma.cart.create({
-                data: {
-                    userId: id
-                }
+            res.status(500).send({
+                message: "Cart not found"
             });
+            return;
         }
 
         const cartItem = await prisma.cartItem.findUnique({
