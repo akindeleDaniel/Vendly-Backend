@@ -1,7 +1,64 @@
 import type { Request, Response } from "express";
 import prisma from "../lib/prisma.js";
 
-async function addToCart(req: Request, res: Response) {
+const cartItemListingSelect = {
+    id: true,
+    title: true,
+    description: true,
+    price: true,
+    stockQuantity: true,
+    category: true,
+    imageUrl: true,
+    user: {
+        select: {
+            sellerProfile: {
+                select: {
+                    businessName: true,
+                    slug: true
+                }
+            }
+        }
+    }
+} as const;
+
+
+
+export async function getCart(req: Request, res: Response) {
+    const userId = req.user?.id;
+
+    if (!userId) {
+        res.status(401).send({ message: "Authentication required" });
+        return;
+    }
+
+    try {
+        const cart = await prisma.cart.findUnique({
+            where: { userId },
+            select: {
+                cartItems: {
+                    select: {
+                        listingId: true,
+                        quantity: true,
+                        listing: {
+                            select: cartItemListingSelect
+                        }
+                    }
+                }
+            }
+        });
+
+        res.send({ cart });
+    } catch (error) {
+        console.error(error);
+        res.status(500).send({
+            message: "Sorry, there is an issue on our end"
+        });
+    }
+}
+
+
+
+export async function addToCart(req: Request, res: Response) {
     const { listingId, quantity } = req.body;
     const id = req.user?.id;
 
@@ -104,5 +161,10 @@ async function addToCart(req: Request, res: Response) {
         });
     }
 }
+
+
+
+
+
 
 export default addToCart
