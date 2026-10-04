@@ -251,4 +251,49 @@ export async function updateCartItem(req: Request, res: Response) {
 
 
 
+export async function removeCartItem(req: Request, res: Response) {
+    const userId = req.user?.id;
+    const listingId = Number(req.params.listingId);
+
+    if (!userId) {
+        res.status(401).send({ message: "Authentication required" });
+        return;
+    }
+
+    if (!Number.isSafeInteger(listingId) || listingId < 1) {
+        res.status(400).send({ message: "Invalid listing ID" });
+        return;
+    }
+
+    try {
+        const cart = await prisma.cart.findUnique({
+            where: { userId },
+            select: { id: true }
+        });
+
+        if (!cart) {
+            res.status(404).send({ message: "Cart not found" });
+            return;
+        }
+
+        const result = await prisma.cartItem.deleteMany({
+            where: {
+                cartId: cart.id,
+                listingId
+            }
+        });
+
+        if (result.count === 0) {
+            res.status(404).send({ message: "Cart item not found" });
+            return;
+        }
+
+        res.send({ message: "Cart item removed successfully" });
+    } catch (error) {
+        console.error(error);
+        res.status(500).send({
+            message: "Sorry, there is an issue on our end"
+        });
+    }
+}
 export default addToCart
