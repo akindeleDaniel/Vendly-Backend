@@ -296,4 +296,36 @@ export async function removeCartItem(req: Request, res: Response) {
         });
     }
 }
+
+
+
+export async function clearCart(req: Request, res: Response) {
+    const userId = req.user?.id;
+
+    if (!userId) {
+        res.status(401).send({ message: "Authentication required" });
+        return;
+    }
+
+    try {
+        const cart = await prisma.cart.findUnique({
+            where: { userId },
+            select: { id: true }
+        });
+
+        if (cart) {
+            await prisma.cartItem.deleteMany({
+                where: { cartId: cart.id }
+            });
+        }
+
+        res.send({ message: "Cart cleared successfully" });
+    } catch (error) {
+        console.error(error);
+        res.status(500).send({
+            message: "Sorry, there is an issue on our end"
+        });
+    }
+}
+
 export default addToCart
