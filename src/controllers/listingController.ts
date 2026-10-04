@@ -9,6 +9,10 @@ function isInvalidPrice(price: unknown){
     return isNaN(amount) || amount <= 0
 }
 
+
+
+
+
 export const getAllListings = async (req:Request, res:Response) =>{
     const {category, search} = req.query
     const filters:Prisma.ListingWhereInput /* a type that prisma created to fit this variable properly  it can be gotten from the erro description if it shows an error*/= {}
@@ -62,6 +66,11 @@ export const getAllListings = async (req:Request, res:Response) =>{
     res.send(shuffleArray(listingsWithShop))
 }
 
+
+
+
+
+
 export const getListingById  = async (req:Request, res:Response) =>{
     const id = Number(req.params.id)
 
@@ -78,10 +87,15 @@ export const getListingById  = async (req:Request, res:Response) =>{
     res.send(specificData)
 }
 
-export const createListing = async(req: Request, res:Response) =>{
-    const {title, description, price, category, imageUrl} = req.body
 
-    if(!title || !description || !price || !category || !imageUrl){
+
+
+
+
+export const createListing = async(req: Request, res:Response) =>{
+    const {title, description, price, category, imageUrl, stockQuantity} = req.body
+
+    if(!title || !description || !price || !category || !imageUrl || stockQuantity === undefined){
         res.status(400).send({message:"All areas must be filled"})
         return
     }
@@ -94,6 +108,13 @@ export const createListing = async(req: Request, res:Response) =>{
     if(!categories.includes(category)){
         res.status(400).send({message:"Category is not valid"})
         return
+    }
+
+    if (!Number.isInteger(stockQuantity) || stockQuantity < 0) {
+        res.status(400).send({
+            message: "Stock quantity must be a whole number greater than or equal to 0"
+        });
+        return;
     }
 
     try{
@@ -110,7 +131,8 @@ export const createListing = async(req: Request, res:Response) =>{
             description,
             price: Number(price),
             category,
-            imageUrl
+            imageUrl,
+            stockQuantity
         }})
         res.status(201).send(newListing)
     }catch(error){
@@ -119,9 +141,12 @@ export const createListing = async(req: Request, res:Response) =>{
 
 }
 
+
+
+
 export const updateListing = async(req:Request, res:Response) =>{
     const id = Number(req.params.id)
-    const {title, description, price, category, imageUrl} = req.body
+    const {title, description, price, category, imageUrl, stockQuantity} = req.body
 
     if(isNaN(id)){
         res.status(400).send({message:"Id has to be a number"})
@@ -144,6 +169,15 @@ export const updateListing = async(req:Request, res:Response) =>{
         if (isInvalidPrice(price)) {
             res.status(400).send({message:"Price must be a number greater than 0"})
             return
+        }
+    }
+
+    if (stockQuantity !== undefined) {
+        if (!Number.isInteger(stockQuantity) || stockQuantity < 0) {
+            res.status(400).send({
+                message: "Stock quantity must be a whole number greater than or equal to 0"
+            });
+            return;
         }
     }
 
@@ -176,6 +210,9 @@ export const updateListing = async(req:Request, res:Response) =>{
     if (imageUrl !== undefined) {
         data.imageUrl = imageUrl
     }
+    if (stockQuantity !== undefined) {
+        data.stockQuantity = stockQuantity
+    }
 
     if (Object.keys(data).length === 0) {
         res.status(400).send({message:"Provide at least one field to update"})
@@ -192,6 +229,11 @@ export const updateListing = async(req:Request, res:Response) =>{
         res.status(500).send({message:"Sorry there is an issue on our end"})
     }
 }
+
+
+
+
+
 
 export const deleteListing = async(req:Request, res:Response) =>{
     const id = Number(req.params.id)
@@ -221,6 +263,11 @@ export const deleteListing = async(req:Request, res:Response) =>{
         res.status(500).send({message:"Sorry there is an issue on our end"})
     }
 }
+
+
+
+
+
 
 export const getMyListings = async(req:Request, res:Response) =>{
     const id = req.user!.id
