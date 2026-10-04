@@ -164,6 +164,90 @@ export async function addToCart(req: Request, res: Response) {
 
 
 
+export async function updateCartItem(req: Request, res: Response) {
+    const userId = req.user?.id;
+    const listingId = Number(req.params.listingId);
+    const quantity = req.body?.quantity;
+
+    if (!userId) {
+        res.status(401).send({ message: "Authentication required" });
+        return;
+    }
+
+    if (!Number.isSafeInteger(listingId) || listingId < 1) {
+        res.status(400).send({ message: "Invalid listing ID" });
+        return;
+    }
+
+    if (!Number.isInteger(quantity) || quantity < 1) {
+        res.status(400).send({ message: "Quantity must be at least 1" });
+        return;
+    }
+
+    try {
+        const cart = await prisma.cart.findUnique({
+            where: { userId },
+            select: { id: true }
+        });
+
+        if (!cart) {
+            res.status(404).send({ message: "Cart not found" });
+            return;
+        }
+
+        const cartItem = await prisma.cartItem.findUnique({
+            where: {
+                cartId_listingId: {
+                    cartId: cart.id,
+                    listingId
+                }
+            },
+            select: {
+                listing: {
+                    select: {
+                        stockQuantity: true
+                    }
+                }
+            }
+        });
+
+        if (!cartItem) {
+            res.status(404).send({ message: "Cart item not found" });
+            return;
+        }
+
+        if (quantity > cartItem.listing.stockQuantity) {
+            res.status(409).send({
+                message: `Only ${cartItem.listing.stockQuantity} units currently available`
+            });
+            return;
+        }
+
+        const updatedCartItem = await prisma.cartItem.update({
+            where: {
+                cartId_listingId: {
+                    cartId: cart.id,
+                    listingId
+                }
+            },
+            data: { quantity },
+            select: {
+                listingId: true,
+                quantity: true,
+                listing: {
+                    select: cartItemListingSelect
+                }
+            }
+        });
+
+        res.send(updatedCartItem);
+    } catch (error) {
+        console.error(error);
+        res.status(500).send({
+            message: "Sorry, there is an issue on our end"
+        });
+    }
+}
 
 
 
