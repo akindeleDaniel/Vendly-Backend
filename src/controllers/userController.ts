@@ -112,6 +112,40 @@ export const loginUser = async(req: Request, res: Response) =>{
     })
 }
 
-export const checkAuth = (req: Request, res: Response) => {
-    res.send({message: "Authenticated"})   
-}
+export const checkAuth = async (req: Request, res: Response) => {
+    const userId = req.user?.id;
+
+    if (!userId) {
+        res.status(401).send({
+            message: "You're logged out"
+        });
+        return;
+    }
+
+    try {
+        const user = await prisma.user.findUnique({
+            where: { id: userId },
+            select: {
+                role: true
+            }
+        });
+
+        if (!user) {
+            res.status(401).send({
+                message: "You're logged out"
+            });
+            return;
+        }
+
+        res.send({
+            message: "Authenticated",
+            role: user.role
+        });
+
+    } catch (error) {
+        console.error(error);
+        res.status(500).send({
+            message: "Sorry there is an issue on our end"
+        });
+    }
+};
