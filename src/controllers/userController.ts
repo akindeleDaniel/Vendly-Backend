@@ -112,6 +112,15 @@ export const loginUser = async(req: Request, res: Response) =>{
     })
 }
 
+export const logout = (_req: Request, res: Response) => {
+    res.clearCookie("token", {
+        httpOnly: true,
+        secure: process.env.NODE_ENV === "production",
+        sameSite: "lax"
+    })
+    res.send({ message: "Logged out successfully" })
+}
+
 export const checkAuth = async (req: Request, res: Response) => {
     const userId = req.user?.id;
 
