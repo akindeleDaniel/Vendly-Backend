@@ -15,28 +15,34 @@ datasource db {
 }
 
 model Listing {
-  id Int @id @default(autoincrement())
-  title String
-  description String
-  price Float
+  id            Int      @id @default(autoincrement())
+  title         String
+  description   String
+  price         Float
   stockQuantity Int
-  category String
-  imageUrl String
-  createdAt DateTime @default(now())
-  userId Int
-  user User @relation(fields: [userId], references:[id])
-  cartItems CartItem[]
+  category      String
+  imageUrl      String
+  createdAt     DateTime @default(now())
+  userId        Int
+
+  user                  User                   @relation(fields: [userId], references: [id])
+  cartItems             CartItem[]
+  checkoutItems         CheckoutItem[]
+  orderItems            OrderItem[]
+  inventoryReservations InventoryReservation[]
 }
 
 model User {
-  id Int @id @default(autoincrement())
-  name String
-  email String @unique
-  passwordHash String
-  listings Listing[]
-  role Role 
-  sellerProfile SellerProfile? 
-  cart Cart?
+  id            Int            @id @default(autoincrement())
+  name          String
+  email         String         @unique
+  passwordHash  String
+  listings      Listing[]
+  role          Role
+  sellerProfile SellerProfile?
+  cart          Cart?
+  checkouts     Checkout[]
+  orders        Order[]
 }
 
 enum Role {
@@ -45,34 +51,197 @@ enum Role {
 }
 
 model SellerProfile {
-  id Int @id @default(autoincrement())
-  userId Int @unique
-  user User @relation(fields: [userId], references: [id])
-  businessName String
-  state String
-  lga String
-  location String
-  logoUrl String
-  slug String @unique
-  latitude Float?
-  longitude Float?
+  id            Int     @id @default(autoincrement())
+  userId        Int     @unique
+  user          User    @relation(fields: [userId], references: [id])
+  businessName  String
+  state         String
+  lga           String
+  location      String
+  logoUrl       String
+  slug          String  @unique
+  latitude      Float?
+  longitude     Float?
+
+  shippingPolicy SellerShippingPolicy
+  shippingCost   Decimal?             @db.Decimal(12, 2)
 }
 
-model Cart{
-  id Int @id @default(autoincrement())
-  userId Int @unique
-  user User @relation(fields: [userId], references:[id])
+enum SellerShippingPolicy {
+  FREE
+  FIXED
+}
+
+model Cart {
+  id        Int        @id @default(autoincrement())
+  userId    Int        @unique
+  user      User       @relation(fields: [userId], references: [id])
   cartItems CartItem[]
 }
 
-model CartItem{
-  id Int @id @default(autoincrement())
-  cartId Int
-  cart Cart @relation(fields: [cartId], references:[id])
+model CartItem {
+  id        Int     @id @default(autoincrement())
+  cartId    Int
+  cart      Cart    @relation(fields: [cartId], references: [id])
   listingId Int
-  listing Listing @relation(fields: [listingId], references:[id])
-  quantity Int
+  listing   Listing @relation(fields: [listingId], references: [id])
+  quantity  Int
 
   @@unique([cartId, listingId])
 }
-//npx prisma migrate dev --name init (run this command to actually migrate the schema into the database)
+
+enum CheckoutStatus {
+  PENDING
+  PAYMENT_PENDING
+  COMPLETED
+  EXPIRED
+}
+
+enum OrderStatus {
+  PENDING_PAYMENT
+  PAID
+  SHIPPED
+  DELIVERED
+  CANCELLED
+  REFUNDED
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+enum PaymentProvider {
+  PAYSTACK
+  FLUTTERWAVE
+}
+
+enum InventoryReservationStatus {
+  ACTIVE
+  CONSUMED
+  RELEASED
+  EXPIRED
+}
+
+model Checkout {
+  id                   Int            @id @default(autoincrement())
+  userId               Int
+  status               CheckoutStatus @default(PENDING)
+  expiresAt            DateTime
+
+  deliveryName         String
+  deliveryPhone        String
+  deliveryAddress      String
+  deliveryState        String
+  deliveryLga          String
+  deliveryInstructions String?
+
+  total                Decimal        @db.Decimal(12, 2)
+
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
+
+  user                  User                   @relation(fields: [userId], references: [id])
+  checkoutItems         CheckoutItem[]
+  orders                Order[]
+  paymentAttempts       PaymentAttempt[]
+  inventoryReservations InventoryReservation[]
+
+  @@index([userId])
+}
+
+model CheckoutItem {
+  id         Int     @id @default(autoincrement())
+  checkoutId Int
+  listingId  Int
+
+  title      String
+  unitPrice  Decimal @db.Decimal(12, 2)
+  quantity   Int
+
+  checkout Checkout @relation(fields: [checkoutId], references: [id])
+  listing  Listing  @relation(fields: [listingId], references: [id])
+
+  @@unique([checkoutId, listingId])
+  @@index([listingId])
+}
+
+model InventoryReservation {
+  id         Int                       @id @default(autoincrement())
+  checkoutId Int
+  listingId  Int
+  quantity   Int
+  status     InventoryReservationStatus @default(ACTIVE)
+  expiresAt  DateTime
+  createdAt  DateTime                  @default(now())
+  updatedAt  DateTime                  @updatedAt
+
+  checkout Checkout @relation(fields: [checkoutId], references: [id])
+  listing  Listing  @relation(fields: [listingId], references: [id])
+
+  @@unique([checkoutId, listingId])
+  @@index([listingId, status])
+  @@index([expiresAt])
+}
+
+model Order {
+  id           Int         @id @default(autoincrement())
+  checkoutId   Int
+  sellerId     Int
+  status       OrderStatus @default(PENDING_PAYMENT)
+
+  subtotal     Decimal @db.Decimal(12, 2)
+  shippingCost Decimal @db.Decimal(12, 2)
+  total        Decimal @db.Decimal(12, 2)
+
+  deliveryName         String
+  deliveryPhone        String
+  deliveryAddress      String
+  deliveryState        String
+  deliveryLga          String
+  deliveryInstructions String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  checkout   Checkout    @relation(fields: [checkoutId], references: [id])
+  seller     User        @relation(fields: [sellerId], references: [id])
+  orderItems OrderItem[]
+
+  @@index([sellerId])
+  @@index([checkoutId])
+}
+
+model OrderItem {
+  id        Int     @id @default(autoincrement())
+  orderId   Int
+  listingId Int
+
+  title     String
+  unitPrice Decimal @db.Decimal(12, 2)
+  quantity  Int
+
+  order   Order   @relation(fields: [orderId], references: [id])
+  listing Listing @relation(fields: [listingId], references: [id])
+
+  @@index([listingId])
+}
+
+model PaymentAttempt {
+  id          Int             @id @default(autoincrement())
+  checkoutId  Int
+  provider    PaymentProvider
+  providerRef String?
+  amount      Decimal         @db.Decimal(12, 2)
+  currency    String          @default("NGN")
+  status      PaymentStatus   @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  checkout Checkout @relation(fields: [checkoutId], references: [id])
+
+  @@unique([provider, providerRef])
+  @@index([checkoutId])
+}
