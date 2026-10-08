@@ -21,12 +21,57 @@ function hasValidCoordinates<T extends { latitude: number | null; longitude: num
         shop.longitude <= 180
 }
 
-export const createSeller = async(req: Request, res: Response) => {
-    const {businessName, state, lga, logoUrl} = req.body
+const maximumShippingCost = new Prisma.Decimal("9999999999.99")
 
-    if(!businessName || !logoUrl || !state || !lga){
+function parseShippingCost(value: unknown): Prisma.Decimal | null {
+    if (typeof value !== "number" && typeof value !== "string") {
+        return null
+    }
+
+    const amount = typeof value === "string" ? value.trim() : String(value)
+
+    if (!/^\d+(?:\.\d{1,2})?$/.test(amount)) {
+        return null
+    }
+
+    const shippingCost = new Prisma.Decimal(amount)
+
+    if (shippingCost.greaterThan(maximumShippingCost)) {
+        return null
+    }
+
+    return shippingCost
+}
+
+export const createSeller = async(req: Request, res: Response) => {
+    const {businessName, state, lga, logoUrl, shippingPolicy, shippingCost} = req.body
+
+    if(!businessName || !logoUrl || !state || !lga || !shippingPolicy){
         res.status(400).send({message:"All areas are required"})
         return
+    }
+
+    if (shippingPolicy !== "FREE" && shippingPolicy !== "FIXED") {
+        res.status(400).send({ message: "Shipping policy must be FREE or FIXED" })
+        return
+    }
+
+    let configuredShippingCost: Prisma.Decimal | null = null
+
+    if (shippingPolicy === "FREE") {
+        if (shippingCost !== undefined) {
+            res.status(400).send({ message: "Shipping cost cannot be provided with the FREE policy" })
+            return
+        }
+    } else {
+        configuredShippingCost = parseShippingCost(shippingCost)
+
+        if (!configuredShippingCost) {
+            res.status(400).send({
+                message: "A valid non-negative shipping cost with at most two decimal places is required for FIXED shipping"
+            })
+            return
+        }
     }
     
     const location = buildLocation(state, lga)
@@ -55,7 +100,9 @@ export const createSeller = async(req: Request, res: Response) => {
             logoUrl,
             slug,
             latitude: coordinates?.latitude ?? null,
-            longitude: coordinates?.longitude ?? null
+            longitude: coordinates?.longitude ?? null,
+            shippingPolicy,
+            shippingCost: configuredShippingCost
         }})
         res.status(201).send({message:"Seller profile created"})
     }catch(error){
@@ -84,9 +131,16 @@ export const getMySellerProfile = async (req: Request, res: Response) => {
 }
 
 export const updateSeller = async(req: Request, res: Response) => {
-    const {businessName, state, lga, logoUrl} = req.body
+    const {businessName, state, lga, logoUrl, shippingPolicy, shippingCost} = req.body
 
-    if(businessName === undefined && state === undefined && logoUrl === undefined && lga === undefined){
+    if(
+        businessName === undefined &&
+        state === undefined &&
+        logoUrl === undefined &&
+        lga === undefined &&
+        shippingPolicy === undefined &&
+        shippingCost === undefined
+    ){
         res.status(400).send({message:"Provide at least one field to update"})
         return
     }
@@ -103,6 +157,44 @@ export const updateSeller = async(req: Request, res: Response) => {
 
         if(!existingProfile){
             res.status(404).send({ message: "Store profile not found" })
+            return
+        }
+
+        if (shippingPolicy !== undefined && shippingPolicy !== "FREE" && shippingPolicy !== "FIXED") {
+            res.status(400).send({ message: "Shipping policy must be FREE or FIXED" })
+            return
+        }
+
+        const nextShippingPolicy = shippingPolicy ?? existingProfile.shippingPolicy
+        let shippingCostData: Prisma.Decimal | undefined
+
+        if (shippingCost !== undefined) {
+            const parsedShippingCost = parseShippingCost(shippingCost)
+
+            if (!parsedShippingCost) {
+                res.status(400).send({
+                    message: "Shipping cost must be a non-negative amount with at most two decimal places"
+                })
+                return
+            }
+
+            if (nextShippingPolicy === "FREE") {
+                res.status(400).send({ message: "Shipping cost cannot be provided with the FREE policy" })
+                return
+            }
+
+            shippingCostData = parsedShippingCost
+        }
+
+        if (
+            nextShippingPolicy === "FIXED" &&
+            (shippingPolicy !== undefined || shippingCost !== undefined) &&
+            shippingCostData === undefined &&
+            existingProfile.shippingCost === null
+        ) {
+            res.status(400).send({
+                message: "A shipping cost is required before enabling FIXED shipping"
+            })
             return
         }
 
@@ -128,7 +220,16 @@ export const updateSeller = async(req: Request, res: Response) => {
 
         const updatedProfile = await prisma.sellerProfile.update({
             where:{userId: req.user!.id},
-            data:{businessName, state, lga, logoUrl, location, ...coordinateData}
+            data:{
+                businessName,
+                state,
+                lga,
+                logoUrl,
+                location,
+                ...(shippingPolicy !== undefined ? { shippingPolicy: nextShippingPolicy } : {}),
+                ...(shippingCostData !== undefined ? { shippingCost: shippingCostData } : {}),
+                ...coordinateData
+            }
         })
 
         res.send(updatedProfile)
