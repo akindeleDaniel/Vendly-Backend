@@ -4,6 +4,12 @@ import shuffleArray from "../lib/shuffle.js"
 import { Prisma } from "../generated/prisma/client.js"
 import { categories, getCanonicalCategory } from "../lib/categories.js"
 
+class ReservedStockConflict extends Error {
+    constructor(readonly reservedQuantity: number) {
+        super("Requested stock is below the quantity currently reserved")
+    }
+}
+
 function isInvalidPrice(price: unknown){
     const amount = Number(price)
     return isNaN(amount) || amount <= 0
@@ -220,12 +226,53 @@ export const updateListing = async(req:Request, res:Response) =>{
     }
 
     try{
-        const updatedListing = await prisma.listing.update({
-            where:{id},
-            data
-        })//whenever you use prisma.anything it returns the value 
+        const updatedListing = stockQuantity !== undefined
+            ? await prisma.$transaction(async (tx) => {
+                const now = new Date()
+                const reservations = await tx.inventoryReservation.aggregate({
+                    where: {
+                        listingId: id,
+                        status: "ACTIVE",
+                        expiresAt: { gt: now }
+                    },
+                    _sum: {
+                        quantity: true
+                    }
+                })
+                const reservedQuantity = reservations._sum.quantity ?? 0
+
+                if (stockQuantity < reservedQuantity) {
+                    throw new ReservedStockConflict(reservedQuantity)
+                }
+
+                return tx.listing.update({
+                    where: { id },
+                    data
+                })
+            }, {
+                isolationLevel: Prisma.TransactionIsolationLevel.Serializable
+            })
+            : await prisma.listing.update({
+                where: { id },
+                data
+            })
+
         res.send(updatedListing)
     }catch (error){
+        if (error instanceof ReservedStockConflict) {
+            res.status(409).send({
+                message: `Stock quantity cannot be less than ${error.reservedQuantity} units currently reserved`
+            })
+            return
+        }
+
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {
+            res.status(409).send({
+                message: "Inventory changed while updating stock. Please try again."
+            })
+            return
+        }
+
         res.status(500).send({message:"Sorry there is an issue on our end"})
     }
 }
