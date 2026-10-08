@@ -72,6 +72,54 @@ function formatMoney(amount: Prisma.Decimal): string {
     return amount.toFixed(2)
 }
 
+async function expireExpiredCheckouts(userId: number, now = new Date()): Promise<void> {
+    await prisma.$transaction(async (tx) => {
+        const expiredCheckouts = await tx.checkout.findMany({
+            where: {
+                userId,
+                status: { in: ["PENDING", "PAYMENT_PENDING"] },
+                expiresAt: { lte: now }
+            },
+            select: { id: true }
+        })
+
+        for (const checkout of expiredCheckouts) {
+            const transition = await tx.checkout.updateMany({
+                where: {
+                    id: checkout.id,
+                    userId,
+                    status: { in: ["PENDING", "PAYMENT_PENDING"] },
+                    expiresAt: { lte: now }
+                },
+                data: { status: "EXPIRED" }
+            })
+
+            if (transition.count === 0) {
+                continue
+            }
+
+            await tx.inventoryReservation.updateMany({
+                where: {
+                    checkoutId: checkout.id,
+                    status: "ACTIVE",
+                    expiresAt: { lte: now }
+                },
+                data: { status: "EXPIRED" }
+            })
+
+            await tx.order.updateMany({
+                where: {
+                    checkoutId: checkout.id,
+                    status: "PENDING_PAYMENT"
+                },
+                data: { status: "CANCELLED" }
+            })
+        }
+    }, {
+        isolationLevel: Prisma.TransactionIsolationLevel.Serializable
+    })
+}
+
 function parseDelivery(body: unknown): DeliveryInput | null {
     if (
         !body ||
@@ -144,6 +192,8 @@ export async function createCheckout(req: Request, res: Response) {
     }
 
     try {
+        await expireExpiredCheckouts(userId)
+
         const result = await prisma.$transaction(async (tx) => {
             const cart = await tx.cart.findUnique({
                 where: { userId },
@@ -398,7 +448,7 @@ export async function createCheckout(req: Request, res: Response) {
 
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {
             res.status(409).send({
-                message: "Inventory changed while creating checkout. Please review your cart and try again."
+                message: "Checkout state changed while creating checkout. Please try again."
             })
             return
         }
@@ -419,6 +469,8 @@ export async function getCheckoutPreview(req: Request, res: Response) {
     }
 
     try {
+        await expireExpiredCheckouts(userId)
+
         const cart = await prisma.cart.findUnique({
             where: { userId },
             select: {
@@ -570,6 +622,14 @@ export async function getCheckoutPreview(req: Request, res: Response) {
         })
     } catch (error) {
         console.error(error)
+
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {
+            res.status(409).send({
+                message: "Checkout state changed while loading your cart. Please try again."
+            })
+            return
+        }
+
         res.status(500).send({
             message: "Sorry, there is an issue on our end"
         })
