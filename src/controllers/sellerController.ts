@@ -23,6 +23,10 @@ function hasValidCoordinates<T extends { latitude: number | null; longitude: num
 
 const maximumShippingCost = new Prisma.Decimal("9999999999.99")
 
+function isNonBlankString(value: unknown): value is string {
+    return typeof value === "string" && value.trim().length > 0
+}
+
 function parseShippingCost(value: unknown): Prisma.Decimal | null {
     if (typeof value !== "number" && typeof value !== "string") {
         return null
@@ -46,7 +50,27 @@ function parseShippingCost(value: unknown): Prisma.Decimal | null {
 export const createSeller = async(req: Request, res: Response) => {
     const {businessName, state, lga, logoUrl, shippingPolicy, shippingCost} = req.body
 
-    if(!businessName || !logoUrl || !state || !lga || !shippingPolicy){
+    if (!isNonBlankString(businessName)) {
+        res.status(400).send({ message: "Business name must be a non-empty string" })
+        return
+    }
+
+    if (!isNonBlankString(logoUrl)) {
+        res.status(400).send({ message: "Logo URL must be a non-empty string" })
+        return
+    }
+
+    if (!isNonBlankString(state)) {
+        res.status(400).send({ message: "State must be a non-empty string" })
+        return
+    }
+
+    if (!isNonBlankString(lga)) {
+        res.status(400).send({ message: "LGA must be a non-empty string" })
+        return
+    }
+
+    if (!shippingPolicy) {
         res.status(400).send({message:"All areas are required"})
         return
     }
@@ -145,8 +169,23 @@ export const updateSeller = async(req: Request, res: Response) => {
         return
     }
 
-    if(businessName === "" || state === "" || logoUrl === "" || lga === ""){
-        res.status(400).send({message:"Fields cannot be empty"})
+    if (businessName !== undefined && !isNonBlankString(businessName)) {
+        res.status(400).send({ message: "Business name must be a non-empty string" })
+        return
+    }
+
+    if (logoUrl !== undefined && !isNonBlankString(logoUrl)) {
+        res.status(400).send({ message: "Logo URL must be a non-empty string" })
+        return
+    }
+
+    if (state !== undefined && !isNonBlankString(state)) {
+        res.status(400).send({ message: "State must be a non-empty string" })
+        return
+    }
+
+    if (lga !== undefined && !isNonBlankString(lga)) {
+        res.status(400).send({ message: "LGA must be a non-empty string" })
         return
     }
 
