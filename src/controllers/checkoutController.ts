@@ -1,4 +1,5 @@
 import type { Request, Response } from "express"
+import { createHash } from "node:crypto"
 import prisma from "../lib/prisma.js"
 import { Prisma } from "../generated/prisma/client.js"
 import { buildLocation } from "../lib/nigeriaLocation.js"
@@ -59,17 +60,125 @@ type DeliveryInput = {
     instructions: string | null
 }
 
+type CheckoutReview = {
+    reviewToken: string
+    sellers: Array<{
+        seller: SellerPreview["seller"]
+        items: PreviewItem[]
+        subtotal: string
+        shipping: string
+        total: string
+    }>
+    subtotal: string
+    shipping: string
+    total: string
+}
+
 class CheckoutCreationError extends Error {
     constructor(
         readonly statusCode: number,
-        message: string
+        message: string,
+        readonly code?: string,
+        readonly review?: CheckoutReview
     ) {
         super(message)
     }
 }
 
+type CheckoutRequest = {
+    delivery: DeliveryInput
+    reviewToken: string | null
+}
+
 function formatMoney(amount: Prisma.Decimal): string {
     return amount.toFixed(2)
+}
+
+function sortCartItems<T extends { listingId: number; quantity: number }>(items: T[]): T[] {
+    return [...items].sort((left, right) => left.listingId - right.listingId)
+}
+
+function createReviewToken(
+    userId: number,
+    items: Array<{ listingId: number; quantity: number; unitPrice: string }>,
+    sellers: Array<{ sellerId: number; shipping: Prisma.Decimal }>
+): string {
+    const snapshot = {
+        userId,
+        items: sortCartItems(items).map(({ listingId, quantity, unitPrice }) => ({
+            listingId,
+            quantity,
+            unitPrice
+        })),
+        sellers: [...sellers]
+            .sort((left, right) => left.sellerId - right.sellerId)
+            .map(({ sellerId, shipping }) => ({ sellerId, shipping: formatMoney(shipping) }))
+    }
+
+    return createHash("sha256").update(JSON.stringify(snapshot)).digest("hex")
+}
+
+function buildCheckoutReview(
+    userId: number,
+    sellers: SellerPreview[]
+): CheckoutReview {
+    const sortedSellers = [...sellers].sort((left, right) => left.sellerId - right.sellerId)
+    const sellerGroups = sortedSellers.map((seller) => {
+        const total = seller.subtotal.plus(seller.shipping)
+
+        return {
+            seller: seller.seller,
+            items: [...seller.items].sort((left, right) => left.listingId - right.listingId),
+            subtotal: formatMoney(seller.subtotal),
+            shipping: formatMoney(seller.shipping),
+            total: formatMoney(total)
+        }
+    })
+    const subtotal = sortedSellers.reduce(
+        (total, seller) => total.plus(seller.subtotal),
+        new Prisma.Decimal(0)
+    )
+    const shipping = sortedSellers.reduce(
+        (total, seller) => total.plus(seller.shipping),
+        new Prisma.Decimal(0)
+    )
+    const items = sortedSellers.flatMap((seller) => seller.items)
+    const reviewToken = createReviewToken(
+        userId,
+        items.map(({ listingId, quantity, unitPrice }) => ({ listingId, quantity, unitPrice })),
+        sortedSellers.map(({ sellerId, shipping: sellerShipping }) => ({
+            sellerId,
+            shipping: sellerShipping
+        }))
+    )
+
+    return {
+        reviewToken,
+        sellers: sellerGroups,
+        subtotal: formatMoney(subtotal),
+        shipping: formatMoney(shipping),
+        total: formatMoney(subtotal.plus(shipping))
+    }
+}
+
+function deliveryMatchesCheckout(delivery: DeliveryInput, checkout: {
+    deliveryName: string
+    deliveryPhone: string
+    deliveryAddress: string
+    deliveryState: string
+    deliveryLga: string
+    deliveryInstructions: string | null
+}): boolean {
+    return delivery.fullName === checkout.deliveryName &&
+        delivery.phone === checkout.deliveryPhone &&
+        delivery.address === checkout.deliveryAddress &&
+        delivery.state === checkout.deliveryState &&
+        delivery.lga === checkout.deliveryLga &&
+        delivery.instructions === checkout.deliveryInstructions
+}
+
+async function acquireCheckoutCreationLock(tx: Prisma.TransactionClient, userId: number): Promise<void> {
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(1447380556, ${userId})`
 }
 
 async function expireExpiredCheckouts(userId: number, now = new Date()): Promise<void> {
@@ -120,57 +229,63 @@ async function expireExpiredCheckouts(userId: number, now = new Date()): Promise
     })
 }
 
-function parseDelivery(body: unknown): DeliveryInput | null {
+function parseCheckoutRequest(body: unknown): CheckoutRequest | null {
     if (
         !body ||
         typeof body !== "object" ||
         Array.isArray(body) ||
-        Object.keys(body).length !== 1 ||
+        Object.keys(body).some((field) => field !== "delivery" && field !== "reviewToken") ||
         !("delivery" in body)
     ) {
         return null
     }
 
-    const delivery = body.delivery
+    const fields = body as Record<string, unknown>
+    const delivery = fields.delivery
 
     if (!delivery || typeof delivery !== "object" || Array.isArray(delivery)) {
         return null
     }
 
-    const fields = delivery as Record<string, unknown>
+    const deliveryFields = delivery as Record<string, unknown>
     const allowedFields = ["fullName", "phone", "address", "state", "lga", "instructions"]
 
     if (
-        Object.keys(fields).some((field) => !allowedFields.includes(field)) ||
-        typeof fields.fullName !== "string" ||
-        !fields.fullName.trim() ||
-        typeof fields.phone !== "string" ||
-        !fields.phone.trim() ||
-        typeof fields.address !== "string" ||
-        !fields.address.trim() ||
-        typeof fields.state !== "string" ||
-        typeof fields.lga !== "string" ||
-        (fields.instructions !== undefined && typeof fields.instructions !== "string")
+        Object.keys(deliveryFields).some((field) => !allowedFields.includes(field)) ||
+        typeof deliveryFields.fullName !== "string" ||
+        !deliveryFields.fullName.trim() ||
+        typeof deliveryFields.phone !== "string" ||
+        !deliveryFields.phone.trim() ||
+        typeof deliveryFields.address !== "string" ||
+        !deliveryFields.address.trim() ||
+        typeof deliveryFields.state !== "string" ||
+        typeof deliveryFields.lga !== "string" ||
+        (deliveryFields.instructions !== undefined && typeof deliveryFields.instructions !== "string") ||
+        (fields.reviewToken !== undefined &&
+            (typeof fields.reviewToken !== "string" || !/^[a-f0-9]{64}$/.test(fields.reviewToken)))
     ) {
         return null
     }
 
-    const state = fields.state.trim()
-    const lga = fields.lga.trim()
+    const state = deliveryFields.state.trim()
+    const lga = deliveryFields.lga.trim()
 
     if (!buildLocation(state, lga)) {
         return null
     }
 
     return {
-        fullName: fields.fullName.trim(),
-        phone: fields.phone.trim(),
-        address: fields.address.trim(),
-        state,
-        lga,
-        instructions: typeof fields.instructions === "string" && fields.instructions.trim()
-            ? fields.instructions.trim()
-            : null
+        delivery: {
+            fullName: deliveryFields.fullName.trim(),
+            phone: deliveryFields.phone.trim(),
+            address: deliveryFields.address.trim(),
+            state,
+            lga,
+            instructions: typeof deliveryFields.instructions === "string" && deliveryFields.instructions.trim()
+                ? deliveryFields.instructions.trim()
+                : null
+        },
+        reviewToken: typeof fields.reviewToken === "string" ? fields.reviewToken : null
     }
 }
 
@@ -182,19 +297,24 @@ export async function createCheckout(req: Request, res: Response) {
         return
     }
 
-    const delivery = parseDelivery(req.body)
+    const checkoutRequest = parseCheckoutRequest(req.body)
 
-    if (!delivery) {
+    if (!checkoutRequest) {
         res.status(400).send({
-            message: "Provide valid delivery fullName, phone, address, state, lga, and optional instructions"
+            message: "Provide valid delivery details and, if supplied, a valid review token"
         })
         return
     }
+
+    const { delivery, reviewToken } = checkoutRequest
 
     try {
         await expireExpiredCheckouts(userId)
 
         const result = await prisma.$transaction(async (tx) => {
+            await acquireCheckoutCreationLock(tx, userId)
+
+            const now = new Date()
             const cart = await tx.cart.findUnique({
                 where: { userId },
                 select: {
@@ -214,35 +334,63 @@ export async function createCheckout(req: Request, res: Response) {
                 throw new CheckoutCreationError(400, "Cart is empty")
             }
 
-            const listingIds = cart.cartItems.map(({ listingId }) => listingId)
-            const reservationCheckTime = new Date()
-            const activeReservations = await tx.inventoryReservation.findMany({
+            const existingCheckouts = await tx.checkout.findMany({
                 where: {
-                    listingId: { in: listingIds },
-                    status: "ACTIVE",
-                    expiresAt: { gt: reservationCheckTime }
+                    userId,
+                    status: { in: ["PENDING", "PAYMENT_PENDING"] },
+                    expiresAt: { gt: now }
                 },
-                select: {
-                    listingId: true,
-                    quantity: true
+                orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+                include: {
+                    checkoutItems: {
+                        orderBy: { listingId: "asc" },
+                        select: {
+                            listingId: true,
+                            title: true,
+                            unitPrice: true,
+                            quantity: true
+                        }
+                    },
+                    inventoryReservations: {
+                        select: {
+                            listingId: true,
+                            quantity: true,
+                            status: true,
+                            expiresAt: true
+                        }
+                    },
+                    orders: {
+                        orderBy: { id: "asc" },
+                        include: {
+                            seller: {
+                                select: {
+                                    sellerProfile: {
+                                        select: { businessName: true, slug: true }
+                                    }
+                                }
+                            },
+                            orderItems: {
+                                orderBy: { listingId: "asc" },
+                                select: {
+                                    listingId: true,
+                                    title: true,
+                                    unitPrice: true,
+                                    quantity: true
+                                }
+                            }
+                        }
+                    },
+                    paymentAttempts: {
+                        select: { status: true }
+                    }
                 }
             })
-            const reservedQuantities = new Map<number, number>()
-
-            for (const reservation of activeReservations) {
-                reservedQuantities.set(
-                    reservation.listingId,
-                    (reservedQuantities.get(reservation.listingId) ?? 0) + reservation.quantity
-                )
-            }
 
             const sellers = new Map<number, SellerPreview>()
 
             for (const cartItem of cart.cartItems) {
                 const listing = cartItem.listing
                 const sellerProfile = listing.user.sellerProfile
-                const reservedQuantity = reservedQuantities.get(listing.id) ?? 0
-                const availableQuantity = Math.max(listing.stockQuantity - reservedQuantity, 0)
 
                 if (
                     !Number.isSafeInteger(cartItem.quantity) ||
@@ -250,8 +398,7 @@ export async function createCheckout(req: Request, res: Response) {
                     !Number.isSafeInteger(listing.stockQuantity) ||
                     listing.stockQuantity < 0 ||
                     !Number.isFinite(listing.price) ||
-                    listing.price <= 0 ||
-                    cartItem.quantity > availableQuantity
+                    listing.price <= 0
                 ) {
                     throw new CheckoutCreationError(
                         409,
@@ -312,7 +459,7 @@ export async function createCheckout(req: Request, res: Response) {
                     quantity: cartItem.quantity,
                     lineSubtotal: formatMoney(lineSubtotal),
                     stockQuantity: listing.stockQuantity,
-                    availableQuantity
+                    availableQuantity: listing.stockQuantity
                 })
                 sellerPreview.subtotal = sellerPreview.subtotal.plus(lineSubtotal)
             }
@@ -334,6 +481,242 @@ export async function createCheckout(req: Request, res: Response) {
                     .some((amount) => amount.greaterThan(decimalMaximum))
             ) {
                 throw new CheckoutCreationError(409, "Checkout total exceeds the supported payment amount")
+            }
+
+            const review = buildCheckoutReview(userId, sellerPreviews)
+            const cartSnapshot = sortCartItems(cart.cartItems)
+            const hasSameCart = (checkout: typeof existingCheckouts[number]) => {
+                const savedItems = sortCartItems(checkout.checkoutItems)
+                return savedItems.length === cartSnapshot.length &&
+                    savedItems.every((item, index) =>
+                        item.listingId === cartSnapshot[index]?.listingId &&
+                        item.quantity === cartSnapshot[index]?.quantity
+                    )
+            }
+            const hasSamePricesAndShipping = (checkout: typeof existingCheckouts[number]) => {
+                const savedItems = sortCartItems(checkout.checkoutItems)
+                const currentItems = sortCartItems(cart.cartItems)
+                const pricesMatch = savedItems.length === currentItems.length &&
+                    savedItems.every((item, index) => {
+                        const current = currentItems[index]
+                        return current !== undefined &&
+                            item.listingId === current.listingId &&
+                            item.unitPrice.equals(
+                                new Prisma.Decimal(current.listing.price.toString()).toDecimalPlaces(2)
+                            )
+                    })
+                const savedShipping = new Map(
+                    checkout.orders.map((order) => [order.sellerId, order.shippingCost])
+                )
+                const shippingMatches = checkout.orders.length === sellerPreviews.length &&
+                    sellerPreviews.length === savedShipping.size &&
+                    sellerPreviews.every((seller) =>
+                        savedShipping.get(seller.sellerId)?.equals(seller.shipping) === true
+                    )
+
+                return pricesMatch && shippingMatches
+            }
+            const reservationsMatch = (checkout: typeof existingCheckouts[number]) => {
+                const activeReservations = sortCartItems(
+                    checkout.inventoryReservations
+                        .filter((reservation) => reservation.status === "ACTIVE" && reservation.expiresAt > now)
+                        .map(({ listingId, quantity }) => ({ listingId, quantity }))
+                )
+                const cartItems = sortCartItems(cart.cartItems)
+                return activeReservations.length === cartItems.length &&
+                    activeReservations.every((reservation, index) =>
+                        reservation.listingId === cartItems[index]?.listingId &&
+                        reservation.quantity === cartItems[index]?.quantity
+                    )
+            }
+
+            const hasMatchingCartAndDelivery = existingCheckouts.some((checkout) =>
+                hasSameCart(checkout) && deliveryMatchesCheckout(delivery, checkout)
+            )
+
+            if (
+                !hasMatchingCartAndDelivery &&
+                existingCheckouts.some((checkout) => !deliveryMatchesCheckout(delivery, checkout))
+            ) {
+                throw new CheckoutCreationError(
+                    409,
+                    "Delivery details differ from an existing checkout",
+                    "CHECKOUT_CONFLICT"
+                )
+            }
+
+            if (reviewToken !== review.reviewToken) {
+                throw new CheckoutCreationError(
+                    409,
+                    "Review the current cart prices and confirm before continuing",
+                    "CHECKOUT_REVIEW_REQUIRED",
+                    review
+                )
+            }
+
+            const reusableCheckout = existingCheckouts.find((checkout) =>
+                hasSameCart(checkout) &&
+                hasSamePricesAndShipping(checkout) &&
+                reservationsMatch(checkout) &&
+                checkout.orders.length > 0 &&
+                checkout.orders.every((order) => order.status === "PENDING_PAYMENT")
+            )
+
+            if (reusableCheckout) {
+                const checkoutSubtotal = reusableCheckout.orders.reduce(
+                    (sum, order) => sum.plus(order.subtotal),
+                    new Prisma.Decimal(0)
+                )
+                const checkoutShipping = reusableCheckout.orders.reduce(
+                    (sum, order) => sum.plus(order.shippingCost),
+                    new Prisma.Decimal(0)
+                )
+
+                return {
+                    httpStatus: 200,
+                    response: {
+                        code: "CHECKOUT_REUSED",
+                        checkout: {
+                            id: reusableCheckout.id,
+                            status: reusableCheckout.status,
+                            expiresAt: reusableCheckout.expiresAt,
+                            delivery: {
+                                fullName: reusableCheckout.deliveryName,
+                                phone: reusableCheckout.deliveryPhone,
+                                address: reusableCheckout.deliveryAddress,
+                                state: reusableCheckout.deliveryState,
+                                lga: reusableCheckout.deliveryLga,
+                                instructions: reusableCheckout.deliveryInstructions
+                            }
+                        },
+                        items: reusableCheckout.checkoutItems.map((item) => ({
+                            listingId: item.listingId,
+                            title: item.title,
+                            unitPrice: formatMoney(item.unitPrice),
+                            quantity: item.quantity
+                        })),
+                        subtotal: formatMoney(checkoutSubtotal),
+                        shipping: formatMoney(checkoutShipping),
+                        total: formatMoney(reusableCheckout.total),
+                        orders: reusableCheckout.orders.map((order) => ({
+                            id: order.id,
+                            seller: order.seller.sellerProfile
+                                ? {
+                                    businessName: order.seller.sellerProfile.businessName,
+                                    slug: order.seller.sellerProfile.slug
+                                }
+                                : null,
+                            status: order.status,
+                            subtotal: formatMoney(order.subtotal),
+                            shipping: formatMoney(order.shippingCost),
+                            total: formatMoney(order.total),
+                            items: order.orderItems.map((item) => ({
+                                listingId: item.listingId,
+                                title: item.title,
+                                unitPrice: formatMoney(item.unitPrice),
+                                quantity: item.quantity
+                            }))
+                        }))
+                    }
+                }
+            }
+
+            if (existingCheckouts.some((checkout) => !deliveryMatchesCheckout(delivery, checkout))) {
+                throw new CheckoutCreationError(
+                    409,
+                    "Delivery details differ from an existing checkout",
+                    "CHECKOUT_CONFLICT"
+                )
+            }
+
+            const hasUnsafeHistory = existingCheckouts.some((checkout) =>
+                checkout.status !== "PENDING" ||
+                checkout.paymentAttempts.length > 0 ||
+                checkout.orders.length === 0 ||
+                checkout.orders.some((order) => order.status !== "PENDING_PAYMENT")
+            )
+
+            if (hasUnsafeHistory) {
+                throw new CheckoutCreationError(
+                    409,
+                    "An existing checkout has payment activity and cannot be replaced",
+                    "CHECKOUT_CONFLICT"
+                )
+            }
+
+            const replaceableCheckoutIds = existingCheckouts.map(({ id }) => id)
+            const listingIds = cart.cartItems.map(({ listingId }) => listingId)
+            const activeReservations = await tx.inventoryReservation.findMany({
+                where: {
+                    listingId: { in: listingIds },
+                    status: "ACTIVE",
+                    expiresAt: { gt: now },
+                    ...(replaceableCheckoutIds.length > 0
+                        ? { checkoutId: { notIn: replaceableCheckoutIds } }
+                        : {})
+                },
+                select: {
+                    listingId: true,
+                    quantity: true
+                }
+            })
+            const reservedQuantities = new Map<number, number>()
+
+            for (const reservation of activeReservations) {
+                reservedQuantities.set(
+                    reservation.listingId,
+                    (reservedQuantities.get(reservation.listingId) ?? 0) + reservation.quantity
+                )
+            }
+
+            for (const cartItem of cart.cartItems) {
+                const availableQuantity = Math.max(
+                    cartItem.listing.stockQuantity - (reservedQuantities.get(cartItem.listingId) ?? 0),
+                    0
+                )
+
+                if (cartItem.quantity > availableQuantity) {
+                    throw new CheckoutCreationError(
+                        409,
+                        `Listing ${cartItem.listingId} is unavailable in the requested quantity`
+                    )
+                }
+            }
+
+            for (const checkout of existingCheckouts) {
+                const transitioned = await tx.checkout.updateMany({
+                    where: {
+                        id: checkout.id,
+                        userId,
+                        status: "PENDING",
+                        expiresAt: { gt: now }
+                    },
+                    data: { status: "EXPIRED" }
+                })
+
+                if (transitioned.count !== 1) {
+                    throw new CheckoutCreationError(
+                        409,
+                        "Checkout state changed before replacement could complete",
+                        "CHECKOUT_CONFLICT"
+                    )
+                }
+
+                await tx.inventoryReservation.updateMany({
+                    where: {
+                        checkoutId: checkout.id,
+                        status: "ACTIVE"
+                    },
+                    data: { status: "RELEASED" }
+                })
+
+                await tx.order.updateMany({
+                    where: {
+                        checkoutId: checkout.id,
+                        status: "PENDING_PAYMENT"
+                    },
+                    data: { status: "CANCELLED" }
+                })
             }
 
             const expiresAt = new Date(Date.now() + 15 * 60 * 1000)
@@ -408,6 +791,7 @@ export async function createCheckout(req: Request, res: Response) {
 
                 createdOrders.push({
                     id: order.id,
+                    sellerId: seller.sellerId,
                     seller: seller.seller,
                     status: "PENDING_PAYMENT" as const,
                     subtotal: formatMoney(seller.subtotal),
@@ -417,37 +801,66 @@ export async function createCheckout(req: Request, res: Response) {
             }
 
             return {
-                checkout: {
-                    id: checkout.id,
-                    status: checkout.status,
-                    expiresAt: checkout.expiresAt,
-                    delivery: {
-                        fullName: checkout.deliveryName,
-                        phone: checkout.deliveryPhone,
-                        address: checkout.deliveryAddress,
-                        state: checkout.deliveryState,
-                        lga: checkout.deliveryLga,
-                        instructions: checkout.deliveryInstructions
-                    }
-                },
-                subtotal: formatMoney(subtotal),
-                shipping: formatMoney(shipping),
-                total: formatMoney(total),
-                orders: createdOrders
+                httpStatus: 201,
+                response: {
+                    code: replaceableCheckoutIds.length > 0 ? "CHECKOUT_REPLACED" : "CHECKOUT_CREATED",
+                    checkout: {
+                        id: checkout.id,
+                        status: checkout.status,
+                        expiresAt: checkout.expiresAt,
+                        delivery: {
+                            fullName: checkout.deliveryName,
+                            phone: checkout.deliveryPhone,
+                            address: checkout.deliveryAddress,
+                            state: checkout.deliveryState,
+                            lga: checkout.deliveryLga,
+                            instructions: checkout.deliveryInstructions
+                        }
+                    },
+                    items: cart.cartItems.map(({ listingId, quantity, listing }) => ({
+                        listingId,
+                        title: listing.title,
+                        unitPrice: formatMoney(
+                            new Prisma.Decimal(listing.price.toString()).toDecimalPlaces(2)
+                        ),
+                        quantity
+                    })),
+                    subtotal: formatMoney(subtotal),
+                    shipping: formatMoney(shipping),
+                    total: formatMoney(total),
+                    orders: createdOrders.map(({ sellerId, ...order }) => ({
+                        ...order,
+                        items: cart.cartItems
+                            .filter(({ listing }) => listing.user.id === sellerId)
+                            .map(({ listingId, quantity, listing }) => ({
+                                listingId,
+                                title: listing.title,
+                                unitPrice: formatMoney(
+                                    new Prisma.Decimal(listing.price.toString()).toDecimalPlaces(2)
+                                ),
+                                quantity
+                            }))
+                    }))
+                }
             }
         }, {
             isolationLevel: Prisma.TransactionIsolationLevel.Serializable
         })
 
-        res.status(201).send(result)
+        res.status(result.httpStatus).send(result.response)
     } catch (error) {
         if (error instanceof CheckoutCreationError) {
-            res.status(error.statusCode).send({ message: error.message })
+            res.status(error.statusCode).send({
+                message: error.message,
+                ...(error.code ? { code: error.code } : {}),
+                ...(error.review ? { review: error.review } : {})
+            })
             return
         }
 
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {
             res.status(409).send({
+                code: "CHECKOUT_CONFLICT",
                 message: "Checkout state changed while creating checkout. Please try again."
             })
             return
@@ -491,12 +904,24 @@ export async function getCheckoutPreview(req: Request, res: Response) {
             return
         }
 
+        const now = new Date()
+        const existingCheckoutIds = await prisma.checkout.findMany({
+            where: {
+                userId,
+                status: { in: ["PENDING", "PAYMENT_PENDING"] },
+                expiresAt: { gt: now }
+            },
+            select: { id: true }
+        })
         const listingIds = [...new Set(cart.cartItems.map(({ listingId }) => listingId))]
         const activeReservations = await prisma.inventoryReservation.findMany({
             where: {
                 listingId: { in: listingIds },
                 status: "ACTIVE",
-                expiresAt: { gt: new Date() }
+                expiresAt: { gt: now },
+                ...(existingCheckoutIds.length > 0
+                    ? { checkoutId: { notIn: existingCheckoutIds.map(({ id }) => id) } }
+                    : {})
             },
             select: {
                 listingId: true,
@@ -593,38 +1018,13 @@ export async function getCheckoutPreview(req: Request, res: Response) {
             sellerPreview.subtotal = sellerPreview.subtotal.plus(lineSubtotal)
         }
 
-        const sellerGroups = Array.from(sellers.values()).map((sellerPreview) => {
-            const total = sellerPreview.subtotal.plus(sellerPreview.shipping)
-
-            return {
-                seller: sellerPreview.seller,
-                items: sellerPreview.items,
-                subtotal: formatMoney(sellerPreview.subtotal),
-                shipping: formatMoney(sellerPreview.shipping),
-                total: formatMoney(total)
-            }
-        })
-
-        const subtotal = Array.from(sellers.values()).reduce(
-            (total, sellerPreview) => total.plus(sellerPreview.subtotal),
-            new Prisma.Decimal(0)
-        )
-        const shipping = Array.from(sellers.values()).reduce(
-            (total, sellerPreview) => total.plus(sellerPreview.shipping),
-            new Prisma.Decimal(0)
-        )
-
-        res.send({
-            sellers: sellerGroups,
-            subtotal: formatMoney(subtotal),
-            shipping: formatMoney(shipping),
-            total: formatMoney(subtotal.plus(shipping))
-        })
+        res.send(buildCheckoutReview(userId, Array.from(sellers.values())))
     } catch (error) {
         console.error(error)
 
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {
             res.status(409).send({
+                code: "CHECKOUT_CONFLICT",
                 message: "Checkout state changed while loading your cart. Please try again."
             })
             return
