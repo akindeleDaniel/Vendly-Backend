@@ -100,15 +100,29 @@ function sortCartItems<T extends { listingId: number; quantity: number }>(items:
 
 function createReviewToken(
     userId: number,
-    items: Array<{ listingId: number; quantity: number; unitPrice: string }>,
+    items: Array<{
+        listingId: number
+        quantity: number
+        unitPrice: string
+        stockQuantity: number
+        availableQuantity: number
+    }>,
     sellers: Array<{ sellerId: number; shipping: Prisma.Decimal }>
 ): string {
     const snapshot = {
         userId,
-        items: sortCartItems(items).map(({ listingId, quantity, unitPrice }) => ({
+        items: sortCartItems(items).map(({
             listingId,
             quantity,
-            unitPrice
+            unitPrice,
+            stockQuantity,
+            availableQuantity
+        }) => ({
+            listingId,
+            quantity,
+            unitPrice,
+            stockQuantity,
+            availableQuantity
         })),
         sellers: [...sellers]
             .sort((left, right) => left.sellerId - right.sellerId)
@@ -145,7 +159,19 @@ function buildCheckoutReview(
     const items = sortedSellers.flatMap((seller) => seller.items)
     const reviewToken = createReviewToken(
         userId,
-        items.map(({ listingId, quantity, unitPrice }) => ({ listingId, quantity, unitPrice })),
+        items.map(({
+            listingId,
+            quantity,
+            unitPrice,
+            stockQuantity,
+            availableQuantity
+        }) => ({
+            listingId,
+            quantity,
+            unitPrice,
+            stockQuantity,
+            availableQuantity
+        })),
         sortedSellers.map(({ sellerId, shipping: sellerShipping }) => ({
             sellerId,
             shipping: sellerShipping
@@ -386,11 +412,40 @@ export async function createCheckout(req: Request, res: Response) {
                 }
             })
 
+            const replaceableCheckoutIds = existingCheckouts.map(({ id }) => id)
+            const listingIds = cart.cartItems.map(({ listingId }) => listingId)
+            const activeReservations = await tx.inventoryReservation.findMany({
+                where: {
+                    listingId: { in: listingIds },
+                    status: "ACTIVE",
+                    expiresAt: { gt: now },
+                    ...(replaceableCheckoutIds.length > 0
+                        ? { checkoutId: { notIn: replaceableCheckoutIds } }
+                        : {})
+                },
+                select: {
+                    listingId: true,
+                    quantity: true
+                }
+            })
+            const reservedQuantities = new Map<number, number>()
+
+            for (const reservation of activeReservations) {
+                reservedQuantities.set(
+                    reservation.listingId,
+                    (reservedQuantities.get(reservation.listingId) ?? 0) + reservation.quantity
+                )
+            }
+
             const sellers = new Map<number, SellerPreview>()
 
             for (const cartItem of cart.cartItems) {
                 const listing = cartItem.listing
                 const sellerProfile = listing.user.sellerProfile
+                const availableQuantity = Math.max(
+                    listing.stockQuantity - (reservedQuantities.get(listing.id) ?? 0),
+                    0
+                )
 
                 if (
                     !Number.isSafeInteger(cartItem.quantity) ||
@@ -398,7 +453,8 @@ export async function createCheckout(req: Request, res: Response) {
                     !Number.isSafeInteger(listing.stockQuantity) ||
                     listing.stockQuantity < 0 ||
                     !Number.isFinite(listing.price) ||
-                    listing.price <= 0
+                    listing.price <= 0 ||
+                    cartItem.quantity > availableQuantity
                 ) {
                     throw new CheckoutCreationError(
                         409,
@@ -459,7 +515,7 @@ export async function createCheckout(req: Request, res: Response) {
                     quantity: cartItem.quantity,
                     lineSubtotal: formatMoney(lineSubtotal),
                     stockQuantity: listing.stockQuantity,
-                    availableQuantity: listing.stockQuantity
+                    availableQuantity
                 })
                 sellerPreview.subtotal = sellerPreview.subtotal.plus(lineSubtotal)
             }
@@ -642,45 +698,6 @@ export async function createCheckout(req: Request, res: Response) {
                     "An existing checkout has payment activity and cannot be replaced",
                     "CHECKOUT_CONFLICT"
                 )
-            }
-
-            const replaceableCheckoutIds = existingCheckouts.map(({ id }) => id)
-            const listingIds = cart.cartItems.map(({ listingId }) => listingId)
-            const activeReservations = await tx.inventoryReservation.findMany({
-                where: {
-                    listingId: { in: listingIds },
-                    status: "ACTIVE",
-                    expiresAt: { gt: now },
-                    ...(replaceableCheckoutIds.length > 0
-                        ? { checkoutId: { notIn: replaceableCheckoutIds } }
-                        : {})
-                },
-                select: {
-                    listingId: true,
-                    quantity: true
-                }
-            })
-            const reservedQuantities = new Map<number, number>()
-
-            for (const reservation of activeReservations) {
-                reservedQuantities.set(
-                    reservation.listingId,
-                    (reservedQuantities.get(reservation.listingId) ?? 0) + reservation.quantity
-                )
-            }
-
-            for (const cartItem of cart.cartItems) {
-                const availableQuantity = Math.max(
-                    cartItem.listing.stockQuantity - (reservedQuantities.get(cartItem.listingId) ?? 0),
-                    0
-                )
-
-                if (cartItem.quantity > availableQuantity) {
-                    throw new CheckoutCreationError(
-                        409,
-                        `Listing ${cartItem.listingId} is unavailable in the requested quantity`
-                    )
-                }
             }
 
             for (const checkout of existingCheckouts) {
