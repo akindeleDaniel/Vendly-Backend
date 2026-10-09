@@ -1,5 +1,6 @@
 import type { Request, Response } from "express";
 import prisma from "../lib/prisma.js";
+import { Prisma } from "../generated/prisma/client.js";
 
 const cartItemListingSelect = {
     id: true,
@@ -21,6 +22,65 @@ const cartItemListingSelect = {
     }
 } as const;
 
+class CartRequestError extends Error {
+    constructor(
+        readonly statusCode: number,
+        message: string
+    ) {
+        super(message);
+    }
+}
+
+async function getOtherReservedQuantities(
+    tx: Prisma.TransactionClient,
+    userId: number,
+    listingIds: number[],
+    now: Date
+): Promise<Map<number, number>> {
+    const reservations = await tx.inventoryReservation.findMany({
+        where: {
+            listingId: { in: listingIds },
+            status: "ACTIVE",
+            expiresAt: { gt: now },
+            checkout: {
+                userId: { not: userId }
+            }
+        },
+        select: {
+            listingId: true,
+            quantity: true
+        }
+    });
+    const reservedQuantities = new Map<number, number>();
+
+    for (const reservation of reservations) {
+        reservedQuantities.set(
+            reservation.listingId,
+            (reservedQuantities.get(reservation.listingId) ?? 0) + reservation.quantity
+        );
+    }
+
+    return reservedQuantities;
+}
+
+function availableQuantity(stockQuantity: number, reservedQuantity: number): number {
+    return Math.max(stockQuantity - reservedQuantity, 0);
+}
+
+function sendCartConflict(error: unknown, res: Response): boolean {
+    if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        ["P2002", "P2025", "P2034"].includes(error.code)
+    ) {
+        res.status(409).send({
+            message: "Cart or inventory changed. Please try again."
+        });
+        return true;
+    }
+
+    return false;
+}
+
 
 
 export async function getCart(req: Request, res: Response) {
@@ -32,24 +92,54 @@ export async function getCart(req: Request, res: Response) {
     }
 
     try {
-        const cart = await prisma.cart.findUnique({
-            where: { userId },
-            select: {
-                cartItems: {
-                    select: {
-                        listingId: true,
-                        quantity: true,
-                        listing: {
-                            select: cartItemListingSelect
+        const cart = await prisma.$transaction(async (tx) => {
+            const currentCart = await tx.cart.findUnique({
+                where: { userId },
+                select: {
+                    cartItems: {
+                        select: {
+                            listingId: true,
+                            quantity: true,
+                            listing: {
+                                select: cartItemListingSelect
+                            }
                         }
                     }
                 }
+            });
+
+            if (!currentCart) {
+                return null;
             }
+
+            const now = new Date();
+            const reservedQuantities = await getOtherReservedQuantities(
+                tx,
+                userId,
+                currentCart.cartItems.map(({ listingId }) => listingId),
+                now
+            );
+
+            return {
+                ...currentCart,
+                cartItems: currentCart.cartItems.map((item) => ({
+                    ...item,
+                    availableQuantity: availableQuantity(
+                        item.listing.stockQuantity,
+                        reservedQuantities.get(item.listingId) ?? 0
+                    )
+                }))
+            };
+        }, {
+            isolationLevel: Prisma.TransactionIsolationLevel.Serializable
         });
 
         res.send({ cart });
     } catch (error) {
         console.error(error);
+        if (sendCartConflict(error, res)) {
+            return;
+        }
         res.status(500).send({
             message: "Sorry, there is an issue on our end"
         });
@@ -80,87 +170,87 @@ export async function addToCart(req: Request, res: Response) {
     }
 
     try {
-        const listing = await prisma.listing.findUnique({
-            where: { id: listingId }
-        });
-
-        if (!listing) {
-            res.status(404).send({
-                message: "This Listing was not found"
+        const result = await prisma.$transaction(async (tx) => {
+            const listing = await tx.listing.findUnique({
+                where: { id: listingId },
+                select: { stockQuantity: true }
             });
-            return;
-        }
 
-        if (listing.stockQuantity === 0) {
-            res.status(409).send({
-                message: "This listing has been sold out"
-            });
-            return;
-        }
-
-        if (quantity > listing.stockQuantity) {
-            res.status(409).send({
-                message: `Only ${listing.stockQuantity} units currently available`
-            });
-            return;
-        }
-
-        const cart = await prisma.cart.findUnique({
-            where: { userId: id }
-        });
-
-        if (!cart) {
-            res.status(500).send({
-                message: "Cart not found"
-            });
-            return;
-        }
-
-        const cartItem = await prisma.cartItem.findUnique({
-            where: {
-                cartId_listingId: {
-                    cartId: cart.id,
-                    listingId: listingId
-                }
-            }
-        });
-
-        if (cartItem) {
-            const newQuantity = cartItem.quantity + quantity;
-
-            if (newQuantity > listing.stockQuantity) {
-                res.status(409).send({
-                    message: `Only ${listing.stockQuantity} units currently available`
-                });
-                return;
+            if (!listing) {
+                throw new CartRequestError(404, "This Listing was not found");
             }
 
-            const updatedCartItem = await prisma.cartItem.update({
+            const cart = await tx.cart.findUnique({
+                where: { userId: id }
+            });
+
+            if (!cart) {
+                throw new CartRequestError(500, "Cart not found");
+            }
+
+            const cartItem = await tx.cartItem.findUnique({
                 where: {
-                    id: cartItem.id
-                },
-                data: {
-                    quantity: newQuantity
+                    cartId_listingId: {
+                        cartId: cart.id,
+                        listingId
+                    }
                 }
             });
+            const reservedQuantities = await getOtherReservedQuantities(
+                tx,
+                id,
+                [listingId],
+                new Date()
+            );
+            const available = availableQuantity(
+                listing.stockQuantity,
+                reservedQuantities.get(listingId) ?? 0
+            );
+            const newQuantity = (cartItem?.quantity ?? 0) + quantity;
 
-            res.status(200).send(updatedCartItem);
-            return;
-        }
-
-        const newCartItem = await prisma.cartItem.create({
-            data: {
-                cartId: cart.id,
-                listingId: listingId,
-                quantity: quantity
+            if (newQuantity > available) {
+                throw new CartRequestError(
+                    409,
+                    `Only ${available} units currently available`
+                );
             }
+
+            const created = cartItem === null;
+            const updatedCartItem = cartItem
+                ? await tx.cartItem.update({
+                    where: { id: cartItem.id },
+                    data: { quantity: newQuantity }
+                })
+                : await tx.cartItem.create({
+                    data: {
+                        cartId: cart.id,
+                        listingId,
+                        quantity
+                    }
+                });
+
+            return {
+                ...updatedCartItem,
+                availableQuantity: available,
+                created
+            };
+        }, {
+            isolationLevel: Prisma.TransactionIsolationLevel.Serializable
         });
 
-        res.status(201).send(newCartItem);
-        return;
+        const { created, ...cartItem } = result;
+        res.status(created ? 201 : 200).send(cartItem);
 
     } catch (error) {
+        if (error instanceof CartRequestError) {
+            res.status(error.statusCode).send({ message: error.message });
+            return;
+        }
+
         console.error(error);
+        if (sendCartConflict(error, res)) {
+            return;
+        }
         res.status(500).send({
             message: "Sorry, there is an issue on our end"
         });
@@ -190,64 +280,90 @@ export async function updateCartItem(req: Request, res: Response) {
     }
 
     try {
-        const cart = await prisma.cart.findUnique({
-            where: { userId },
-            select: { id: true }
-        });
+        const result = await prisma.$transaction(async (tx) => {
+            const cart = await tx.cart.findUnique({
+                where: { userId },
+                select: { id: true }
+            });
 
-        if (!cart) {
-            res.status(404).send({ message: "Cart not found" });
-            return;
-        }
+            if (!cart) {
+                throw new CartRequestError(404, "Cart not found");
+            }
 
-        const cartItem = await prisma.cartItem.findUnique({
-            where: {
-                cartId_listingId: {
-                    cartId: cart.id,
-                    listingId
-                }
-            },
-            select: {
-                listing: {
-                    select: {
-                        stockQuantity: true
+            const cartItem = await tx.cartItem.findUnique({
+                where: {
+                    cartId_listingId: {
+                        cartId: cart.id,
+                        listingId
+                    }
+                },
+                select: {
+                    listingId: true,
+                    quantity: true,
+                    listing: {
+                        select: cartItemListingSelect
                     }
                 }
-            }
-        });
-
-        if (!cartItem) {
-            res.status(404).send({ message: "Cart item not found" });
-            return;
-        }
-
-        if (quantity > cartItem.listing.stockQuantity) {
-            res.status(409).send({
-                message: `Only ${cartItem.listing.stockQuantity} units currently available`
             });
+
+            if (!cartItem) {
+                throw new CartRequestError(404, "Cart item not found");
+            }
+
+            const reservedQuantities = await getOtherReservedQuantities(
+                tx,
+                userId,
+                [listingId],
+                new Date()
+            );
+            const available = availableQuantity(
+                cartItem.listing.stockQuantity,
+                reservedQuantities.get(listingId) ?? 0
+            );
+
+            if (quantity > available) {
+                throw new CartRequestError(
+                    409,
+                    `Only ${available} units currently available`
+                );
+            }
+
+            const updatedCartItem = await tx.cartItem.update({
+                where: {
+                    cartId_listingId: {
+                        cartId: cart.id,
+                        listingId
+                    }
+                },
+                data: { quantity },
+                select: {
+                    listingId: true,
+                    quantity: true,
+                    listing: {
+                        select: cartItemListingSelect
+                    }
+                }
+            });
+
+            return {
+                ...updatedCartItem,
+                availableQuantity: available
+            };
+        }, {
+            isolationLevel: Prisma.TransactionIsolationLevel.Serializable
+        });
+
+        res.send(result);
+    } catch (error) {
+        if (error instanceof CartRequestError) {
+            res.status(error.statusCode).send({ message: error.message });
             return;
         }
 
-        const updatedCartItem = await prisma.cartItem.update({
-            where: {
-                cartId_listingId: {
-                    cartId: cart.id,
-                    listingId
-                }
-            },
-            data: { quantity },
-            select: {
-                listingId: true,
-                quantity: true,
-                listing: {
-                    select: cartItemListingSelect
-                }
-            }
-        });
-
-        res.send(updatedCartItem);
-    } catch (error) {
         console.error(error);
+        if (sendCartConflict(error, res)) {
+            return;
+        }
         res.status(500).send({
             message: "Sorry, there is an issue on our end"
         });
