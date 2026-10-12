@@ -232,8 +232,13 @@ export const updateListing = async(req:Request, res:Response) =>{
                 const reservations = await tx.inventoryReservation.aggregate({
                     where: {
                         listingId: id,
-                        status: "ACTIVE",
-                        expiresAt: { gt: now }
+                        OR: [
+                            { status: "PROTECTED" },
+                            {
+                                status: "ACTIVE",
+                                expiresAt: { gt: now }
+                            }
+                        ]
                     },
                     _sum: {
                         quantity: true
@@ -307,6 +312,18 @@ export const deleteListing = async(req:Request, res:Response) =>{
         await prisma.listing.delete({where: {id}})
         res.send({message:"Listing deleted successfully"})
     }catch(error){
+        // P2003 = foreign key constraint failed (listing still referenced)
+        if (
+            error instanceof Prisma.PrismaClientKnownRequestError &&
+            error.code === "P2003"
+        ) {
+            res.status(409).send({
+                message:
+                    "Cannot delete listing because it is referenced by checkout, order, or reservation history",
+            })
+            return
+        }
+
         res.status(500).send({message:"Sorry there is an issue on our end"})
     }
 }

@@ -204,7 +204,12 @@ function deliveryMatchesCheckout(delivery: DeliveryInput, checkout: {
 }
 
 async function acquireCheckoutCreationLock(tx: Prisma.TransactionClient, userId: number): Promise<void> {
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(1447380556, ${userId})`
+    await tx.$queryRaw`
+        WITH lock_acquired AS MATERIALIZED (
+            SELECT pg_advisory_xact_lock(1447380556, ${userId}::integer)
+        )
+        SELECT 1 FROM lock_acquired
+    `
 }
 
 async function expireExpiredCheckouts(userId: number, now = new Date()): Promise<void> {
@@ -212,43 +217,64 @@ async function expireExpiredCheckouts(userId: number, now = new Date()): Promise
         const expiredCheckouts = await tx.checkout.findMany({
             where: {
                 userId,
-                status: { in: ["PENDING", "PAYMENT_PENDING"] },
-                expiresAt: { lte: now }
+                expiresAt: { lte: now },
+                OR: [
+                    { status: { in: ["PENDING", "PAYMENT_PENDING"] } },
+                    {
+                        status: "EXPIRED",
+                        inventoryReservations: {
+                            some: { status: { in: ["ACTIVE", "PROTECTED"] } }
+                        }
+                    }
+                ]
             },
-            select: { id: true }
+            select: {
+                id: true,
+                status: true,
+                paymentAttempts: { select: { status: true } }
+            }
         })
 
         for (const checkout of expiredCheckouts) {
-            const transition = await tx.checkout.updateMany({
-                where: {
-                    id: checkout.id,
-                    userId,
-                    status: { in: ["PENDING", "PAYMENT_PENDING"] },
-                    expiresAt: { lte: now }
-                },
-                data: { status: "EXPIRED" }
-            })
+            if (checkout.status !== "EXPIRED") {
+                const transition = await tx.checkout.updateMany({
+                    where: {
+                        id: checkout.id,
+                        userId,
+                        status: { in: ["PENDING", "PAYMENT_PENDING"] },
+                        expiresAt: { lte: now }
+                    },
+                    data: { status: "EXPIRED" }
+                })
 
-            if (transition.count === 0) {
-                continue
+                if (transition.count === 0) {
+                    continue
+                }
             }
+
+            const hasUnresolvedOrSuccessfulPayment = checkout.paymentAttempts.some(
+                ({ status }) => status === "PENDING" || status === "SUCCESS"
+            )
 
             await tx.inventoryReservation.updateMany({
                 where: {
                     checkoutId: checkout.id,
-                    status: "ACTIVE",
-                    expiresAt: { lte: now }
+                    status: { in: ["ACTIVE", "PROTECTED"] }
                 },
-                data: { status: "EXPIRED" }
+                data: {
+                    status: hasUnresolvedOrSuccessfulPayment ? "PROTECTED" : "EXPIRED"
+                }
             })
 
-            await tx.order.updateMany({
-                where: {
-                    checkoutId: checkout.id,
-                    status: "PENDING_PAYMENT"
-                },
-                data: { status: "CANCELLED" }
-            })
+            if (!hasUnresolvedOrSuccessfulPayment) {
+                await tx.order.updateMany({
+                    where: {
+                        checkoutId: checkout.id,
+                        status: "PENDING_PAYMENT"
+                    },
+                    data: { status: "CANCELLED" }
+                })
+            }
         }
     }, {
         isolationLevel: Prisma.TransactionIsolationLevel.Serializable
@@ -417,11 +443,16 @@ export async function createCheckout(req: Request, res: Response) {
             const activeReservations = await tx.inventoryReservation.findMany({
                 where: {
                     listingId: { in: listingIds },
-                    status: "ACTIVE",
-                    expiresAt: { gt: now },
-                    ...(replaceableCheckoutIds.length > 0
-                        ? { checkoutId: { notIn: replaceableCheckoutIds } }
-                        : {})
+                    OR: [
+                        { status: "PROTECTED" },
+                        {
+                            status: "ACTIVE",
+                            expiresAt: { gt: now },
+                            ...(replaceableCheckoutIds.length > 0
+                                ? { checkoutId: { notIn: replaceableCheckoutIds } }
+                                : {})
+                        }
+                    ]
                 },
                 select: {
                     listingId: true,
@@ -736,7 +767,7 @@ export async function createCheckout(req: Request, res: Response) {
                 })
             }
 
-            const expiresAt = new Date(Date.now() + 15 * 60 * 1000)
+            const expiresAt = new Date(Date.now() + (15 * 60 * 1000))
             const checkout = await tx.checkout.create({
                 data: {
                     userId,
@@ -934,11 +965,16 @@ export async function getCheckoutPreview(req: Request, res: Response) {
         const activeReservations = await prisma.inventoryReservation.findMany({
             where: {
                 listingId: { in: listingIds },
-                status: "ACTIVE",
-                expiresAt: { gt: now },
-                ...(existingCheckoutIds.length > 0
-                    ? { checkoutId: { notIn: existingCheckoutIds.map(({ id }) => id) } }
-                    : {})
+                OR: [
+                    { status: "PROTECTED" },
+                    {
+                        status: "ACTIVE",
+                        expiresAt: { gt: now },
+                        ...(existingCheckoutIds.length > 0
+                            ? { checkoutId: { notIn: existingCheckoutIds.map(({ id }) => id) } }
+                            : {})
+                    }
+                ]
             },
             select: {
                 listingId: true,

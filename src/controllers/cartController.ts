@@ -40,11 +40,16 @@ async function getOtherReservedQuantities(
     const reservations = await tx.inventoryReservation.findMany({
         where: {
             listingId: { in: listingIds },
-            status: "ACTIVE",
-            expiresAt: { gt: now },
-            checkout: {
-                userId: { not: userId }
-            }
+            OR: [
+                { status: "PROTECTED" },
+                {
+                    status: "ACTIVE",
+                    expiresAt: { gt: now },
+                    checkout: {
+                        userId: { not: userId }
+                    }
+                }
+            ]
         },
         select: {
             listingId: true,

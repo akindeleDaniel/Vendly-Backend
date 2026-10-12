@@ -119,6 +119,7 @@ enum PaymentProvider {
 
 enum InventoryReservationStatus {
   ACTIVE
+  PROTECTED
   CONSUMED
   RELEASED
   EXPIRED
