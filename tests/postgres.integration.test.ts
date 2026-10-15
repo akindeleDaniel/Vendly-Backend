@@ -275,7 +275,7 @@ function loadConsumerCheckouts(userId: number) {
 }
 
 async function installRowTrigger(options: {
-    table: "Checkout" | "OrderItem"
+    table: "Checkout" | "OrderItem" | "Listing"
     event: "INSERT" | "UPDATE"
     column: "id" | "listingId"
     targetId: number
@@ -2817,6 +2817,112 @@ test("reports a retryable conflict when checkout expiry hits a serialization fai
         assert.equal(checkout?.status, "PENDING")
         assert.deepEqual(checkout?.inventoryReservations.map(({ status }) => status), ["ACTIVE"])
         assert.deepEqual(checkout?.orders.map(({ status }) => status), ["PENDING_PAYMENT"])
+    } finally {
+        await removeTrigger?.()
+        await fixture.cleanup()
+    }
+})
+
+async function updateListingStock(fixture: CheckoutLifecycleFixture, stockQuantity: unknown) {
+    const response = await fetch(`${fixture.baseUrl}/listings/${fixture.listingId}`, {
+        method: "PATCH",
+        headers: {
+            cookie: `token=${fixture.sellerToken}`,
+            "content-type": "application/json"
+        },
+        body: JSON.stringify({ stockQuantity })
+    })
+    return {
+        status: response.status,
+        body: await response.json() as { message?: unknown; stockQuantity?: unknown }
+    }
+}
+
+async function loadListingStock(listingId: number) {
+    const listing = await prisma.listing.findUniqueOrThrow({
+        where: { id: listingId },
+        select: { stockQuantity: true }
+    })
+    return listing.stockQuantity
+}
+
+test("updates listing stock at or above the active reserved quantity", async () => {
+    const fixture = await createCheckoutLifecycleFixture("listing-stock-update", 5, 2)
+
+    try {
+        await fixture.createCheckout()
+
+        for (const stockQuantity of [2, 4]) {
+            const response = await updateListingStock(fixture, stockQuantity)
+            assert.equal(response.status, 200)
+            assert.equal(response.body.stockQuantity, stockQuantity)
+            assert.equal(await loadListingStock(fixture.listingId), stockQuantity)
+        }
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("rejects listing stock below the active reserved quantity without logging an unexpected error", async (t) => {
+    const fixture = await createCheckoutLifecycleFixture("listing-stock-reserved", 5, 2)
+
+    try {
+        await fixture.createCheckout()
+        const consoleError = t.mock.method(console, "error", () => {})
+
+        const response = await updateListingStock(fixture, 1)
+        assert.equal(response.status, 409)
+        assert.deepEqual(response.body, {
+            message: "Stock quantity cannot be less than 2 units currently reserved"
+        })
+        assert.equal(consoleError.mock.callCount(), 0)
+        assert.equal(await loadListingStock(fixture.listingId), 5)
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("rejects invalid listing stock values", async () => {
+    const fixture = await createCheckoutLifecycleFixture("listing-stock-invalid", 5, 2)
+
+    try {
+        for (const stockQuantity of [-1, 1.5, "3", null]) {
+            const response = await updateListingStock(fixture, stockQuantity)
+            assert.equal(response.status, 400, `Expected 400 for ${JSON.stringify(stockQuantity)}`)
+            assert.deepEqual(response.body, {
+                message: "Stock quantity must be a whole number greater than or equal to 0"
+            })
+        }
+        assert.equal(await loadListingStock(fixture.listingId), 5)
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("logs unexpected listing stock update failures and returns a generic error", async (t) => {
+    const fixture = await createCheckoutLifecycleFixture("listing-stock-unexpected", 5, 2)
+    let removeTrigger: (() => Promise<void>) | undefined
+
+    try {
+        removeTrigger = await installRowTrigger({
+            table: "Listing",
+            event: "UPDATE",
+            column: "id",
+            targetId: fixture.listingId,
+            matchedStatement: "RAISE EXCEPTION 'integration test forced listing update failure';"
+        })
+        const consoleError = t.mock.method(console, "error", () => {})
+
+        const response = await updateListingStock(fixture, 4)
+        assert.equal(response.status, 500)
+        assert.deepEqual(response.body, { message: "Sorry there is an issue on our end" })
+        assert.equal(consoleError.mock.callCount(), 1)
+        const [operation, context, loggedError] = consoleError.mock.calls[0]?.arguments ?? []
+        assert.equal(operation, "updateListing failed unexpectedly")
+        assert.deepEqual(context, { listingId: fixture.listingId })
+        assert.ok(loggedError instanceof Error)
+        assert.match(loggedError.message, /integration test forced listing update failure/)
+        assert.equal(await loadListingStock(fixture.listingId), 5)
     } finally {
         await removeTrigger?.()
         await fixture.cleanup()

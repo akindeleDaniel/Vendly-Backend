@@ -278,6 +278,7 @@ export const updateListing = async(req:Request, res:Response) =>{
             return
         }
 
+        console.error("updateListing failed unexpectedly", { listingId: id }, error)
         res.status(500).send({message:"Sorry there is an issue on our end"})
     }
 }
