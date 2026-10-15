@@ -27,6 +27,16 @@ const checkoutListingSelect = {
     }
 } as const
 
+const checkoutCartItemSelect = {
+    listingId: true,
+    quantity: true,
+    listing: {
+        select: checkoutListingSelect
+    }
+} as const
+
+type CheckoutCartItem = Prisma.CartItemGetPayload<{ select: typeof checkoutCartItemSelect }>
+
 type PreviewItem = {
     listingId: number
     title: string
@@ -74,16 +84,39 @@ type CheckoutReview = {
     total: string
 }
 
-class CheckoutCreationError extends Error {
+type CheckoutErrorCode =
+    | "CHECKOUT_CONFLICT"
+    | "CHECKOUT_LOCKED"
+    | "CHECKOUT_REVIEW_REQUIRED"
+    | "CHECKOUT_ITEMS_UNAVAILABLE"
+
+class CheckoutRequestError extends Error {
     constructor(
         readonly statusCode: number,
         message: string,
-        readonly code?: string,
-        readonly review?: CheckoutReview
+        readonly code?: CheckoutErrorCode,
+        readonly details: Record<string, unknown> = {}
     ) {
         super(message)
     }
 }
+
+function sendCheckoutRequestError(error: CheckoutRequestError, res: Response): void {
+    res.status(error.statusCode).send({
+        message: error.message,
+        ...(error.code ? { code: error.code } : {}),
+        ...error.details
+    })
+}
+
+type CheckoutPricing = {
+    sellerPreviews: SellerPreview[]
+    subtotal: Prisma.Decimal
+    shipping: Prisma.Decimal
+    total: Prisma.Decimal
+}
+
+const maximumCheckoutAmount = new Prisma.Decimal("9999999999.99")
 
 type CheckoutRequest = {
     delivery: DeliveryInput
@@ -185,6 +218,124 @@ function buildCheckoutReview(
         shipping: formatMoney(shipping),
         total: formatMoney(subtotal.plus(shipping))
     }
+}
+
+function priceCheckoutItems(
+    cartItems: CheckoutCartItem[],
+    reservedQuantities: Map<number, number>
+): CheckoutPricing {
+    const sellers = new Map<number, SellerPreview>()
+
+    for (const cartItem of cartItems) {
+        const listing = cartItem.listing
+        const sellerProfile = listing.user.sellerProfile
+        const availableQuantity = Math.max(
+            listing.stockQuantity - (reservedQuantities.get(listing.id) ?? 0),
+            0
+        )
+
+        if (
+            !Number.isSafeInteger(cartItem.quantity) ||
+            cartItem.quantity < 1 ||
+            !Number.isSafeInteger(listing.stockQuantity) ||
+            listing.stockQuantity < 0 ||
+            !Number.isFinite(listing.price) ||
+            listing.price <= 0 ||
+            cartItem.quantity > availableQuantity
+        ) {
+            throw new CheckoutRequestError(
+                409,
+                `Listing ${cartItem.listingId} is unavailable in the requested quantity`,
+                "CHECKOUT_ITEMS_UNAVAILABLE",
+                { listingId: cartItem.listingId }
+            )
+        }
+
+        if (!sellerProfile) {
+            throw new CheckoutRequestError(
+                409,
+                `Listing ${cartItem.listingId} does not have an available seller storefront`,
+                "CHECKOUT_ITEMS_UNAVAILABLE",
+                { listingId: cartItem.listingId }
+            )
+        }
+
+        let sellerPreview = sellers.get(listing.user.id)
+
+        if (!sellerPreview) {
+            let shipping: Prisma.Decimal
+
+            if (sellerProfile.shippingPolicy === "FREE") {
+                shipping = new Prisma.Decimal(0)
+            } else if (
+                sellerProfile.shippingPolicy === "FIXED" &&
+                sellerProfile.shippingCost !== null &&
+                sellerProfile.shippingCost.greaterThanOrEqualTo(0)
+            ) {
+                shipping = sellerProfile.shippingCost.toDecimalPlaces(2)
+            } else {
+                throw new CheckoutRequestError(
+                    409,
+                    `Shipping information is unavailable for ${sellerProfile.businessName}`,
+                    "CHECKOUT_ITEMS_UNAVAILABLE",
+                    { listingId: cartItem.listingId }
+                )
+            }
+
+            sellerPreview = {
+                sellerId: listing.user.id,
+                seller: {
+                    businessName: sellerProfile.businessName,
+                    slug: sellerProfile.slug
+                },
+                items: [],
+                subtotal: new Prisma.Decimal(0),
+                shipping
+            }
+            sellers.set(listing.user.id, sellerPreview)
+        }
+
+        const unitPrice = new Prisma.Decimal(listing.price.toString()).toDecimalPlaces(2)
+        const lineSubtotal = unitPrice.times(cartItem.quantity)
+
+        sellerPreview.items.push({
+            listingId: listing.id,
+            title: listing.title,
+            description: listing.description,
+            imageUrl: listing.imageUrl,
+            category: listing.category,
+            unitPrice: formatMoney(unitPrice),
+            quantity: cartItem.quantity,
+            lineSubtotal: formatMoney(lineSubtotal),
+            stockQuantity: listing.stockQuantity,
+            availableQuantity
+        })
+        sellerPreview.subtotal = sellerPreview.subtotal.plus(lineSubtotal)
+    }
+
+    const sellerPreviews = Array.from(sellers.values())
+    const subtotal = sellerPreviews.reduce(
+        (total, seller) => total.plus(seller.subtotal),
+        new Prisma.Decimal(0)
+    )
+    const shipping = sellerPreviews.reduce(
+        (total, seller) => total.plus(seller.shipping),
+        new Prisma.Decimal(0)
+    )
+    const total = subtotal.plus(shipping)
+
+    if (
+        [subtotal, shipping, total, ...sellerPreviews.flatMap((seller) => [seller.subtotal, seller.shipping])]
+            .some((amount) => amount.greaterThan(maximumCheckoutAmount))
+    ) {
+        throw new CheckoutRequestError(
+            409,
+            "Checkout total exceeds the supported payment amount",
+            "CHECKOUT_ITEMS_UNAVAILABLE"
+        )
+    }
+
+    return { sellerPreviews, subtotal, shipping, total }
 }
 
 function deliveryMatchesCheckout(delivery: DeliveryInput, checkout: {
@@ -371,19 +522,13 @@ export async function createCheckout(req: Request, res: Response) {
                 where: { userId },
                 select: {
                     cartItems: {
-                        select: {
-                            listingId: true,
-                            quantity: true,
-                            listing: {
-                                select: checkoutListingSelect
-                            }
-                        }
+                        select: checkoutCartItemSelect
                     }
                 }
             })
 
             if (!cart || cart.cartItems.length === 0) {
-                throw new CheckoutCreationError(400, "Cart is empty")
+                throw new CheckoutRequestError(400, "Cart is empty")
             }
 
             const existingCheckouts = await tx.checkout.findMany({
@@ -468,107 +613,10 @@ export async function createCheckout(req: Request, res: Response) {
                 )
             }
 
-            const sellers = new Map<number, SellerPreview>()
-
-            for (const cartItem of cart.cartItems) {
-                const listing = cartItem.listing
-                const sellerProfile = listing.user.sellerProfile
-                const availableQuantity = Math.max(
-                    listing.stockQuantity - (reservedQuantities.get(listing.id) ?? 0),
-                    0
-                )
-
-                if (
-                    !Number.isSafeInteger(cartItem.quantity) ||
-                    cartItem.quantity < 1 ||
-                    !Number.isSafeInteger(listing.stockQuantity) ||
-                    listing.stockQuantity < 0 ||
-                    !Number.isFinite(listing.price) ||
-                    listing.price <= 0 ||
-                    cartItem.quantity > availableQuantity
-                ) {
-                    throw new CheckoutCreationError(
-                        409,
-                        `Listing ${cartItem.listingId} is unavailable in the requested quantity`
-                    )
-                }
-
-                if (!sellerProfile) {
-                    throw new CheckoutCreationError(
-                        409,
-                        `Listing ${cartItem.listingId} does not have an available seller storefront`
-                    )
-                }
-
-                let sellerPreview = sellers.get(listing.user.id)
-
-                if (!sellerPreview) {
-                    let shipping: Prisma.Decimal
-
-                    if (sellerProfile.shippingPolicy === "FREE") {
-                        shipping = new Prisma.Decimal(0)
-                    } else if (
-                        sellerProfile.shippingPolicy === "FIXED" &&
-                        sellerProfile.shippingCost !== null &&
-                        sellerProfile.shippingCost.greaterThanOrEqualTo(0)
-                    ) {
-                        shipping = sellerProfile.shippingCost.toDecimalPlaces(2)
-                    } else {
-                        throw new CheckoutCreationError(
-                            409,
-                            `Shipping information is unavailable for ${sellerProfile.businessName}`
-                        )
-                    }
-
-                    sellerPreview = {
-                        sellerId: listing.user.id,
-                        seller: {
-                            businessName: sellerProfile.businessName,
-                            slug: sellerProfile.slug
-                        },
-                        items: [],
-                        subtotal: new Prisma.Decimal(0),
-                        shipping
-                    }
-                    sellers.set(listing.user.id, sellerPreview)
-                }
-
-                const unitPrice = new Prisma.Decimal(listing.price.toString()).toDecimalPlaces(2)
-                const lineSubtotal = unitPrice.times(cartItem.quantity)
-
-                sellerPreview.items.push({
-                    listingId: listing.id,
-                    title: listing.title,
-                    description: listing.description,
-                    imageUrl: listing.imageUrl,
-                    category: listing.category,
-                    unitPrice: formatMoney(unitPrice),
-                    quantity: cartItem.quantity,
-                    lineSubtotal: formatMoney(lineSubtotal),
-                    stockQuantity: listing.stockQuantity,
-                    availableQuantity
-                })
-                sellerPreview.subtotal = sellerPreview.subtotal.plus(lineSubtotal)
-            }
-
-            const sellerPreviews = Array.from(sellers.values())
-            const subtotal = sellerPreviews.reduce(
-                (total, seller) => total.plus(seller.subtotal),
-                new Prisma.Decimal(0)
+            const { sellerPreviews, subtotal, shipping, total } = priceCheckoutItems(
+                cart.cartItems,
+                reservedQuantities
             )
-            const shipping = sellerPreviews.reduce(
-                (total, seller) => total.plus(seller.shipping),
-                new Prisma.Decimal(0)
-            )
-            const total = subtotal.plus(shipping)
-            const decimalMaximum = new Prisma.Decimal("9999999999.99")
-
-            if (
-                [subtotal, shipping, total, ...sellerPreviews.flatMap((seller) => [seller.subtotal, seller.shipping])]
-                    .some((amount) => amount.greaterThan(decimalMaximum))
-            ) {
-                throw new CheckoutCreationError(409, "Checkout total exceeds the supported payment amount")
-            }
 
             const review = buildCheckoutReview(userId, sellerPreviews)
             const cartSnapshot = sortCartItems(cart.cartItems)
@@ -617,37 +665,49 @@ export async function createCheckout(req: Request, res: Response) {
                     )
             }
 
-            const hasMatchingCartAndDelivery = existingCheckouts.some((checkout) =>
-                hasSameCart(checkout) && deliveryMatchesCheckout(delivery, checkout)
-            )
-
-            if (
-                !hasMatchingCartAndDelivery &&
-                existingCheckouts.some((checkout) => !deliveryMatchesCheckout(delivery, checkout))
-            ) {
-                throw new CheckoutCreationError(
-                    409,
-                    "Delivery details differ from an existing checkout",
-                    "CHECKOUT_CONFLICT"
-                )
-            }
-
-            if (reviewToken !== review.reviewToken) {
-                throw new CheckoutCreationError(
-                    409,
-                    "Review the current cart prices and confirm before continuing",
-                    "CHECKOUT_REVIEW_REQUIRED",
-                    review
-                )
-            }
+            const hasPaymentActivity = (checkout: typeof existingCheckouts[number]) =>
+                checkout.status !== "PENDING" ||
+                checkout.paymentAttempts.length > 0
+            const isLocked = (checkout: typeof existingCheckouts[number]) =>
+                hasPaymentActivity(checkout) ||
+                checkout.orders.length === 0 ||
+                checkout.orders.some((order) => order.status !== "PENDING_PAYMENT")
 
             const reusableCheckout = existingCheckouts.find((checkout) =>
                 hasSameCart(checkout) &&
+                deliveryMatchesCheckout(delivery, checkout) &&
                 hasSamePricesAndShipping(checkout) &&
                 reservationsMatch(checkout) &&
                 checkout.orders.length > 0 &&
                 checkout.orders.every((order) => order.status === "PENDING_PAYMENT")
             )
+            const lockedCheckout = reusableCheckout ? undefined : existingCheckouts.find(isLocked)
+
+            if (lockedCheckout) {
+                throw new CheckoutRequestError(
+                    409,
+                    hasPaymentActivity(lockedCheckout)
+                        ? "An existing checkout has payment activity and cannot be replaced"
+                        : "An existing checkout is being processed and cannot be replaced",
+                    "CHECKOUT_LOCKED",
+                    {
+                        checkout: {
+                            id: lockedCheckout.id,
+                            status: lockedCheckout.status,
+                            expiresAt: lockedCheckout.expiresAt
+                        }
+                    }
+                )
+            }
+
+            if (reviewToken !== review.reviewToken) {
+                throw new CheckoutRequestError(
+                    409,
+                    "Review the current cart prices and confirm before continuing",
+                    "CHECKOUT_REVIEW_REQUIRED",
+                    { review }
+                )
+            }
 
             if (reusableCheckout) {
                 const checkoutSubtotal = reusableCheckout.orders.reduce(
@@ -708,29 +768,6 @@ export async function createCheckout(req: Request, res: Response) {
                 }
             }
 
-            if (existingCheckouts.some((checkout) => !deliveryMatchesCheckout(delivery, checkout))) {
-                throw new CheckoutCreationError(
-                    409,
-                    "Delivery details differ from an existing checkout",
-                    "CHECKOUT_CONFLICT"
-                )
-            }
-
-            const hasUnsafeHistory = existingCheckouts.some((checkout) =>
-                checkout.status !== "PENDING" ||
-                checkout.paymentAttempts.length > 0 ||
-                checkout.orders.length === 0 ||
-                checkout.orders.some((order) => order.status !== "PENDING_PAYMENT")
-            )
-
-            if (hasUnsafeHistory) {
-                throw new CheckoutCreationError(
-                    409,
-                    "An existing checkout has payment activity and cannot be replaced",
-                    "CHECKOUT_CONFLICT"
-                )
-            }
-
             for (const checkout of existingCheckouts) {
                 const transitioned = await tx.checkout.updateMany({
                     where: {
@@ -743,7 +780,7 @@ export async function createCheckout(req: Request, res: Response) {
                 })
 
                 if (transitioned.count !== 1) {
-                    throw new CheckoutCreationError(
+                    throw new CheckoutRequestError(
                         409,
                         "Checkout state changed before replacement could complete",
                         "CHECKOUT_CONFLICT"
@@ -897,12 +934,8 @@ export async function createCheckout(req: Request, res: Response) {
 
         res.status(result.httpStatus).send(result.response)
     } catch (error) {
-        if (error instanceof CheckoutCreationError) {
-            res.status(error.statusCode).send({
-                message: error.message,
-                ...(error.code ? { code: error.code } : {}),
-                ...(error.review ? { review: error.review } : {})
-            })
+        if (error instanceof CheckoutRequestError) {
+            sendCheckoutRequestError(error, res)
             return
         }
 
@@ -936,13 +969,7 @@ export async function getCheckoutPreview(req: Request, res: Response) {
             where: { userId },
             select: {
                 cartItems: {
-                    select: {
-                        listingId: true,
-                        quantity: true,
-                        listing: {
-                            select: checkoutListingSelect
-                        }
-                    }
+                    select: checkoutCartItemSelect
                 }
             }
         })
@@ -990,89 +1017,15 @@ export async function getCheckoutPreview(req: Request, res: Response) {
             )
         }
 
-        const sellers = new Map<number, SellerPreview>()
+        const { sellerPreviews } = priceCheckoutItems(cart.cartItems, reservedQuantities)
 
-        for (const cartItem of cart.cartItems) {
-            const listing = cartItem.listing
-            const sellerProfile = listing.user.sellerProfile
-            const availableQuantity = Math.max(
-                listing.stockQuantity - (reservedQuantities.get(listing.id) ?? 0),
-                0
-            )
-
-            if (
-                !Number.isSafeInteger(cartItem.quantity) ||
-                cartItem.quantity < 1 ||
-                !Number.isFinite(listing.price) ||
-                listing.price <= 0 ||
-                cartItem.quantity > availableQuantity
-            ) {
-                res.status(409).send({
-                    message: `Listing ${cartItem.listingId} is unavailable in the requested quantity`
-                })
-                return
-            }
-
-            if (!sellerProfile) {
-                res.status(409).send({
-                    message: `Listing ${cartItem.listingId} does not have an available seller storefront`
-                })
-                return
-            }
-
-            let sellerPreview = sellers.get(listing.user.id)
-
-            if (!sellerPreview) {
-                let shipping: Prisma.Decimal
-
-                if (sellerProfile.shippingPolicy === "FREE") {
-                    shipping = new Prisma.Decimal(0)
-                } else if (
-                    sellerProfile.shippingPolicy === "FIXED" &&
-                    sellerProfile.shippingCost !== null &&
-                    sellerProfile.shippingCost.greaterThanOrEqualTo(0)
-                ) {
-                    shipping = sellerProfile.shippingCost.toDecimalPlaces(2)
-                } else {
-                    res.status(409).send({
-                        message: `Shipping information is unavailable for ${sellerProfile.businessName}`
-                    })
-                    return
-                }
-
-                sellerPreview = {
-                    sellerId: listing.user.id,
-                    seller: {
-                        businessName: sellerProfile.businessName,
-                        slug: sellerProfile.slug
-                    },
-                    items: [],
-                    subtotal: new Prisma.Decimal(0),
-                    shipping
-                }
-                sellers.set(listing.user.id, sellerPreview)
-            }
-
-            const unitPrice = new Prisma.Decimal(listing.price.toString()).toDecimalPlaces(2)
-            const lineSubtotal = unitPrice.times(cartItem.quantity)
-
-            sellerPreview.items.push({
-                listingId: listing.id,
-                title: listing.title,
-                description: listing.description,
-                imageUrl: listing.imageUrl,
-                category: listing.category,
-                unitPrice: formatMoney(unitPrice),
-                quantity: cartItem.quantity,
-                lineSubtotal: formatMoney(lineSubtotal),
-                stockQuantity: listing.stockQuantity,
-                availableQuantity
-            })
-            sellerPreview.subtotal = sellerPreview.subtotal.plus(lineSubtotal)
+        res.send(buildCheckoutReview(userId, sellerPreviews))
+    } catch (error) {
+        if (error instanceof CheckoutRequestError) {
+            sendCheckoutRequestError(error, res)
+            return
         }
 
-        res.send(buildCheckoutReview(userId, Array.from(sellers.values())))
-    } catch (error) {
         console.error(error)
 
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034") {

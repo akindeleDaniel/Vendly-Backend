@@ -194,11 +194,165 @@ async function createCheckoutLifecycleFixture(
             await prisma.cartItem.deleteMany({ where: { cart: { userId: { in: consumerIds } } } })
             await prisma.cart.deleteMany({ where: { userId: { in: consumerIds } } })
             await prisma.listing.delete({ where: { id: listing.id } })
-            await prisma.sellerProfile.delete({ where: { userId: seller.id } })
+            await prisma.sellerProfile.deleteMany({ where: { userId: seller.id } })
             await prisma.user.deleteMany({ where: { id: { in: [...consumerIds, seller.id] } } })
         }
     }
     return fixture
+}
+
+const fixtureDelivery = {
+    fullName: "Test Consumer",
+    phone: "08000000000",
+    address: "1 Test Street",
+    state: "Lagos",
+    lga: "Ikeja"
+}
+
+const changedDelivery = {
+    fullName: "Test Consumer",
+    phone: "08000000001",
+    address: "2 Updated Street",
+    state: "Lagos",
+    lga: "Ikeja",
+    instructions: "Call on arrival"
+}
+
+const paymentActivityLockMessage = "An existing checkout has payment activity and cannot be replaced"
+const processingLockMessage = "An existing checkout is being processed and cannot be replaced"
+
+type CheckoutResponseBody = {
+    code?: unknown
+    message?: unknown
+    listingId?: unknown
+    reviewToken?: unknown
+    review?: { reviewToken?: unknown }
+    checkout?: {
+        id?: unknown
+        status?: unknown
+        expiresAt?: unknown
+        delivery?: unknown
+    }
+}
+
+async function requestCheckoutPreview(fixture: CheckoutLifecycleFixture, token = fixture.token) {
+    const response = await fetch(`${fixture.baseUrl}/checkout/preview`, {
+        headers: { cookie: `token=${token}` }
+    })
+    return { status: response.status, body: await response.json() as CheckoutResponseBody }
+}
+
+async function submitCheckout(
+    fixture: CheckoutLifecycleFixture,
+    body: Record<string, unknown>,
+    token = fixture.token
+) {
+    const response = await fetch(`${fixture.baseUrl}/checkout`, {
+        method: "POST",
+        headers: {
+            cookie: `token=${token}`,
+            "content-type": "application/json"
+        },
+        body: JSON.stringify(body)
+    })
+    return { status: response.status, body: await response.json() as CheckoutResponseBody }
+}
+
+function pickItemsUnavailable(body: unknown) {
+    const { code, listingId } = body as CheckoutResponseBody
+    return { code, listingId }
+}
+
+function loadConsumerCheckouts(userId: number) {
+    return prisma.checkout.findMany({
+        where: { userId },
+        orderBy: { id: "asc" },
+        include: {
+            inventoryReservations: { orderBy: { listingId: "asc" } },
+            orders: { orderBy: { id: "asc" } }
+        }
+    })
+}
+
+async function installRowTrigger(options: {
+    table: "Checkout" | "OrderItem"
+    event: "INSERT" | "UPDATE"
+    column: "id" | "listingId"
+    targetId: number
+    matchedStatement: string
+}): Promise<() => Promise<void>> {
+    const { table, event, column, targetId, matchedStatement } = options
+    assert.ok(Number.isSafeInteger(targetId) && targetId > 0)
+    const name = `vendly_test_trigger_${randomUUID().replaceAll("-", "")}`
+    const remove = async () => {
+        await prisma.$executeRawUnsafe(`DROP TRIGGER IF EXISTS "${name}" ON public."${table}"`)
+        await prisma.$executeRawUnsafe(`DROP FUNCTION IF EXISTS public."${name}"()`)
+    }
+
+    await prisma.$executeRawUnsafe(`
+        CREATE FUNCTION public."${name}"()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $trigger$
+        BEGIN
+        IF NEW."${column}" = TG_ARGV[0]::integer THEN
+        ${matchedStatement}
+        END IF;
+        RETURN NEW;
+        END;
+        $trigger$
+    `)
+
+    try {
+        await prisma.$executeRawUnsafe(`
+            CREATE TRIGGER "${name}"
+            BEFORE ${event} ON public."${table}"
+            FOR EACH ROW
+            EXECUTE FUNCTION public."${name}"('${targetId}')
+        `)
+    } catch (error) {
+        await remove()
+        throw error
+    }
+
+    return remove
+}
+
+async function assertCheckoutUnchanged(
+    fixture: CheckoutLifecycleFixture,
+    checkoutId: number,
+    expectedStatus: "PENDING" | "PAYMENT_PENDING",
+    expectedOrderStatus: "PENDING_PAYMENT" | "PAID" = "PENDING_PAYMENT"
+) {
+    const checkouts = await loadConsumerCheckouts(fixture.consumerId)
+    assert.deepEqual(checkouts.map(({ id, status, deliveryAddress }) => ({ id, status, deliveryAddress })), [
+        { id: checkoutId, status: expectedStatus, deliveryAddress: fixtureDelivery.address }
+    ])
+    assert.deepEqual(
+        checkouts[0]?.inventoryReservations.map(({ quantity, status }) => ({ quantity, status })),
+        [{ quantity: 2, status: "ACTIVE" }]
+    )
+    assert.deepEqual(checkouts[0]?.orders.map(({ status }) => status), [expectedOrderStatus])
+}
+
+async function assertReservedWithinStock(listingId: number, expectedReserved: number, expectedStock: number) {
+    const [reservations, listing] = await Promise.all([
+        prisma.inventoryReservation.aggregate({
+            where: {
+                listingId,
+                status: "ACTIVE",
+                expiresAt: { gt: new Date() }
+            },
+            _sum: { quantity: true }
+        }),
+        prisma.listing.findUniqueOrThrow({
+            where: { id: listingId },
+            select: { stockQuantity: true }
+        })
+    ])
+    assert.equal(reservations._sum.quantity ?? 0, expectedReserved)
+    assert.equal(listing.stockQuantity, expectedStock)
+    assert.ok((reservations._sum.quantity ?? 0) <= listing.stockQuantity)
 }
 
 test("connects to the dedicated PostgreSQL test database with Serializable transactions", async () => {
@@ -1910,8 +2064,14 @@ test("rejects checkout replacement after payment activity", async () => {
             body: JSON.stringify({ reviewToken: changedCartPreview.reviewToken, delivery })
         })
         assert.equal(replacementResponse.status, 409)
-        const replacementBody = await replacementResponse.json() as { code?: unknown }
-        assert.equal(replacementBody.code, "CHECKOUT_CONFLICT")
+        const replacementBody = await replacementResponse.json() as {
+            code?: unknown
+            checkout?: { id?: unknown; status?: unknown; expiresAt?: unknown }
+        }
+        assert.equal(replacementBody.code, "CHECKOUT_LOCKED")
+        assert.equal(replacementBody.checkout?.id, checkoutId)
+        assert.equal(replacementBody.checkout?.status, "PAYMENT_PENDING")
+        assert.equal(typeof replacementBody.checkout?.expiresAt, "string")
 
         const [originalCheckout, checkoutCount, checkoutItemCount, reservationCount, orderCount, orderItemCount, finalListing] =
             await Promise.all([
@@ -2107,6 +2267,10 @@ test("expires an overdue checkout but protects its reservation while payment is 
             headers: { cookie: `token=${fixture.token}` }
         })
         assert.equal(response.status, 409)
+        assert.deepEqual(
+            pickItemsUnavailable(await response.json()),
+            { code: "CHECKOUT_ITEMS_UNAVAILABLE", listingId: fixture.listingId }
+        )
 
         const checkout = await prisma.checkout.findUniqueOrThrow({
             where: { id: checkoutId },
@@ -2162,6 +2326,10 @@ test("protected expired-payment reservations remain unavailable across inventory
             headers: { cookie: `token=${fixture.token}` }
         })
         assert.equal(expireResponse.status, 409)
+        assert.deepEqual(
+            pickItemsUnavailable(await expireResponse.json()),
+            { code: "CHECKOUT_ITEMS_UNAVAILABLE", listingId: fixture.listingId }
+        )
 
         const otherConsumer = await fixture.addConsumer(2)
         const cartResponse = await fetch(`${fixture.baseUrl}/cart`, {
@@ -2177,6 +2345,10 @@ test("protected expired-payment reservations remain unavailable across inventory
             headers: { cookie: `token=${otherConsumer.token}` }
         })
         assert.equal(otherConsumerPreview.status, 409)
+        assert.deepEqual(
+            pickItemsUnavailable(await otherConsumerPreview.json()),
+            { code: "CHECKOUT_ITEMS_UNAVAILABLE", listingId: fixture.listingId }
+        )
 
         const stockUpdateResponse = await fetch(`${fixture.baseUrl}/listings/${fixture.listingId}`, {
             method: "PATCH",
@@ -2196,6 +2368,457 @@ test("protected expired-payment reservations remain unavailable across inventory
         })
         assert.equal(protectedReservation.expiresAt.getTime(), expiredAt.getTime())
     } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("replaces an eligible checkout when only delivery details change", async () => {
+    const fixture = await createCheckoutLifecycleFixture("checkout-delivery-change", 5, 2)
+
+    try {
+        const oldCheckoutId = await fixture.createCheckout()
+        const preview = await requestCheckoutPreview(fixture)
+        assert.equal(preview.status, 200)
+
+        const response = await submitCheckout(fixture, {
+            reviewToken: preview.body.reviewToken,
+            delivery: changedDelivery
+        })
+        assert.equal(response.status, 201)
+        assert.equal(response.body.code, "CHECKOUT_REPLACED")
+        const newCheckoutId = response.body.checkout?.id
+        assert.ok(typeof newCheckoutId === "number")
+        assert.notEqual(newCheckoutId, oldCheckoutId)
+        assert.deepEqual(response.body.checkout?.delivery, changedDelivery)
+
+        const checkouts = await loadConsumerCheckouts(fixture.consumerId)
+        assert.deepEqual(checkouts.map(({ id }) => id), [oldCheckoutId, newCheckoutId])
+        const [oldCheckout, newCheckout] = checkouts
+        assert.equal(oldCheckout?.status, "EXPIRED")
+        assert.equal(oldCheckout?.deliveryAddress, fixtureDelivery.address)
+        assert.deepEqual(oldCheckout?.inventoryReservations.map(({ status }) => status), ["RELEASED"])
+        assert.deepEqual(oldCheckout?.orders.map(({ status }) => status), ["CANCELLED"])
+        assert.equal(newCheckout?.status, "PENDING")
+        assert.deepEqual(
+            {
+                fullName: newCheckout?.deliveryName,
+                phone: newCheckout?.deliveryPhone,
+                address: newCheckout?.deliveryAddress,
+                state: newCheckout?.deliveryState,
+                lga: newCheckout?.deliveryLga,
+                instructions: newCheckout?.deliveryInstructions
+            },
+            changedDelivery
+        )
+        assert.deepEqual(
+            newCheckout?.inventoryReservations.map(({ listingId, quantity, status }) => ({ listingId, quantity, status })),
+            [{ listingId: fixture.listingId, quantity: 2, status: "ACTIVE" }]
+        )
+        assert.deepEqual(
+            newCheckout?.orders.map(({ status, deliveryAddress }) => ({ status, deliveryAddress })),
+            [{ status: "PENDING_PAYMENT", deliveryAddress: changedDelivery.address }]
+        )
+        await assertReservedWithinStock(fixture.listingId, 2, 5)
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("replaces an eligible checkout when the cart and delivery details change", async () => {
+    const fixture = await createCheckoutLifecycleFixture("checkout-cart-delivery-change", 5, 2)
+
+    try {
+        const oldCheckoutId = await fixture.createCheckout()
+        await prisma.cartItem.updateMany({
+            where: { cart: { userId: fixture.consumerId } },
+            data: { quantity: 3 }
+        })
+        const preview = await requestCheckoutPreview(fixture)
+        assert.equal(preview.status, 200)
+
+        const response = await submitCheckout(fixture, {
+            reviewToken: preview.body.reviewToken,
+            delivery: changedDelivery
+        })
+        assert.equal(response.status, 201)
+        assert.equal(response.body.code, "CHECKOUT_REPLACED")
+
+        const [oldCheckout, newCheckout, ...otherCheckouts] = await loadConsumerCheckouts(fixture.consumerId)
+        assert.equal(otherCheckouts.length, 0)
+        assert.equal(oldCheckout?.id, oldCheckoutId)
+        assert.equal(oldCheckout?.status, "EXPIRED")
+        assert.deepEqual(oldCheckout?.inventoryReservations.map(({ status }) => status), ["RELEASED"])
+        assert.deepEqual(oldCheckout?.orders.map(({ status }) => status), ["CANCELLED"])
+        assert.equal(newCheckout?.id, response.body.checkout?.id)
+        assert.equal(newCheckout?.deliveryAddress, changedDelivery.address)
+        assert.deepEqual(
+            newCheckout?.inventoryReservations.map(({ quantity, status }) => ({ quantity, status })),
+            [{ quantity: 3, status: "ACTIVE" }]
+        )
+        await assertReservedWithinStock(fixture.listingId, 3, 5)
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("requires review before a delivery change with a stale review token", async () => {
+    const fixture = await createCheckoutLifecycleFixture("checkout-delivery-stale-review", 5, 2)
+
+    try {
+        const checkoutId = await fixture.createCheckout()
+        const preview = await requestCheckoutPreview(fixture)
+        assert.equal(preview.status, 200)
+        await prisma.listing.update({
+            where: { id: fixture.listingId },
+            data: { price: 1750 }
+        })
+
+        const response = await submitCheckout(fixture, {
+            reviewToken: preview.body.reviewToken,
+            delivery: changedDelivery
+        })
+        assert.equal(response.status, 409)
+        assert.equal(response.body.code, "CHECKOUT_REVIEW_REQUIRED")
+        assert.equal(typeof response.body.review?.reviewToken, "string")
+        assert.notEqual(response.body.review?.reviewToken, preview.body.reviewToken)
+
+        const checkouts = await loadConsumerCheckouts(fixture.consumerId)
+        assert.deepEqual(checkouts.map(({ id, status, deliveryAddress }) => ({ id, status, deliveryAddress })), [
+            { id: checkoutId, status: "PENDING", deliveryAddress: fixtureDelivery.address }
+        ])
+        assert.deepEqual(checkouts[0]?.inventoryReservations.map(({ status }) => status), ["ACTIVE"])
+        assert.deepEqual(checkouts[0]?.orders.map(({ status }) => status), ["PENDING_PAYMENT"])
+        await assertReservedWithinStock(fixture.listingId, 2, 5)
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("locks delivery changes while an existing checkout has payment activity", async () => {
+    const fixture = await createCheckoutLifecycleFixture("checkout-delivery-locked", 5, 2)
+
+    try {
+        const checkoutId = await fixture.createCheckout()
+        await prisma.paymentAttempt.create({
+            data: {
+                checkoutId,
+                provider: "PAYSTACK",
+                providerRef: `checkout-delivery-locked-${randomUUID()}`,
+                amount: new Prisma.Decimal("3000.00"),
+                currency: "NGN",
+                status: "PENDING"
+            }
+        })
+        await prisma.checkout.update({
+            where: { id: checkoutId },
+            data: { status: "PAYMENT_PENDING" }
+        })
+        const preview = await requestCheckoutPreview(fixture)
+        assert.equal(preview.status, 200)
+
+        for (const reviewToken of [preview.body.reviewToken, "0".repeat(64), undefined]) {
+            const response = await submitCheckout(fixture, {
+                ...(reviewToken === undefined ? {} : { reviewToken }),
+                delivery: changedDelivery
+            })
+            assert.equal(response.status, 409)
+            assert.equal(response.body.code, "CHECKOUT_LOCKED")
+            assert.equal(response.body.message, paymentActivityLockMessage)
+            assert.equal(response.body.checkout?.id, checkoutId)
+            assert.equal(response.body.checkout?.status, "PAYMENT_PENDING")
+            assert.equal(typeof response.body.checkout?.expiresAt, "string")
+        }
+
+        const reuseResponse = await submitCheckout(fixture, {
+            reviewToken: preview.body.reviewToken,
+            delivery: fixtureDelivery
+        })
+        assert.equal(reuseResponse.status, 200)
+        assert.equal(reuseResponse.body.code, "CHECKOUT_REUSED")
+        assert.equal(reuseResponse.body.checkout?.id, checkoutId)
+
+        const checkouts = await loadConsumerCheckouts(fixture.consumerId)
+        assert.deepEqual(checkouts.map(({ id, status, deliveryAddress }) => ({ id, status, deliveryAddress })), [
+            { id: checkoutId, status: "PAYMENT_PENDING", deliveryAddress: fixtureDelivery.address }
+        ])
+        assert.deepEqual(checkouts[0]?.inventoryReservations.map(({ status }) => status), ["ACTIVE"])
+        assert.deepEqual(checkouts[0]?.orders.map(({ status }) => status), ["PENDING_PAYMENT"])
+        await assertReservedWithinStock(fixture.listingId, 2, 5)
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("reports insufficient stock as unavailable checkout items in preview and creation", async () => {
+    const fixture = await createCheckoutLifecycleFixture("checkout-items-stock", 1, 2)
+
+    try {
+        const preview = await requestCheckoutPreview(fixture)
+        assert.equal(preview.status, 409)
+        assert.deepEqual(
+            pickItemsUnavailable(preview.body),
+            { code: "CHECKOUT_ITEMS_UNAVAILABLE", listingId: fixture.listingId }
+        )
+
+        const response = await submitCheckout(fixture, { delivery: fixtureDelivery })
+        assert.equal(response.status, 409)
+        assert.deepEqual(
+            pickItemsUnavailable(response.body),
+            { code: "CHECKOUT_ITEMS_UNAVAILABLE", listingId: fixture.listingId }
+        )
+        assert.equal((await loadConsumerCheckouts(fixture.consumerId)).length, 0)
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("reports unconfigured seller shipping as unavailable checkout items", async () => {
+    const fixture = await createCheckoutLifecycleFixture("checkout-items-shipping", 5, 2)
+
+    try {
+        await prisma.sellerProfile.update({
+            where: { userId: fixture.sellerId },
+            data: { shippingPolicy: "FIXED", shippingCost: null }
+        })
+
+        const preview = await requestCheckoutPreview(fixture)
+        assert.equal(preview.status, 409)
+        assert.deepEqual(
+            pickItemsUnavailable(preview.body),
+            { code: "CHECKOUT_ITEMS_UNAVAILABLE", listingId: fixture.listingId }
+        )
+
+        const response = await submitCheckout(fixture, { delivery: fixtureDelivery })
+        assert.equal(response.status, 409)
+        assert.deepEqual(
+            pickItemsUnavailable(response.body),
+            { code: "CHECKOUT_ITEMS_UNAVAILABLE", listingId: fixture.listingId }
+        )
+        assert.equal((await loadConsumerCheckouts(fixture.consumerId)).length, 0)
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("rejects checkout totals above the supported amount in preview and creation", async () => {
+    const fixture = await createCheckoutLifecycleFixture("checkout-items-maximum-total", 5, 2)
+
+    try {
+        await prisma.listing.update({
+            where: { id: fixture.listingId },
+            data: { price: 6_000_000_000 }
+        })
+
+        const preview = await requestCheckoutPreview(fixture)
+        assert.equal(preview.status, 409)
+        assert.deepEqual(
+            pickItemsUnavailable(preview.body),
+            { code: "CHECKOUT_ITEMS_UNAVAILABLE", listingId: undefined }
+        )
+
+        const response = await submitCheckout(fixture, { delivery: fixtureDelivery })
+        assert.equal(response.status, 409)
+        assert.deepEqual(
+            pickItemsUnavailable(response.body),
+            { code: "CHECKOUT_ITEMS_UNAVAILABLE", listingId: undefined }
+        )
+        assert.equal((await loadConsumerCheckouts(fixture.consumerId)).length, 0)
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("reports a missing seller storefront as unavailable checkout items", async () => {
+    const fixture = await createCheckoutLifecycleFixture("checkout-items-storefront", 5, 2)
+
+    try {
+        await prisma.sellerProfile.delete({ where: { userId: fixture.sellerId } })
+
+        const preview = await requestCheckoutPreview(fixture)
+        assert.equal(preview.status, 409)
+        assert.deepEqual(
+            pickItemsUnavailable(preview.body),
+            { code: "CHECKOUT_ITEMS_UNAVAILABLE", listingId: fixture.listingId }
+        )
+
+        const response = await submitCheckout(fixture, { delivery: fixtureDelivery })
+        assert.equal(response.status, 409)
+        assert.deepEqual(
+            pickItemsUnavailable(response.body),
+            { code: "CHECKOUT_ITEMS_UNAVAILABLE", listingId: fixture.listingId }
+        )
+        assert.equal((await loadConsumerCheckouts(fixture.consumerId)).length, 0)
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("locks replacement when an existing checkout has only failed payment attempts", async () => {
+    const fixture = await createCheckoutLifecycleFixture("checkout-failed-payment-lock", 5, 2)
+
+    try {
+        const checkoutId = await fixture.createCheckout()
+        await prisma.paymentAttempt.create({
+            data: {
+                checkoutId,
+                provider: "PAYSTACK",
+                providerRef: `checkout-failed-payment-lock-${randomUUID()}`,
+                amount: new Prisma.Decimal("3000.00"),
+                currency: "NGN",
+                status: "FAILED"
+            }
+        })
+        const preview = await requestCheckoutPreview(fixture)
+        assert.equal(preview.status, 200)
+
+        const response = await submitCheckout(fixture, {
+            reviewToken: preview.body.reviewToken,
+            delivery: changedDelivery
+        })
+        assert.equal(response.status, 409)
+        assert.equal(response.body.code, "CHECKOUT_LOCKED")
+        assert.equal(response.body.message, paymentActivityLockMessage)
+        assert.equal(response.body.checkout?.id, checkoutId)
+        assert.equal(response.body.checkout?.status, "PENDING")
+        await assertCheckoutUnchanged(fixture, checkoutId, "PENDING")
+        await assertReservedWithinStock(fixture.listingId, 2, 5)
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("describes non-payment lock conditions as a checkout being processed", async () => {
+    const fixture = await createCheckoutLifecycleFixture("checkout-processing-lock", 5, 2)
+
+    try {
+        const checkoutId = await fixture.createCheckout()
+        await prisma.order.updateMany({
+            where: { checkoutId },
+            data: { status: "PAID" }
+        })
+        const preview = await requestCheckoutPreview(fixture)
+        assert.equal(preview.status, 200)
+
+        const response = await submitCheckout(fixture, {
+            reviewToken: preview.body.reviewToken,
+            delivery: changedDelivery
+        })
+        assert.equal(response.status, 409)
+        assert.equal(response.body.code, "CHECKOUT_LOCKED")
+        assert.equal(response.body.message, processingLockMessage)
+        assert.equal(response.body.checkout?.id, checkoutId)
+        await assertCheckoutUnchanged(fixture, checkoutId, "PENDING", "PAID")
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("keeps the original checkout when a delivery-only replacement fails", async () => {
+    const fixture = await createCheckoutLifecycleFixture("checkout-delivery-rollback", 5, 2)
+    let removeTrigger: (() => Promise<void>) | undefined
+
+    try {
+        const checkoutId = await fixture.createCheckout()
+        const preview = await requestCheckoutPreview(fixture)
+        assert.equal(preview.status, 200)
+        removeTrigger = await installRowTrigger({
+            table: "OrderItem",
+            event: "INSERT",
+            column: "listingId",
+            targetId: fixture.listingId,
+            matchedStatement: "RAISE EXCEPTION 'integration test forced delivery replacement failure';"
+        })
+
+        const response = await submitCheckout(fixture, {
+            reviewToken: preview.body.reviewToken,
+            delivery: changedDelivery
+        })
+        assert.equal(response.status, 500)
+        assert.deepEqual(response.body, { message: "Sorry, there is an issue on our end" })
+        await assertCheckoutUnchanged(fixture, checkoutId, "PENDING")
+        await assertReservedWithinStock(fixture.listingId, 2, 5)
+    } finally {
+        await removeTrigger?.()
+        await fixture.cleanup()
+    }
+})
+
+test("reports a retryable conflict when the replaced checkout changes during replacement", async () => {
+    const fixture = await createCheckoutLifecycleFixture("checkout-replacement-conflict", 5, 2)
+    let removeTrigger: (() => Promise<void>) | undefined
+
+    try {
+        const checkoutId = await fixture.createCheckout()
+        const preview = await requestCheckoutPreview(fixture)
+        assert.equal(preview.status, 200)
+        removeTrigger = await installRowTrigger({
+            table: "Checkout",
+            event: "UPDATE",
+            column: "id",
+            targetId: checkoutId,
+            matchedStatement: "RETURN NULL;"
+        })
+
+        const response = await submitCheckout(fixture, {
+            reviewToken: preview.body.reviewToken,
+            delivery: changedDelivery
+        })
+        assert.equal(response.status, 409)
+        assert.deepEqual(response.body, {
+            code: "CHECKOUT_CONFLICT",
+            message: "Checkout state changed before replacement could complete"
+        })
+        await assertCheckoutUnchanged(fixture, checkoutId, "PENDING")
+        await assertReservedWithinStock(fixture.listingId, 2, 5)
+    } finally {
+        await removeTrigger?.()
+        await fixture.cleanup()
+    }
+})
+
+test("reports a retryable conflict when checkout expiry hits a serialization failure", async () => {
+    const fixture = await createCheckoutLifecycleFixture("checkout-expiry-conflict", 5, 2)
+    let removeTrigger: (() => Promise<void>) | undefined
+
+    try {
+        const checkoutId = await fixture.createCheckout()
+        const expiredAt = new Date(Date.now() - 60_000)
+        await prisma.checkout.update({
+            where: { id: checkoutId },
+            data: { expiresAt: expiredAt }
+        })
+        await prisma.inventoryReservation.updateMany({
+            where: { checkoutId },
+            data: { expiresAt: expiredAt }
+        })
+        removeTrigger = await installRowTrigger({
+            table: "Checkout",
+            event: "UPDATE",
+            column: "id",
+            targetId: checkoutId,
+            matchedStatement: "RAISE EXCEPTION 'integration test forced serialization failure' USING ERRCODE = '40001';"
+        })
+
+        const preview = await requestCheckoutPreview(fixture)
+        assert.equal(preview.status, 409)
+        assert.deepEqual(preview.body, {
+            code: "CHECKOUT_CONFLICT",
+            message: "Checkout state changed while loading your cart. Please try again."
+        })
+
+        const response = await submitCheckout(fixture, { delivery: fixtureDelivery })
+        assert.equal(response.status, 409)
+        assert.deepEqual(response.body, {
+            code: "CHECKOUT_CONFLICT",
+            message: "Checkout state changed while creating checkout. Please try again."
+        })
+
+        const [checkout] = await loadConsumerCheckouts(fixture.consumerId)
+        assert.equal(checkout?.status, "PENDING")
+        assert.deepEqual(checkout?.inventoryReservations.map(({ status }) => status), ["ACTIVE"])
+        assert.deepEqual(checkout?.orders.map(({ status }) => status), ["PENDING_PAYMENT"])
+    } finally {
+        await removeTrigger?.()
         await fixture.cleanup()
     }
 })
