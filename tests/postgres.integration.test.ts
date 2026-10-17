@@ -2928,3 +2928,117 @@ test("logs unexpected listing stock update failures and returns a generic error"
         await fixture.cleanup()
     }
 })
+
+// Moves a checkout past its expiry with the given payment attempts, without any request from
+// its owner, so its reservation is still ACTIVE when other users' requests run.
+async function expireCheckoutWithPaymentAttempts(
+    checkoutId: number,
+    attemptStatuses: Array<"PENDING" | "SUCCESS" | "FAILED">
+) {
+    const expiredAt = new Date(Date.now() - 60_000)
+
+    for (const status of attemptStatuses) {
+        await prisma.paymentAttempt.create({
+            data: {
+                checkoutId,
+                provider: "PAYSTACK",
+                providerRef: `checkout-expired-attempt-${randomUUID()}`,
+                amount: new Prisma.Decimal("3000.00"),
+                currency: "NGN",
+                status
+            }
+        })
+    }
+
+    await prisma.checkout.update({
+        where: { id: checkoutId },
+        data: {
+            expiresAt: expiredAt,
+            ...(attemptStatuses.length > 0 ? { status: "PAYMENT_PENDING" as const } : {})
+        }
+    })
+    await prisma.inventoryReservation.updateMany({
+        where: { checkoutId },
+        data: { expiresAt: expiredAt }
+    })
+}
+
+async function fetchCartAvailability(fixture: CheckoutLifecycleFixture, token: string) {
+    const response = await fetch(`${fixture.baseUrl}/cart`, {
+        headers: { cookie: `token=${token}` }
+    })
+    assert.equal(response.status, 200)
+    const body = await response.json() as {
+        cart?: { cartItems?: Array<{ availableQuantity?: number }> }
+    }
+    return body.cart?.cartItems?.[0]?.availableQuantity
+}
+
+for (const attemptStatus of ["PENDING", "SUCCESS"] as const) {
+    test(`holds stock for an expired checkout with a ${attemptStatus} payment before its owner returns`, async () => {
+        const fixture = await createCheckoutLifecycleFixture(`checkout-expired-${attemptStatus.toLowerCase()}-hold`, 3, 2)
+
+        try {
+            const checkoutId = await fixture.createCheckout()
+            await expireCheckoutWithPaymentAttempts(checkoutId, [attemptStatus])
+            const otherConsumer = await fixture.addConsumer(2)
+
+            assert.equal(await fetchCartAvailability(fixture, otherConsumer.token), 1)
+
+            const preview = await requestCheckoutPreview(fixture, otherConsumer.token)
+            assert.equal(preview.status, 409)
+            assert.deepEqual(
+                pickItemsUnavailable(preview.body),
+                { code: "CHECKOUT_ITEMS_UNAVAILABLE", listingId: fixture.listingId }
+            )
+
+            const response = await submitCheckout(fixture, { delivery: fixtureDelivery }, otherConsumer.token)
+            assert.equal(response.status, 409)
+            assert.deepEqual(
+                pickItemsUnavailable(response.body),
+                { code: "CHECKOUT_ITEMS_UNAVAILABLE", listingId: fixture.listingId }
+            )
+            assert.equal((await loadConsumerCheckouts(otherConsumer.id)).length, 0)
+
+            const stockUpdate = await updateListingStock(fixture, 1)
+            assert.equal(stockUpdate.status, 409)
+            assert.deepEqual(stockUpdate.body, {
+                message: "Stock quantity cannot be less than 2 units currently reserved"
+            })
+            assert.equal(await loadListingStock(fixture.listingId), 3)
+
+            const [ownerCheckout] = await loadConsumerCheckouts(fixture.consumerId)
+            assert.equal(ownerCheckout?.status, "PAYMENT_PENDING")
+            assert.deepEqual(ownerCheckout?.inventoryReservations.map(({ status }) => status), ["ACTIVE"])
+            assert.deepEqual(ownerCheckout?.orders.map(({ status }) => status), ["PENDING_PAYMENT"])
+        } finally {
+            await fixture.cleanup()
+        }
+    })
+}
+
+for (const [label, attemptStatuses] of [
+    ["only failed payment attempts", ["FAILED"]],
+    ["no payment attempts", []]
+] as const) {
+    test(`releases stock from an expired checkout with ${label}`, async () => {
+        const fixture = await createCheckoutLifecycleFixture(`checkout-expired-release-${attemptStatuses.length}`, 3, 2)
+
+        try {
+            const checkoutId = await fixture.createCheckout()
+            await expireCheckoutWithPaymentAttempts(checkoutId, [...attemptStatuses])
+            const otherConsumer = await fixture.addConsumer(2)
+
+            assert.equal(await fetchCartAvailability(fixture, otherConsumer.token), 3)
+
+            const preview = await requestCheckoutPreview(fixture, otherConsumer.token)
+            assert.equal(preview.status, 200)
+
+            const stockUpdate = await updateListingStock(fixture, 2)
+            assert.equal(stockUpdate.status, 200)
+            assert.equal(await loadListingStock(fixture.listingId), 2)
+        } finally {
+            await fixture.cleanup()
+        }
+    })
+}

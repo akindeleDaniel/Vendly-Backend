@@ -1,6 +1,7 @@
 import type { Request, Response } from "express";
 import prisma from "../lib/prisma.js";
 import { Prisma } from "../generated/prisma/client.js";
+import { heldReservationConditions } from "../lib/inventoryReservations.js";
 
 const cartItemListingSelect = {
     id: true,
@@ -40,16 +41,11 @@ async function getOtherReservedQuantities(
     const reservations = await tx.inventoryReservation.findMany({
         where: {
             listingId: { in: listingIds },
-            OR: [
-                { status: "PROTECTED" },
-                {
-                    status: "ACTIVE",
-                    expiresAt: { gt: now },
-                    checkout: {
-                        userId: { not: userId }
-                    }
+            OR: heldReservationConditions(now, {
+                checkout: {
+                    userId: { not: userId }
                 }
-            ]
+            })
         },
         select: {
             listingId: true,

@@ -3,6 +3,7 @@ import prisma from "../lib/prisma.js"
 import shuffleArray from "../lib/shuffle.js"
 import { Prisma } from "../generated/prisma/client.js"
 import { categories, getCanonicalCategory } from "../lib/categories.js"
+import { heldReservationConditions } from "../lib/inventoryReservations.js"
 
 class ReservedStockConflict extends Error {
     constructor(readonly reservedQuantity: number) {
@@ -232,13 +233,7 @@ export const updateListing = async(req:Request, res:Response) =>{
                 const reservations = await tx.inventoryReservation.aggregate({
                     where: {
                         listingId: id,
-                        OR: [
-                            { status: "PROTECTED" },
-                            {
-                                status: "ACTIVE",
-                                expiresAt: { gt: now }
-                            }
-                        ]
+                        OR: heldReservationConditions(now)
                     },
                     _sum: {
                         quantity: true

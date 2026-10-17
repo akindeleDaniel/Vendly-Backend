@@ -3,6 +3,7 @@ import { createHash } from "node:crypto"
 import prisma from "../lib/prisma.js"
 import { Prisma } from "../generated/prisma/client.js"
 import { buildLocation } from "../lib/nigeriaLocation.js"
+import { heldReservationConditions } from "../lib/inventoryReservations.js"
 
 const checkoutListingSelect = {
     id: true,
@@ -588,16 +589,12 @@ export async function createCheckout(req: Request, res: Response) {
             const activeReservations = await tx.inventoryReservation.findMany({
                 where: {
                     listingId: { in: listingIds },
-                    OR: [
-                        { status: "PROTECTED" },
-                        {
-                            status: "ACTIVE",
-                            expiresAt: { gt: now },
-                            ...(replaceableCheckoutIds.length > 0
-                                ? { checkoutId: { notIn: replaceableCheckoutIds } }
-                                : {})
-                        }
-                    ]
+                    OR: heldReservationConditions(
+                        now,
+                        replaceableCheckoutIds.length > 0
+                            ? { checkoutId: { notIn: replaceableCheckoutIds } }
+                            : {}
+                    )
                 },
                 select: {
                     listingId: true,
@@ -992,16 +989,12 @@ export async function getCheckoutPreview(req: Request, res: Response) {
         const activeReservations = await prisma.inventoryReservation.findMany({
             where: {
                 listingId: { in: listingIds },
-                OR: [
-                    { status: "PROTECTED" },
-                    {
-                        status: "ACTIVE",
-                        expiresAt: { gt: now },
-                        ...(existingCheckoutIds.length > 0
-                            ? { checkoutId: { notIn: existingCheckoutIds.map(({ id }) => id) } }
-                            : {})
-                    }
-                ]
+                OR: heldReservationConditions(
+                    now,
+                    existingCheckoutIds.length > 0
+                        ? { checkoutId: { notIn: existingCheckoutIds.map(({ id }) => id) } }
+                        : {}
+                )
             },
             select: {
                 listingId: true,
