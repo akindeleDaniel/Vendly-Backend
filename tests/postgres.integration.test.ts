@@ -11,6 +11,8 @@ import checkoutRoutes from "../src/routes/checkoutRoutes.js"
 import cartRoutes from "../src/routes/cartRoutes.js"
 import listingRoutes from "../src/routes/listingRoutes.js"
 import app from "../src/app.js"
+import { assertRequiredEnvironment, loadConfig } from "../src/config.js"
+import bcrypt from "bcrypt"
 
 let prisma: PrismaClient
 
@@ -3137,4 +3139,110 @@ test("rejects non-integer listing ids as invalid", async () => {
             assert.deepEqual(await readJsonResponse(response), { message: "Id has to be a number" })
         }
     })
+})
+
+test("uses local-development defaults when deployment settings are not configured", () => {
+    assert.deepEqual(loadConfig({}), {
+        port: 3000,
+        frontendUrl: "http://localhost:5173",
+        cookieSameSite: "lax",
+        cookieSecure: false
+    })
+    assert.equal(loadConfig({ NODE_ENV: "production" }).cookieSecure, true)
+})
+
+test("reads valid deployment settings from the environment", () => {
+    assert.deepEqual(loadConfig({
+        PORT: " 8080 ",
+        FRONTEND_URL: "https://vendly.example/",
+        COOKIE_SAME_SITE: "Strict"
+    }), {
+        port: 8080,
+        frontendUrl: "https://vendly.example",
+        cookieSameSite: "strict",
+        cookieSecure: false
+    })
+    assert.deepEqual(loadConfig({ COOKIE_SAME_SITE: "none" }).cookieSecure, true)
+})
+
+test("rejects invalid deployment settings with clear messages", () => {
+    for (const port of ["abc", "0", "65536", "80.5", "-1"]) {
+        assert.throws(() => loadConfig({ PORT: port }), /PORT must be a whole number between 1 and 65535/)
+    }
+    for (const frontendUrl of ["not a url", "ftp://vendly.example", "https://vendly.example/shop", "https://vendly.example/?x=1"]) {
+        assert.throws(() => loadConfig({ FRONTEND_URL: frontendUrl }), /FRONTEND_URL must be/)
+    }
+    assert.throws(() => loadConfig({ COOKIE_SAME_SITE: "maybe" }), /COOKIE_SAME_SITE must be lax, strict or none/)
+})
+
+test("requires the database URL and JWT secret before the server starts", () => {
+    assert.throws(
+        () => assertRequiredEnvironment({}),
+        /Missing required environment variables: DATABASE_URL, JWT_SECRET/
+    )
+    assert.throws(
+        () => assertRequiredEnvironment({ DATABASE_URL: "postgresql://localhost/vendly", JWT_SECRET: " " }),
+        /Missing required environment variables: JWT_SECRET/
+    )
+    assert.doesNotThrow(() => assertRequiredEnvironment({
+        DATABASE_URL: "postgresql://localhost/vendly",
+        JWT_SECRET: "configured"
+    }))
+})
+
+test("allows cross-origin requests only from the configured frontend", async () => {
+    await withAppServer(async (baseUrl) => {
+        const allowed = await fetch(`${baseUrl}/listings/abc`, {
+            headers: { origin: "http://localhost:5173" }
+        })
+        assert.equal(allowed.headers.get("access-control-allow-origin"), "http://localhost:5173")
+        assert.equal(allowed.headers.get("access-control-allow-credentials"), "true")
+
+        // With a single configured origin the header is fixed, so browsers block any other site
+        // because it does not match their own origin. The unknown origin must never be echoed.
+        const other = await fetch(`${baseUrl}/listings/abc`, {
+            headers: { origin: "https://unknown.example" }
+        })
+        assert.equal(other.headers.get("access-control-allow-origin"), "http://localhost:5173")
+    })
+})
+
+test("sets and clears the login cookie with the configured attributes", async () => {
+    const email = `cookie-attributes-${randomUUID()}@example.test`
+    const password = "integration-test-password"
+    const user = await prisma.user.create({
+        data: {
+            name: "Cookie attributes test consumer",
+            email,
+            passwordHash: await bcrypt.hash(password, 4),
+            role: "CONSUMER"
+        }
+    })
+
+    try {
+        await withAppServer(async (baseUrl) => {
+            const login = await fetch(`${baseUrl}/users/login`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ email, password })
+            })
+            assert.equal(login.status, 200)
+            const loginCookie = login.headers.get("set-cookie") ?? ""
+            assert.match(loginCookie, /^token=[^;]+;/)
+            assert.match(loginCookie, /Max-Age=3600/)
+            assert.match(loginCookie, /HttpOnly/)
+            assert.match(loginCookie, /SameSite=Lax/)
+            assert.doesNotMatch(loginCookie, /Secure/)
+
+            const logout = await fetch(`${baseUrl}/users/logout`, { method: "POST" })
+            assert.equal(logout.status, 200)
+            const logoutCookie = logout.headers.get("set-cookie") ?? ""
+            assert.match(logoutCookie, /^token=;/)
+            assert.match(logoutCookie, /Expires=Thu, 01 Jan 1970/)
+            assert.match(logoutCookie, /HttpOnly/)
+            assert.match(logoutCookie, /SameSite=Lax/)
+        })
+    } finally {
+        await prisma.user.delete({ where: { id: user.id } })
+    }
 })

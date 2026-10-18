@@ -7,11 +7,12 @@ import sellerRoutes from "./routes/sellerRoutes.js"
 import cartRoutes from "./routes/cartRoutes.js"
 import checkoutRoutes from "./routes/checkoutRoutes.js"
 import { ensureRequestBody, errorHandler, notFoundHandler } from "./middleware/errorHandlers.js"
+import config from "./config.js"
 
 const app = express()
 
 app.use(cors({
-    origin: "http://localhost:5173",
+    origin: config.frontendUrl,
     credentials:true
 }))
 app.use(express.json())

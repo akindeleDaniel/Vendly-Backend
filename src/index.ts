@@ -1,6 +1,9 @@
 import "dotenv/config"
+import config, { assertRequiredEnvironment } from "./config.js"
 import app from "./app.js"
 
-app.listen(3000, () => {
-    console.log("Server is running on port 3000")
+assertRequiredEnvironment(process.env)
+
+app.listen(config.port, () => {
+    console.log(`Server is running on port ${config.port}`)
 })

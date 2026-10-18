@@ -2,6 +2,7 @@ import bcrypt from "bcrypt"
 import prisma from "../lib/prisma.js"
 import type { Request, Response } from "express"
 import jwt from "jsonwebtoken"
+import { authCookieMaxAgeMs, authCookieOptions } from "../lib/authCookie.js"
 
 export const createUser = async (req: Request, res: Response) => {
     const { name, email, password, role } = req.body;
@@ -57,10 +58,8 @@ export const createUser = async (req: Request, res: Response) => {
         );
 
         res.cookie("token", token, {
-            httpOnly: true,
-            secure: process.env.NODE_ENV === "production",
-            sameSite: "lax",
-            maxAge: 3600000
+            ...authCookieOptions,
+            maxAge: authCookieMaxAgeMs
         });
 
         res.send({ message: "Registration successful" });
@@ -101,10 +100,8 @@ export const loginUser = async(req: Request, res: Response) =>{
     const token = jwt.sign({id: existingUser.id}, process.env.JWT_SECRET, {expiresIn:"1h"})
 
     res.cookie("token", token, {
-        httpOnly:true,
-        secure: process.env.NODE_ENV === "production", // tells the cookie that for development it doesn't need to be secure, but for production it will need to be secure
-        sameSite:"lax",
-        maxAge: 3600000
+        ...authCookieOptions,
+        maxAge: authCookieMaxAgeMs
     })
     res.send({
         message: "Login Successful",
@@ -113,11 +110,7 @@ export const loginUser = async(req: Request, res: Response) =>{
 }
 
 export const logout = (_req: Request, res: Response) => {
-    res.clearCookie("token", {
-        httpOnly: true,
-        secure: process.env.NODE_ENV === "production",
-        sameSite: "lax"
-    })
+    res.clearCookie("token", authCookieOptions)
     res.send({ message: "Logged out successfully" })
 }
 
