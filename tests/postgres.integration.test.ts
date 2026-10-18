@@ -10,6 +10,7 @@ import { connectTestDatabase } from "../scripts/testDatabase.js"
 import checkoutRoutes from "../src/routes/checkoutRoutes.js"
 import cartRoutes from "../src/routes/cartRoutes.js"
 import listingRoutes from "../src/routes/listingRoutes.js"
+import app from "../src/app.js"
 
 let prisma: PrismaClient
 
@@ -3042,3 +3043,98 @@ for (const [label, attemptStatuses] of [
         }
     })
 }
+
+// Runs requests against the real application wiring from src/app.ts.
+async function withAppServer(run: (baseUrl: string) => Promise<void>) {
+    const server = createServer(app)
+    await new Promise<void>((resolve, reject) => {
+        server.once("error", reject)
+        server.listen(0, "127.0.0.1", resolve)
+    })
+
+    try {
+        const address = server.address()
+        assert.ok(address && typeof address !== "string")
+        await run(`http://127.0.0.1:${address.port}`)
+    } finally {
+        await new Promise<void>((resolve, reject) => {
+            server.close((error) => error ? reject(error) : resolve())
+        })
+    }
+}
+
+async function readJsonResponse(response: Response) {
+    assert.match(response.headers.get("content-type") ?? "", /application\/json/)
+    return response.json() as Promise<unknown>
+}
+
+test("returns validation errors instead of crashing when a request has no JSON body", async () => {
+    await withAppServer(async (baseUrl) => {
+        for (const path of ["/users/register", "/users/login"]) {
+            const response = await fetch(`${baseUrl}${path}`, { method: "POST" })
+            assert.equal(response.status, 400, `Expected 400 from ${path}`)
+            assert.deepEqual(await readJsonResponse(response), { message: "All areas are required" })
+        }
+    })
+})
+
+test("rejects malformed and oversized JSON bodies with JSON errors", async () => {
+    await withAppServer(async (baseUrl) => {
+        const malformed = await fetch(`${baseUrl}/users/login`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: "{not valid json"
+        })
+        assert.equal(malformed.status, 400)
+        assert.deepEqual(await readJsonResponse(malformed), { message: "Request body must be valid JSON" })
+
+        const oversized = await fetch(`${baseUrl}/users/login`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ email: "a".repeat(200_000), password: "x" })
+        })
+        assert.equal(oversized.status, 413)
+        assert.deepEqual(await readJsonResponse(oversized), { message: "Request body is too large" })
+    })
+})
+
+test("answers unknown routes and missing login cookies with JSON errors", async () => {
+    await withAppServer(async (baseUrl) => {
+        const unknownRoute = await fetch(`${baseUrl}/no-such-route`)
+        assert.equal(unknownRoute.status, 404)
+        assert.deepEqual(await readJsonResponse(unknownRoute), { message: "Route not found" })
+
+        const missingCookie = await fetch(`${baseUrl}/cart`)
+        assert.equal(missingCookie.status, 401)
+        assert.deepEqual(await readJsonResponse(missingCookie), { message: "Login first" })
+    })
+})
+
+test("logs unexpected errors outside controller error handling and returns a generic JSON 500", async (t) => {
+    await withAppServer(async (baseUrl) => {
+        const consoleError = t.mock.method(console, "error", () => {})
+
+        const response = await fetch(`${baseUrl}/users/login`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ email: { not: "a string" }, password: "integration-test-not-a-password" })
+        })
+        assert.equal(response.status, 500)
+        assert.deepEqual(await readJsonResponse(response), { message: "Sorry there is an issue on our end" })
+        assert.equal(consoleError.mock.callCount(), 1)
+        const [operation, context, loggedError] = consoleError.mock.calls[0]?.arguments ?? []
+        assert.equal(operation, "Unhandled request error")
+        assert.deepEqual(context, { method: "POST", path: "/users/login" })
+        assert.ok(loggedError instanceof Error)
+    })
+})
+
+test("rejects non-integer listing ids as invalid", async () => {
+    await withAppServer(async (baseUrl) => {
+        for (const id of ["1.5", "abc", "1e400"]) {
+            const response = await fetch(`${baseUrl}/listings/${id}`)
+            assert.equal(response.status, 400, `Expected 400 for listing id ${id}`)
+            assert.deepEqual(await readJsonResponse(response), { message: "Id has to be a number" })
+        }
+    })
+})

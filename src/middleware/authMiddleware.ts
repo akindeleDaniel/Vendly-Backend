@@ -6,7 +6,7 @@ export function authMiddleware (req: Request, res:Response, next:NextFunction){
     const cookieToken = req.cookies.token
     
     if(!cookieToken){
-        res.status(401).send("Login first")
+        res.status(401).send({message:"Login first"})
         return
     }
 

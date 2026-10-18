@@ -81,7 +81,7 @@ export const getAllListings = async (req:Request, res:Response) =>{
 export const getListingById  = async (req:Request, res:Response) =>{
     const id = Number(req.params.id)
 
-    if(isNaN(id)){
+    if(!Number.isSafeInteger(id)){
         res.status(400).send({message:"Id has to be a number"})
         return
     }
@@ -155,7 +155,7 @@ export const updateListing = async(req:Request, res:Response) =>{
     const id = Number(req.params.id)
     const {title, description, price, category, imageUrl, stockQuantity} = req.body
 
-    if(isNaN(id)){
+    if(!Number.isSafeInteger(id)){
         res.status(400).send({message:"Id has to be a number"})
         return 
     }
@@ -286,7 +286,7 @@ export const updateListing = async(req:Request, res:Response) =>{
 export const deleteListing = async(req:Request, res:Response) =>{
     const id = Number(req.params.id)
 
-     if(isNaN(id)){
+     if(!Number.isSafeInteger(id)){
         res.status(400).send({message:"Id has to be a number"})
         return
     }
