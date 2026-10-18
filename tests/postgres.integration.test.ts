@@ -5,13 +5,21 @@ import { after, before, test } from "node:test"
 import cookieParser from "cookie-parser"
 import express from "express"
 import jwt from "jsonwebtoken"
-import { Prisma, PrismaClient } from "../src/generated/prisma/client.js"
+import { Prisma, PrismaClient, type PaymentProvider } from "../src/generated/prisma/client.js"
 import { connectTestDatabase } from "../scripts/testDatabase.js"
 import checkoutRoutes from "../src/routes/checkoutRoutes.js"
 import cartRoutes from "../src/routes/cartRoutes.js"
 import listingRoutes from "../src/routes/listingRoutes.js"
 import app from "../src/app.js"
 import { assertRequiredEnvironment, loadConfig } from "../src/config.js"
+import { payoutFeeTerms } from "../src/controllers/payoutController.js"
+import { setPaymentProvidersForTesting } from "../src/lib/payments/providers.js"
+import {
+    PaymentProviderError,
+    type CreateSubaccountInput,
+    type PaymentProviderAdapter,
+    type ResolveAccountInput
+} from "../src/lib/payments/types.js"
 import bcrypt from "bcrypt"
 
 let prisma: PrismaClient
@@ -3245,4 +3253,357 @@ test("sets and clears the login cookie with the configured attributes", async ()
     } finally {
         await prisma.user.delete({ where: { id: user.id } })
     }
+})
+
+type FakeProviderBehavior = {
+    resolve?: (input: ResolveAccountInput) => Promise<{ accountName: string }>
+    create?: (input: CreateSubaccountInput) => Promise<{ subaccountCode: string }>
+}
+
+function installFakePaymentProviders() {
+    const calls = {
+        resolve: [] as Array<{ provider: PaymentProvider; input: ResolveAccountInput }>,
+        create: [] as Array<{ provider: PaymentProvider; input: CreateSubaccountInput }>
+    }
+    const behaviors: Record<PaymentProvider, FakeProviderBehavior> = { PAYSTACK: {}, FLUTTERWAVE: {} }
+    const fakeAdapter = (provider: PaymentProvider): PaymentProviderAdapter => ({
+        provider,
+        async resolveAccount(input) {
+            calls.resolve.push({ provider, input })
+            return behaviors[provider].resolve?.(input) ?? { accountName: "ADA OKAFOR" }
+        },
+        async createSubaccount(input) {
+            calls.create.push({ provider, input })
+            return behaviors[provider].create?.(input) ?? { subaccountCode: `${provider}-SUB-${randomUUID()}` }
+        }
+    })
+    setPaymentProvidersForTesting({ PAYSTACK: fakeAdapter("PAYSTACK"), FLUTTERWAVE: fakeAdapter("FLUTTERWAVE") })
+    return { calls, behaviors }
+}
+
+type PayoutTestContext = {
+    sellerProfileId: number
+    fakes: ReturnType<typeof installFakePaymentProviders>
+    request(method: "GET" | "POST", path: string, body?: unknown): Promise<{ status: number; body: any; text: string }>
+}
+
+const validPayoutRequest = {
+    bankId: "opay",
+    accountNumber: "0123456789",
+    businessPhone: "+234 801 234 5678",
+    acceptFeeTerms: true,
+    feeTermsVersion: payoutFeeTerms.version
+}
+
+async function withPayoutSeller(
+    name: string,
+    run: (context: PayoutTestContext) => Promise<void>,
+    options: { role?: "SELLER" | "CONSUMER"; withProfile?: boolean } = {}
+) {
+    const jwtSecret = process.env.JWT_SECRET
+    assert.ok(jwtSecret, "JWT_SECRET must be configured for route integration tests")
+    const suffix = randomUUID()
+    const role = options.role ?? "SELLER"
+    const withProfile = role === "SELLER" && options.withProfile !== false
+    const user = await prisma.user.create({
+        data: {
+            name: `${name} user`,
+            email: `${name}-${suffix}@example.test`,
+            passwordHash: "integration-test-not-a-password",
+            role,
+            ...(withProfile
+                ? {
+                    sellerProfile: {
+                        create: {
+                            businessName: `${name} Shop`,
+                            state: "Lagos",
+                            lga: "Ikeja",
+                            location: "Ikeja, Lagos",
+                            logoUrl: "https://example.test/logo.png",
+                            slug: `${name}-${suffix}`,
+                            shippingPolicy: "FREE",
+                            shippingCost: null
+                        }
+                    }
+                }
+                : {})
+        },
+        include: { sellerProfile: true }
+    })
+    const token = jwt.sign({ id: user.id }, jwtSecret)
+    const fakes = installFakePaymentProviders()
+
+    try {
+        await withAppServer(async (baseUrl) => {
+            await run({
+                sellerProfileId: user.sellerProfile?.id ?? 0,
+                fakes,
+                async request(method, path, body) {
+                    const response = await fetch(`${baseUrl}${path}`, {
+                        method,
+                        headers: {
+                            cookie: `token=${token}`,
+                            ...(body !== undefined ? { "content-type": "application/json" } : {})
+                        },
+                        body: body !== undefined ? JSON.stringify(body) : null
+                    })
+                    const text = await response.text()
+                    return { status: response.status, body: text ? JSON.parse(text) : null, text }
+                }
+            })
+        })
+    } finally {
+        setPaymentProvidersForTesting(null)
+        await prisma.sellerPayoutAccount.deleteMany({ where: { sellerProfile: { userId: user.id } } })
+        await prisma.sellerProfile.deleteMany({ where: { userId: user.id } })
+        await prisma.user.delete({ where: { id: user.id } })
+    }
+}
+
+test("lists payout banks supported by both providers to sellers only", async () => {
+    await withPayoutSeller("payout-banks", async ({ request }) => {
+        const response = await request("GET", "/seller/payout/banks")
+        assert.equal(response.status, 200)
+        assert.ok(Array.isArray(response.body) && response.body.length > 100)
+        assert.deepEqual(response.body.find((bank: { id: string }) => bank.id === "opay"), { id: "opay", name: "OPay" })
+        assert.doesNotMatch(response.text, /paystackCode|flutterwaveCode/)
+    })
+
+    await withPayoutSeller("payout-banks-consumer", async ({ request }) => {
+        const response = await request("GET", "/seller/payout/banks")
+        assert.equal(response.status, 403)
+    }, { role: "CONSUMER" })
+})
+
+test("resolves a payout account name through Paystack and reports provider failures", async (t) => {
+    const consoleError = t.mock.method(console, "error", () => {})
+
+    await withPayoutSeller("payout-resolve", async ({ request, fakes }) => {
+        const resolved = await request("POST", "/seller/payout/resolve", { bankId: "opay", accountNumber: "0123456789" })
+        assert.equal(resolved.status, 200)
+        assert.deepEqual(resolved.body, { accountName: "ADA OKAFOR" })
+        assert.deepEqual(fakes.calls.resolve, [
+            { provider: "PAYSTACK", input: { bankCode: "999992", accountNumber: "0123456789" } }
+        ])
+
+        const shortNumber = await request("POST", "/seller/payout/resolve", { bankId: "opay", accountNumber: "12345" })
+        assert.equal(shortNumber.status, 400)
+        assert.equal(shortNumber.body.message, "Account number must be exactly 10 digits")
+
+        const unknownBank = await request("POST", "/seller/payout/resolve", { bankId: "not-a-bank", accountNumber: "0123456789" })
+        assert.equal(unknownBank.status, 400)
+        assert.equal(unknownBank.body.message, "Choose a supported bank")
+        assert.equal(fakes.calls.resolve.length, 1)
+
+        fakes.behaviors.PAYSTACK.resolve = async () => {
+            throw new PaymentProviderError("rejected", "Paystack rejected the request", "HTTP 422: Could not resolve account name")
+        }
+        const rejected = await request("POST", "/seller/payout/resolve", { bankId: "opay", accountNumber: "0123456789" })
+        assert.equal(rejected.status, 400)
+        assert.deepEqual(rejected.body, { message: "Account details are invalid", code: "PAYOUT_ACCOUNT_INVALID" })
+        assert.equal(consoleError.mock.callCount(), 0)
+
+        fakes.behaviors.PAYSTACK.resolve = async () => {
+            throw new PaymentProviderError("unavailable", "Paystack could not be reached", "TimeoutError")
+        }
+        const unavailable = await request("POST", "/seller/payout/resolve", { bankId: "opay", accountNumber: "0123456789" })
+        assert.equal(unavailable.status, 502)
+        assert.equal(unavailable.body.code, "PAYOUT_PROVIDER_UNAVAILABLE")
+        assert.equal(consoleError.mock.callCount(), 1)
+    })
+})
+
+test("creates payout accounts on both providers and stores only the last four account digits", async () => {
+    await withPayoutSeller("payout-create", async ({ request, fakes, sellerProfileId }) => {
+        const created = await request("POST", "/seller/payout/accounts", validPayoutRequest)
+        assert.equal(created.status, 201)
+        assert.deepEqual(
+            created.body.accounts.map((account: { provider: string; status: string; bankName: string; accountName: string; accountNumberLast4: string }) =>
+                [account.provider, account.status, account.bankName, account.accountName, account.accountNumberLast4]),
+            [
+                ["PAYSTACK", "ACTIVE", "OPay", "ADA OKAFOR", "6789"],
+                ["FLUTTERWAVE", "ACTIVE", "OPay", "ADA OKAFOR", "6789"]
+            ]
+        )
+        assert.doesNotMatch(created.text, /0123456789/)
+        assert.doesNotMatch(created.text, /subaccountCode/)
+
+        // Each provider receives its own code for the same bank.
+        assert.deepEqual(
+            fakes.calls.create.map(({ provider, input }) => [provider, input.bankCode, input.accountNumber, input.businessPhone]).sort(),
+            [
+                ["FLUTTERWAVE", "100004", "0123456789", "08012345678"],
+                ["PAYSTACK", "999992", "0123456789", "08012345678"]
+            ]
+        )
+        assert.ok(fakes.calls.create.every(({ input }) => input.businessName === "payout-create Shop" && input.businessEmail.endsWith("@example.test")))
+
+        const accounts = await prisma.sellerPayoutAccount.findMany({ where: { sellerProfileId } })
+        assert.equal(accounts.length, 2)
+        assert.ok(accounts.every((account) => account.status === "ACTIVE" && account.subaccountCode?.startsWith(`${account.provider}-SUB-`)))
+        assert.doesNotMatch(JSON.stringify(accounts), /0123456789/)
+
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { id: sellerProfileId } })
+        assert.equal(profile.businessPhone, "08012345678")
+        assert.equal(profile.payoutTermsVersion, payoutFeeTerms.version)
+        assert.ok(profile.payoutTermsAcceptedAt instanceof Date)
+
+        const listed = await request("GET", "/seller/payout/accounts")
+        assert.equal(listed.status, 200)
+        assert.deepEqual(listed.body.feeTerms, payoutFeeTerms)
+        assert.equal(listed.body.acceptedFeeTermsVersion, payoutFeeTerms.version)
+        assert.equal(listed.body.businessPhone, "08012345678")
+        assert.deepEqual(listed.body.accounts.map((account: { provider: string; status: string }) => [account.provider, account.status]), [
+            ["PAYSTACK", "ACTIVE"],
+            ["FLUTTERWAVE", "ACTIVE"]
+        ])
+
+        const repeated = await request("POST", "/seller/payout/accounts", validPayoutRequest)
+        assert.equal(repeated.status, 409)
+        assert.equal(repeated.body.code, "PAYOUT_ACCOUNTS_ACTIVE")
+        assert.equal(fakes.calls.create.length, 2)
+    })
+})
+
+test("records a partial provider failure and retries only the failed provider", async (t) => {
+    const consoleError = t.mock.method(console, "error", () => {})
+
+    await withPayoutSeller("payout-partial", async ({ request, fakes, sellerProfileId }) => {
+        fakes.behaviors.FLUTTERWAVE.create = async () => {
+            throw new PaymentProviderError("rejected", "Flutterwave rejected the request", "HTTP 400: Account 0123456789 is invalid")
+        }
+
+        const partial = await request("POST", "/seller/payout/accounts", validPayoutRequest)
+        assert.equal(partial.status, 502)
+        assert.equal(partial.body.code, "PAYOUT_SETUP_INCOMPLETE")
+        assert.equal(partial.body.message, "Payout setup failed for Flutterwave. Try again.")
+        assert.deepEqual(
+            partial.body.accounts.map((account: { provider: string; status: string; failureReason: string | null }) =>
+                [account.provider, account.status, account.failureReason]),
+            [
+                ["PAYSTACK", "ACTIVE", null],
+                ["FLUTTERWAVE", "FAILED", "Flutterwave rejected these account details"]
+            ]
+        )
+        assert.equal(consoleError.mock.callCount(), 1)
+        assert.doesNotMatch(JSON.stringify(consoleError.mock.calls.map((call) => call.arguments)), /0123456789/)
+
+        const paystackAccount = await prisma.sellerPayoutAccount.findUniqueOrThrow({
+            where: { sellerProfileId_provider: { sellerProfileId, provider: "PAYSTACK" } }
+        })
+
+        delete fakes.behaviors.FLUTTERWAVE.create
+        fakes.calls.create.length = 0
+
+        const retried = await request("POST", "/seller/payout/accounts", validPayoutRequest)
+        assert.equal(retried.status, 201)
+        assert.deepEqual(fakes.calls.create.map(({ provider }) => provider), ["FLUTTERWAVE"])
+        assert.deepEqual(retried.body.accounts.map((account: { status: string }) => account.status), ["ACTIVE", "ACTIVE"])
+
+        const paystackAfterRetry = await prisma.sellerPayoutAccount.findUniqueOrThrow({
+            where: { sellerProfileId_provider: { sellerProfileId, provider: "PAYSTACK" } }
+        })
+        assert.equal(paystackAfterRetry.subaccountCode, paystackAccount.subaccountCode)
+    })
+})
+
+test("refuses a payout retry with a different bank account than the active one", async (t) => {
+    t.mock.method(console, "error", () => {})
+
+    await withPayoutSeller("payout-mismatch", async ({ request, fakes }) => {
+        fakes.behaviors.FLUTTERWAVE.create = async () => {
+            throw new PaymentProviderError("unavailable", "Flutterwave could not be reached", "TimeoutError")
+        }
+        const partial = await request("POST", "/seller/payout/accounts", validPayoutRequest)
+        assert.equal(partial.status, 502)
+        assert.equal(partial.body.accounts[1].failureReason, "Flutterwave could not be reached. Try again.")
+
+        delete fakes.behaviors.FLUTTERWAVE.create
+        fakes.calls.create.length = 0
+
+        const otherAccount = await request("POST", "/seller/payout/accounts", { ...validPayoutRequest, accountNumber: "0123450000" })
+        assert.equal(otherAccount.status, 409)
+        assert.equal(otherAccount.body.code, "PAYOUT_ACCOUNT_MISMATCH")
+
+        const otherBank = await request("POST", "/seller/payout/accounts", { ...validPayoutRequest, bankId: "access-bank" })
+        assert.equal(otherBank.status, 409)
+        assert.equal(otherBank.body.code, "PAYOUT_ACCOUNT_MISMATCH")
+        assert.equal(fakes.calls.create.length, 0)
+    })
+})
+
+test("validates payout setup requests before calling any provider", async () => {
+    await withPayoutSeller("payout-validate", async ({ request, fakes }) => {
+        const cases: Array<[Record<string, unknown>, number, string]> = [
+            [{ ...validPayoutRequest, acceptFeeTerms: undefined }, 400, "You must accept the payout fee terms"],
+            [{ ...validPayoutRequest, feeTermsVersion: "2000-01-01" }, 409, "The payout fee terms have changed. Review them and try again."],
+            [{ ...validPayoutRequest, businessPhone: "12345" }, 400, "Business phone must be a valid Nigerian mobile number"],
+            [{ ...validPayoutRequest, bankId: "unknown-bank" }, 400, "Choose a supported bank"],
+            [{ ...validPayoutRequest, accountNumber: "01234 56789" }, 400, "Account number must be exactly 10 digits"]
+        ]
+
+        for (const [body, status, message] of cases) {
+            const response = await request("POST", "/seller/payout/accounts", body)
+            assert.equal(response.status, status, message)
+            assert.equal(response.body.message, message)
+        }
+
+        assert.equal(fakes.calls.resolve.length, 0)
+        assert.equal(fakes.calls.create.length, 0)
+    })
+
+    await withPayoutSeller("payout-no-profile", async ({ request, fakes }) => {
+        const response = await request("POST", "/seller/payout/accounts", validPayoutRequest)
+        assert.equal(response.status, 404)
+        assert.equal(response.body.message, "Store profile not found")
+        assert.equal(fakes.calls.create.length, 0)
+    }, { withProfile: false })
+})
+
+test("refuses payout setup while another setup is in progress and recovers a stale one", async () => {
+    await withPayoutSeller("payout-in-progress", async ({ request, fakes, sellerProfileId }) => {
+        const pending = await prisma.sellerPayoutAccount.create({
+            data: {
+                sellerProfileId,
+                provider: "FLUTTERWAVE",
+                bankId: "opay",
+                bankName: "OPay",
+                accountName: "ADA OKAFOR",
+                accountNumberLast4: "6789"
+            }
+        })
+
+        const busy = await request("POST", "/seller/payout/accounts", validPayoutRequest)
+        assert.equal(busy.status, 409)
+        assert.equal(busy.body.code, "PAYOUT_SETUP_IN_PROGRESS")
+        assert.equal(fakes.calls.create.length, 0)
+
+        await prisma.$executeRaw`
+            UPDATE "SellerPayoutAccount" SET "updatedAt" = (NOW() AT TIME ZONE 'UTC') - INTERVAL '5 minutes' WHERE id = ${pending.id}
+        `
+
+        const recovered = await request("POST", "/seller/payout/accounts", validPayoutRequest)
+        assert.equal(recovered.status, 201)
+        assert.equal(fakes.calls.create.length, 2)
+    })
+})
+
+test("lets only one of two concurrent payout setups call the providers", async () => {
+    await withPayoutSeller("payout-concurrent", async ({ request, fakes }) => {
+        for (const provider of ["PAYSTACK", "FLUTTERWAVE"] as const) {
+            fakes.behaviors[provider].create = async () => {
+                await new Promise((resolve) => setTimeout(resolve, 300))
+                return { subaccountCode: `${provider}-SUB-${randomUUID()}` }
+            }
+        }
+
+        const responses = await Promise.all([
+            request("POST", "/seller/payout/accounts", validPayoutRequest),
+            request("POST", "/seller/payout/accounts", validPayoutRequest)
+        ])
+
+        assert.deepEqual(responses.map(({ status }) => status).sort(), [201, 409])
+        assert.equal(responses.find(({ status }) => status === 409)?.body.code, "PAYOUT_SETUP_IN_PROGRESS")
+        assert.equal(fakes.calls.create.length, 2)
+    })
 })

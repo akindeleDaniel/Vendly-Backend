@@ -65,6 +65,40 @@ model SellerProfile {
 
   shippingPolicy SellerShippingPolicy
   shippingCost   Decimal?             @db.Decimal(12, 2)
+
+  businessPhone         String?
+  payoutTermsVersion    String?
+  payoutTermsAcceptedAt DateTime?
+  payoutAccounts        SellerPayoutAccount[]
+}
+
+enum PayoutAccountStatus {
+  PENDING
+  ACTIVE
+  FAILED
+}
+
+// One payout account (provider subaccount) per seller per provider. The full bank account
+// number is held only by the providers; Vendly keeps the last four digits.
+model SellerPayoutAccount {
+  id                 Int                 @id @default(autoincrement())
+  sellerProfileId    Int
+  provider           PaymentProvider
+  status             PayoutAccountStatus @default(PENDING)
+  subaccountCode     String?
+  bankId             String
+  bankName           String
+  accountName        String
+  accountNumberLast4 String
+  failureReason      String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sellerProfile SellerProfile @relation(fields: [sellerProfileId], references: [id])
+
+  @@unique([sellerProfileId, provider])
+  @@unique([provider, subaccountCode])
 }
 
 enum SellerShippingPolicy {
