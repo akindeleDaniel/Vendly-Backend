@@ -3,3 +3,4 @@ dist/
 /src/generated/prisma
 .env
 .env.test
+References/
