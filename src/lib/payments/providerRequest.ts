@@ -6,7 +6,7 @@ type ProviderRequest = {
     providerName: string
     secretKeyVariable: string
     url: string
-    method?: "GET" | "POST"
+    method?: "GET" | "POST" | "PUT"
     body?: unknown
     isSuccess(body: unknown): boolean
 }

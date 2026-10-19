@@ -18,7 +18,16 @@ export type CreateSubaccountInput = {
 export interface PaymentProviderAdapter {
     readonly provider: PaymentProvider
     resolveAccount(input: ResolveAccountInput): Promise<{ accountName: string }>
-    createSubaccount(input: CreateSubaccountInput): Promise<{ subaccountCode: string }>
+    createSubaccount(input: CreateSubaccountInput): Promise<ProviderSubaccount>
+    // Points an existing subaccount at different bank details. The subaccount code stays the same.
+    updateSubaccount(subaccount: ProviderSubaccount, input: CreateSubaccountInput): Promise<void>
+}
+
+// subaccountCode is what payment splits use. providerAccountId is the provider's own record ID,
+// when updates need it (Flutterwave).
+export type ProviderSubaccount = {
+    subaccountCode: string
+    providerAccountId: string | null
 }
 
 // "rejected": the provider refused the request (for example invalid account details).

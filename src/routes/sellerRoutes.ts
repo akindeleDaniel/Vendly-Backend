@@ -1,6 +1,6 @@
 import { Router } from "express"
 import { createSeller, getMySellerProfile, updateSeller, getPublicShop, getCategoryShops } from "../controllers/sellerController.js"
-import { createPayoutAccounts, getPayoutAccounts, getPayoutBanks, resolvePayoutAccount } from "../controllers/payoutController.js"
+import { changePayoutBankAccount, createPayoutAccounts, getPayoutAccounts, getPayoutBanks, resolvePayoutAccount } from "../controllers/payoutController.js"
 import { authMiddleware } from "../middleware/authMiddleware.js"
 import { requireRole } from "../middleware/requireRole.js"
 
@@ -13,6 +13,7 @@ router.get("/payout/banks", authMiddleware, requireRole("SELLER"), getPayoutBank
 router.post("/payout/resolve", authMiddleware, requireRole("SELLER"), resolvePayoutAccount)
 router.get("/payout/accounts", authMiddleware, requireRole("SELLER"), getPayoutAccounts)
 router.post("/payout/accounts", authMiddleware, requireRole("SELLER"), createPayoutAccounts)
+router.put("/payout/accounts", authMiddleware, requireRole("SELLER"), changePayoutBankAccount)
 router.get("/shops", getCategoryShops)
 router.get("/shop/:slug", getPublicShop)
 

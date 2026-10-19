@@ -86,6 +86,8 @@ model SellerPayoutAccount {
   provider           PaymentProvider
   status             PayoutAccountStatus @default(PENDING)
   subaccountCode     String?
+  // Flutterwave updates subaccounts by this numeric ID, not by the RS_ subaccount code.
+  providerAccountId  String?
   bankId             String
   bankName           String
   accountName        String

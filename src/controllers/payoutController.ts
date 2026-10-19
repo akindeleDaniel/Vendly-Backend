@@ -1,9 +1,10 @@
+import bcrypt from "bcrypt"
 import type { Request, Response } from "express"
 import prisma from "../lib/prisma.js"
-import type { PaymentProvider, SellerPayoutAccount } from "../generated/prisma/client.js"
+import type { PaymentProvider, Prisma, SellerPayoutAccount } from "../generated/prisma/client.js"
 import { findPayoutBank, payoutBanks, type PayoutBank } from "../lib/payoutBanks.js"
 import { getPaymentProvider, paymentProviderNames, paymentProviders } from "../lib/payments/providers.js"
-import { PaymentProviderError } from "../lib/payments/types.js"
+import { PaymentProviderError, type ProviderSubaccount } from "../lib/payments/types.js"
 
 // Sellers must accept the current wording before payout accounts are created. Change the
 // version whenever the wording or the fee arrangement changes, so sellers accept it again.
@@ -24,6 +25,9 @@ export type PayoutErrorCode =
     | "PAYOUT_ACCOUNT_MISMATCH"
     | "PAYOUT_SETUP_IN_PROGRESS"
     | "PAYOUT_SETUP_INCOMPLETE"
+    | "PAYOUT_PASSWORD_INCORRECT"
+    | "PAYOUT_ACCOUNTS_NOT_SET_UP"
+    | "PAYOUT_ACCOUNT_UNCHANGED"
 
 class PayoutRequestError extends Error {
     constructor(
@@ -163,9 +167,157 @@ export const getPayoutAccounts = async (req: Request, res: Response) => {
     })
 }
 
+type BankDetailsChange = {
+    profile: { id: number; businessName: string; email: string }
+    bank: PayoutBank
+    accountNumber: string
+    accountName: string
+    businessPhone: string
+    // Picks the providers to configure from the seller's current accounts, or throws.
+    selectProviders(existingAccounts: SellerPayoutAccount[]): PaymentProvider[]
+    profileUpdate?: Prisma.SellerProfileUpdateInput
+}
+
+// Points the seller's payout accounts on the selected providers at the given bank details.
+// The accounts are first claimed as PENDING under a per-seller lock, then each provider is
+// called outside any database transaction (creating a subaccount, or updating the existing
+// one so its code stays the same), then each result is saved.
+async function applyBankDetails(change: BankDetailsChange) {
+    const { profile, bank, accountNumber, accountName, businessPhone } = change
+
+    const claimedAccounts = await prisma.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${payoutAdvisoryLockNamespace}::integer, ${profile.id}::integer)`
+
+        const existingAccounts = await tx.sellerPayoutAccount.findMany({
+            where: { sellerProfileId: profile.id }
+        })
+        const pendingCutoff = Date.now() - pendingSetupTimeoutMs
+
+        if (existingAccounts.some((account) => account.status === "PENDING" && account.updatedAt.getTime() > pendingCutoff)) {
+            throw new PayoutRequestError(
+                409,
+                "Payout setup is already in progress. Try again shortly.",
+                "PAYOUT_SETUP_IN_PROGRESS"
+            )
+        }
+
+        const providers = change.selectProviders(existingAccounts)
+        const accountDetails = {
+            status: "PENDING" as const,
+            bankId: bank.id,
+            bankName: bank.name,
+            accountName,
+            accountNumberLast4: accountNumber.slice(-4),
+            failureReason: null
+        }
+        const claimed: Array<{ provider: PaymentProvider; subaccount: ProviderSubaccount | null }> = []
+
+        // An existing subaccount code is kept so the provider's subaccount is updated in place.
+        for (const provider of providers) {
+            const account = await tx.sellerPayoutAccount.upsert({
+                where: { sellerProfileId_provider: { sellerProfileId: profile.id, provider } },
+                create: { sellerProfileId: profile.id, provider, ...accountDetails },
+                update: accountDetails
+            })
+            claimed.push({
+                provider,
+                subaccount: account.subaccountCode
+                    ? { subaccountCode: account.subaccountCode, providerAccountId: account.providerAccountId }
+                    : null
+            })
+        }
+
+        if (change.profileUpdate) {
+            await tx.sellerProfile.update({ where: { id: profile.id }, data: change.profileUpdate })
+        }
+
+        return claimed
+    })
+
+    const results = await Promise.all(claimedAccounts.map(async ({ provider, subaccount }) => {
+        const input = {
+            businessName: profile.businessName,
+            businessEmail: profile.email,
+            businessPhone,
+            bankCode: provider === "PAYSTACK" ? bank.paystackCode : bank.flutterwaveCode,
+            accountNumber
+        }
+
+        try {
+            if (subaccount) {
+                await getPaymentProvider(provider).updateSubaccount(subaccount, input)
+                return { provider, subaccount, failureReason: null }
+            }
+
+            const created = await getPaymentProvider(provider).createSubaccount(input)
+            return { provider, subaccount: created, failureReason: null }
+        } catch (error) {
+            const rejected = error instanceof PaymentProviderError && error.kind === "rejected"
+            console.error(subaccount ? "Payout account update failed" : "Payout account creation failed", {
+                provider,
+                sellerProfileId: profile.id,
+                reason: error instanceof PaymentProviderError
+                    ? redactAccountNumbers(error.providerMessage)
+                    : error instanceof Error ? error.name : undefined
+            })
+            return {
+                provider,
+                subaccount,
+                failureReason: rejected
+                    ? `${paymentProviderNames[provider]} rejected these account details`
+                    : `${paymentProviderNames[provider]} could not be reached. Try again.`
+            }
+        }
+    }))
+
+    // A failed update keeps its subaccount code so a retry updates the same subaccount. The
+    // account stays FAILED, and so unusable for payments, until the provider accepts the new details.
+    for (const result of results) {
+        await prisma.sellerPayoutAccount.update({
+            where: { sellerProfileId_provider: { sellerProfileId: profile.id, provider: result.provider } },
+            data: result.failureReason
+                ? { status: "FAILED", failureReason: result.failureReason }
+                : {
+                    status: "ACTIVE",
+                    subaccountCode: result.subaccount?.subaccountCode ?? null,
+                    providerAccountId: result.subaccount?.providerAccountId ?? null,
+                    failureReason: null
+                }
+        })
+    }
+
+    const accounts = await prisma.sellerPayoutAccount.findMany({
+        where: { sellerProfileId: profile.id },
+        orderBy: { provider: "asc" }
+    })
+
+    return {
+        accounts: accounts.map(toPayoutAccountResponse),
+        failedProviders: results.filter((result) => result.failureReason).map((result) => result.provider)
+    }
+}
+
+function sendIncompleteBankDetails(
+    res: Response,
+    action: string,
+    result: Awaited<ReturnType<typeof applyBankDetails>>
+) {
+    const providerNames = result.failedProviders.map((provider) => paymentProviderNames[provider]).join(" and ")
+
+    res.status(502).send({
+        message: `${action} failed for ${providerNames}. Try again.`,
+        code: "PAYOUT_SETUP_INCOMPLETE",
+        accounts: result.accounts
+    })
+}
+
+function matchesBankDetails(account: SellerPayoutAccount, bank: PayoutBank, accountNumber: string, accountName: string) {
+    return account.bankId === bank.id &&
+        account.accountNumberLast4 === accountNumber.slice(-4) &&
+        account.accountName === accountName
+}
+
 // Creates the seller's payout accounts on every provider that does not have an active one yet.
-// The provider calls happen outside database transactions: the accounts are first claimed as
-// PENDING, then each provider is called, then each result is saved.
 export const createPayoutAccounts = async (req: Request, res: Response) => {
     try {
         const bank = parseBank(req.body.bankId)
@@ -195,132 +347,113 @@ export const createPayoutAccounts = async (req: Request, res: Response) => {
         }
 
         const accountName = await resolveAccountName(bank, accountNumber)
-        const accountNumberLast4 = accountNumber.slice(-4)
-
-        const providersToSetUp = await prisma.$transaction(async (tx) => {
-            await tx.$executeRaw`SELECT pg_advisory_xact_lock(${payoutAdvisoryLockNamespace}::integer, ${profile.id}::integer)`
-
-            const existingAccounts = await tx.sellerPayoutAccount.findMany({
-                where: { sellerProfileId: profile.id }
-            })
-            const activeAccounts = existingAccounts.filter((account) => account.status === "ACTIVE")
-            const pendingCutoff = Date.now() - pendingSetupTimeoutMs
-
-            if (existingAccounts.some((account) => account.status === "PENDING" && account.updatedAt.getTime() > pendingCutoff)) {
-                throw new PayoutRequestError(
-                    409,
-                    "Payout setup is already in progress. Try again shortly.",
-                    "PAYOUT_SETUP_IN_PROGRESS"
+        const result = await applyBankDetails({
+            profile: { id: profile.id, businessName: profile.businessName, email: profile.user.email },
+            bank,
+            accountNumber,
+            accountName,
+            businessPhone,
+            selectProviders(existingAccounts) {
+                const activeAccounts = existingAccounts.filter((account) => account.status === "ACTIVE")
+                const providers = paymentProviders.filter(
+                    (provider) => !activeAccounts.some((account) => account.provider === provider)
                 )
-            }
 
-            const pendingProviders = paymentProviders.filter(
-                (provider) => !activeAccounts.some((account) => account.provider === provider)
-            )
-
-            if (pendingProviders.length === 0) {
-                throw new PayoutRequestError(409, "Your payout accounts are already set up", "PAYOUT_ACCOUNTS_ACTIVE")
-            }
-
-            // Every provider must pay into the same bank account.
-            if (activeAccounts.some((account) =>
-                account.bankId !== bank.id ||
-                account.accountNumberLast4 !== accountNumberLast4 ||
-                account.accountName !== accountName
-            )) {
-                throw new PayoutRequestError(
-                    409,
-                    "Use the same bank account as your active payout account",
-                    "PAYOUT_ACCOUNT_MISMATCH"
-                )
-            }
-
-            const accountDetails = {
-                status: "PENDING" as const,
-                subaccountCode: null,
-                bankId: bank.id,
-                bankName: bank.name,
-                accountName,
-                accountNumberLast4,
-                failureReason: null
-            }
-
-            for (const provider of pendingProviders) {
-                await tx.sellerPayoutAccount.upsert({
-                    where: { sellerProfileId_provider: { sellerProfileId: profile.id, provider } },
-                    create: { sellerProfileId: profile.id, provider, ...accountDetails },
-                    update: accountDetails
-                })
-            }
-
-            await tx.sellerProfile.update({
-                where: { id: profile.id },
-                data: {
-                    businessPhone,
-                    payoutTermsVersion: payoutFeeTerms.version,
-                    payoutTermsAcceptedAt: new Date()
+                if (providers.length === 0) {
+                    throw new PayoutRequestError(409, "Your payout accounts are already set up", "PAYOUT_ACCOUNTS_ACTIVE")
                 }
-            })
 
-            return pendingProviders
+                // Every provider must pay into the same bank account. Changing it is a separate action.
+                if (activeAccounts.some((account) => !matchesBankDetails(account, bank, accountNumber, accountName))) {
+                    throw new PayoutRequestError(
+                        409,
+                        "Use the same bank account as your active payout account, or change your bank account instead",
+                        "PAYOUT_ACCOUNT_MISMATCH"
+                    )
+                }
+
+                return providers
+            },
+            profileUpdate: {
+                businessPhone,
+                payoutTermsVersion: payoutFeeTerms.version,
+                payoutTermsAcceptedAt: new Date()
+            }
         })
 
-        const results = await Promise.all(providersToSetUp.map(async (provider) => {
-            try {
-                const { subaccountCode } = await getPaymentProvider(provider).createSubaccount({
-                    businessName: profile.businessName,
-                    businessEmail: profile.user.email,
-                    businessPhone,
-                    bankCode: provider === "PAYSTACK" ? bank.paystackCode : bank.flutterwaveCode,
-                    accountNumber
-                })
-                return { provider, subaccountCode, failureReason: null }
-            } catch (error) {
-                const rejected = error instanceof PaymentProviderError && error.kind === "rejected"
-                console.error("Payout account creation failed", {
-                    provider,
-                    sellerProfileId: profile.id,
-                    reason: error instanceof PaymentProviderError
-                        ? redactAccountNumbers(error.providerMessage)
-                        : error instanceof Error ? error.name : undefined
-                })
-                return {
-                    provider,
-                    subaccountCode: null,
-                    failureReason: rejected
-                        ? `${paymentProviderNames[provider]} rejected these account details`
-                        : `${paymentProviderNames[provider]} could not be reached. Try again.`
-                }
-            }
-        }))
-
-        for (const result of results) {
-            await prisma.sellerPayoutAccount.update({
-                where: { sellerProfileId_provider: { sellerProfileId: profile.id, provider: result.provider } },
-                data: result.subaccountCode
-                    ? { status: "ACTIVE", subaccountCode: result.subaccountCode, failureReason: null }
-                    : { status: "FAILED", failureReason: result.failureReason }
-            })
-        }
-
-        const accounts = await prisma.sellerPayoutAccount.findMany({
-            where: { sellerProfileId: profile.id },
-            orderBy: { provider: "asc" }
-        })
-        const failedProviders: PaymentProvider[] = results
-            .filter((result) => !result.subaccountCode)
-            .map((result) => result.provider)
-
-        if (failedProviders.length > 0) {
-            res.status(502).send({
-                message: `Payout setup failed for ${failedProviders.map((provider) => paymentProviderNames[provider]).join(" and ")}. Try again.`,
-                code: "PAYOUT_SETUP_INCOMPLETE",
-                accounts: accounts.map(toPayoutAccountResponse)
-            })
+        if (result.failedProviders.length > 0) {
+            sendIncompleteBankDetails(res, "Payout setup", result)
             return
         }
 
-        res.status(201).send({ accounts: accounts.map(toPayoutAccountResponse) })
+        res.status(201).send({ accounts: result.accounts })
+    } catch (error) {
+        if (!sendPayoutRequestError(error, res)) {
+            throw error
+        }
+    }
+}
+
+// Moves the seller's payouts to a different bank account on both providers. Changing where money
+// goes is what someone with a stolen session would try, so the current password is required.
+export const changePayoutBankAccount = async (req: Request, res: Response) => {
+    try {
+        const bank = parseBank(req.body.bankId)
+        const accountNumber = parseAccountNumber(req.body.accountNumber)
+
+        if (typeof req.body.password !== "string" || !req.body.password) {
+            throw new PayoutRequestError(400, "Enter your current password to change your bank account")
+        }
+
+        const profile = await prisma.sellerProfile.findUnique({
+            where: { userId: req.user!.id },
+            include: {
+                user: { select: { email: true, passwordHash: true } },
+                payoutAccounts: { select: { id: true } }
+            }
+        })
+
+        if (!profile) {
+            res.status(404).send({ message: "Store profile not found" })
+            return
+        }
+
+        // 403 rather than 401: the session is valid, and the frontend signs the user out on 401.
+        if (!await bcrypt.compare(req.body.password, profile.user.passwordHash)) {
+            throw new PayoutRequestError(403, "Password is incorrect", "PAYOUT_PASSWORD_INCORRECT")
+        }
+
+        if (profile.payoutAccounts.length === 0 || !profile.businessPhone) {
+            throw new PayoutRequestError(409, "Set up your payout accounts first", "PAYOUT_ACCOUNTS_NOT_SET_UP")
+        }
+
+        const accountName = await resolveAccountName(bank, accountNumber)
+        const result = await applyBankDetails({
+            profile: { id: profile.id, businessName: profile.businessName, email: profile.user.email },
+            bank,
+            accountNumber,
+            accountName,
+            businessPhone: profile.businessPhone,
+            selectProviders(existingAccounts) {
+                const providers = paymentProviders.filter((provider) => {
+                    const account = existingAccounts.find((existing) => existing.provider === provider)
+                    return !(account?.status === "ACTIVE" && matchesBankDetails(account, bank, accountNumber, accountName))
+                })
+
+                if (providers.length === 0) {
+                    throw new PayoutRequestError(409, "This is already your payout bank account", "PAYOUT_ACCOUNT_UNCHANGED")
+                }
+
+                return providers
+            }
+        })
+
+        if (result.failedProviders.length > 0) {
+            sendIncompleteBankDetails(res, "Changing your bank account", result)
+            return
+        }
+
+        res.send({ accounts: result.accounts })
     } catch (error) {
         if (!sendPayoutRequestError(error, res)) {
             throw error

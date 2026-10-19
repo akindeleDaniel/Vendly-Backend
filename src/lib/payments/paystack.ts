@@ -3,7 +3,7 @@ import type { PaymentProviderAdapter } from "./types.js"
 
 const baseUrl = "https://api.paystack.co"
 
-function paystackRequest(path: string, options: { method?: "GET" | "POST"; body?: unknown } = {}) {
+function paystackRequest(path: string, options: { method?: "GET" | "POST" | "PUT"; body?: unknown } = {}) {
     return sendProviderRequest({
         providerName: "Paystack",
         secretKeyVariable: "PAYSTACK_SECRET_KEY",
@@ -36,6 +36,19 @@ export const paystackAdapter: PaymentProviderAdapter = {
                 primary_contact_phone: input.businessPhone
             }
         })
-        return { subaccountCode: readDataString(body, "subaccount_code") }
+        return { subaccountCode: readDataString(body, "subaccount_code"), providerAccountId: null }
+    },
+
+    async updateSubaccount({ subaccountCode }, input) {
+        await paystackRequest(`/subaccount/${encodeURIComponent(subaccountCode)}`, {
+            method: "PUT",
+            body: {
+                business_name: input.businessName,
+                settlement_bank: input.bankCode,
+                account_number: input.accountNumber,
+                primary_contact_email: input.businessEmail,
+                primary_contact_phone: input.businessPhone
+            }
+        })
     }
 }

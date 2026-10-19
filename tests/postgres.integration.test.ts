@@ -18,6 +18,7 @@ import {
     PaymentProviderError,
     type CreateSubaccountInput,
     type PaymentProviderAdapter,
+    type ProviderSubaccount,
     type ResolveAccountInput
 } from "../src/lib/payments/types.js"
 import bcrypt from "bcrypt"
@@ -3257,13 +3258,23 @@ test("sets and clears the login cookie with the configured attributes", async ()
 
 type FakeProviderBehavior = {
     resolve?: (input: ResolveAccountInput) => Promise<{ accountName: string }>
-    create?: (input: CreateSubaccountInput) => Promise<{ subaccountCode: string }>
+    create?: (input: CreateSubaccountInput) => Promise<ProviderSubaccount>
+    update?: (subaccount: ProviderSubaccount, input: CreateSubaccountInput) => Promise<void>
+}
+
+// Flutterwave also returns a numeric ID, which it needs for updates.
+function fakeSubaccount(provider: PaymentProvider): ProviderSubaccount {
+    return {
+        subaccountCode: `${provider}-SUB-${randomUUID()}`,
+        providerAccountId: provider === "FLUTTERWAVE" ? String(Math.floor(Math.random() * 1_000_000)) : null
+    }
 }
 
 function installFakePaymentProviders() {
     const calls = {
         resolve: [] as Array<{ provider: PaymentProvider; input: ResolveAccountInput }>,
-        create: [] as Array<{ provider: PaymentProvider; input: CreateSubaccountInput }>
+        create: [] as Array<{ provider: PaymentProvider; input: CreateSubaccountInput }>,
+        update: [] as Array<{ provider: PaymentProvider; subaccount: ProviderSubaccount; input: CreateSubaccountInput }>
     }
     const behaviors: Record<PaymentProvider, FakeProviderBehavior> = { PAYSTACK: {}, FLUTTERWAVE: {} }
     const fakeAdapter = (provider: PaymentProvider): PaymentProviderAdapter => ({
@@ -3274,7 +3285,11 @@ function installFakePaymentProviders() {
         },
         async createSubaccount(input) {
             calls.create.push({ provider, input })
-            return behaviors[provider].create?.(input) ?? { subaccountCode: `${provider}-SUB-${randomUUID()}` }
+            return behaviors[provider].create?.(input) ?? fakeSubaccount(provider)
+        },
+        async updateSubaccount(subaccount, input) {
+            calls.update.push({ provider, subaccount, input })
+            await behaviors[provider].update?.(subaccount, input)
         }
     })
     setPaymentProvidersForTesting({ PAYSTACK: fakeAdapter("PAYSTACK"), FLUTTERWAVE: fakeAdapter("FLUTTERWAVE") })
@@ -3284,8 +3299,10 @@ function installFakePaymentProviders() {
 type PayoutTestContext = {
     sellerProfileId: number
     fakes: ReturnType<typeof installFakePaymentProviders>
-    request(method: "GET" | "POST", path: string, body?: unknown): Promise<{ status: number; body: any; text: string }>
+    request(method: "GET" | "POST" | "PUT", path: string, body?: unknown): Promise<{ status: number; body: any; text: string }>
 }
+
+const payoutTestPassword = "payout-test-password"
 
 const validPayoutRequest = {
     bankId: "opay",
@@ -3309,7 +3326,7 @@ async function withPayoutSeller(
         data: {
             name: `${name} user`,
             email: `${name}-${suffix}@example.test`,
-            passwordHash: "integration-test-not-a-password",
+            passwordHash: await bcrypt.hash(payoutTestPassword, 4),
             role,
             ...(withProfile
                 ? {
@@ -3441,6 +3458,8 @@ test("creates payout accounts on both providers and stores only the last four ac
         const accounts = await prisma.sellerPayoutAccount.findMany({ where: { sellerProfileId } })
         assert.equal(accounts.length, 2)
         assert.ok(accounts.every((account) => account.status === "ACTIVE" && account.subaccountCode?.startsWith(`${account.provider}-SUB-`)))
+        assert.equal(accounts.find((account) => account.provider === "PAYSTACK")?.providerAccountId, null)
+        assert.match(accounts.find((account) => account.provider === "FLUTTERWAVE")?.providerAccountId ?? "", /^\d+$/)
         assert.doesNotMatch(JSON.stringify(accounts), /0123456789/)
 
         const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { id: sellerProfileId } })
@@ -3593,7 +3612,7 @@ test("lets only one of two concurrent payout setups call the providers", async (
         for (const provider of ["PAYSTACK", "FLUTTERWAVE"] as const) {
             fakes.behaviors[provider].create = async () => {
                 await new Promise((resolve) => setTimeout(resolve, 300))
-                return { subaccountCode: `${provider}-SUB-${randomUUID()}` }
+                return fakeSubaccount(provider)
             }
         }
 
@@ -3605,5 +3624,116 @@ test("lets only one of two concurrent payout setups call the providers", async (
         assert.deepEqual(responses.map(({ status }) => status).sort(), [201, 409])
         assert.equal(responses.find(({ status }) => status === 409)?.body.code, "PAYOUT_SETUP_IN_PROGRESS")
         assert.equal(fakes.calls.create.length, 2)
+    })
+})
+
+async function setUpPayoutAccounts(context: PayoutTestContext) {
+    const created = await context.request("POST", "/seller/payout/accounts", validPayoutRequest)
+    assert.equal(created.status, 201)
+    context.fakes.calls.create.length = 0
+    return prisma.sellerPayoutAccount.findMany({
+        where: { sellerProfileId: context.sellerProfileId },
+        orderBy: { provider: "asc" }
+    })
+}
+
+const changeBankRequest = { bankId: "access-bank", accountNumber: "9876543210", password: payoutTestPassword }
+
+test("changes the payout bank account on both providers without creating new subaccounts", async () => {
+    await withPayoutSeller("payout-change", async (context) => {
+        const { request, fakes, sellerProfileId } = context
+        const before = await setUpPayoutAccounts(context)
+        fakes.behaviors.PAYSTACK.resolve = async () => ({ accountName: "ADA OKAFOR-BELLO" })
+
+        const changed = await request("PUT", "/seller/payout/accounts", changeBankRequest)
+        assert.equal(changed.status, 200)
+        assert.deepEqual(
+            changed.body.accounts.map((account: { provider: string; status: string; bankName: string; accountName: string; accountNumberLast4: string }) =>
+                [account.provider, account.status, account.bankName, account.accountName, account.accountNumberLast4]),
+            [
+                ["PAYSTACK", "ACTIVE", "Access Bank", "ADA OKAFOR-BELLO", "3210"],
+                ["FLUTTERWAVE", "ACTIVE", "Access Bank", "ADA OKAFOR-BELLO", "3210"]
+            ]
+        )
+        assert.doesNotMatch(changed.text, /9876543210/)
+        assert.equal(fakes.calls.create.length, 0)
+        assert.deepEqual(
+            fakes.calls.update.map(({ provider, subaccount, input }) =>
+                [provider, subaccount.subaccountCode, subaccount.providerAccountId, input.bankCode, input.accountNumber]).sort(),
+            before.map((account) => [account.provider, account.subaccountCode, account.providerAccountId, "044", "9876543210"]).sort()
+        )
+
+        const after = await prisma.sellerPayoutAccount.findMany({ where: { sellerProfileId }, orderBy: { provider: "asc" } })
+        assert.deepEqual(after.map((account) => account.subaccountCode), before.map((account) => account.subaccountCode))
+        assert.doesNotMatch(JSON.stringify(after), /9876543210/)
+
+        const unchanged = await request("PUT", "/seller/payout/accounts", changeBankRequest)
+        assert.equal(unchanged.status, 409)
+        assert.equal(unchanged.body.code, "PAYOUT_ACCOUNT_UNCHANGED")
+        assert.equal(fakes.calls.update.length, 2)
+    })
+})
+
+test("requires the current password and completed setup to change the payout bank account", async () => {
+    await withPayoutSeller("payout-change-guard", async (context) => {
+        const { request, fakes } = context
+
+        const notSetUp = await request("PUT", "/seller/payout/accounts", changeBankRequest)
+        assert.equal(notSetUp.status, 409)
+        assert.equal(notSetUp.body.code, "PAYOUT_ACCOUNTS_NOT_SET_UP")
+
+        await setUpPayoutAccounts(context)
+
+        const missingPassword = await request("PUT", "/seller/payout/accounts", { ...changeBankRequest, password: undefined })
+        assert.equal(missingPassword.status, 400)
+        assert.equal(missingPassword.body.message, "Enter your current password to change your bank account")
+
+        const wrongPassword = await request("PUT", "/seller/payout/accounts", { ...changeBankRequest, password: "not-the-password" })
+        assert.equal(wrongPassword.status, 403)
+        assert.deepEqual(wrongPassword.body, { message: "Password is incorrect", code: "PAYOUT_PASSWORD_INCORRECT" })
+
+        const invalidAccount = await request("PUT", "/seller/payout/accounts", { ...changeBankRequest, accountNumber: "98765" })
+        assert.equal(invalidAccount.status, 400)
+
+        assert.equal(fakes.calls.update.length, 0)
+        assert.equal(fakes.calls.create.length, 0)
+    })
+})
+
+test("keeps a failed bank change unusable and retries only the failed provider", async (t) => {
+    const consoleError = t.mock.method(console, "error", () => {})
+
+    await withPayoutSeller("payout-change-partial", async (context) => {
+        const { request, fakes, sellerProfileId } = context
+        const before = await setUpPayoutAccounts(context)
+        fakes.behaviors.FLUTTERWAVE.update = async () => {
+            throw new PaymentProviderError("unavailable", "Flutterwave could not be reached", "HTTP 503: account 9876543210")
+        }
+
+        const partial = await request("PUT", "/seller/payout/accounts", changeBankRequest)
+        assert.equal(partial.status, 502)
+        assert.equal(partial.body.code, "PAYOUT_SETUP_INCOMPLETE")
+        assert.equal(partial.body.message, "Changing your bank account failed for Flutterwave. Try again.")
+        assert.deepEqual(
+            partial.body.accounts.map((account: { provider: string; status: string; accountNumberLast4: string }) =>
+                [account.provider, account.status, account.accountNumberLast4]),
+            [["PAYSTACK", "ACTIVE", "3210"], ["FLUTTERWAVE", "FAILED", "3210"]]
+        )
+        assert.doesNotMatch(JSON.stringify(consoleError.mock.calls.map((call) => call.arguments)), /9876543210/)
+
+        // The failed account keeps its subaccount code so the retry updates the same subaccount.
+        const flutterwaveAccount = await prisma.sellerPayoutAccount.findUniqueOrThrow({
+            where: { sellerProfileId_provider: { sellerProfileId, provider: "FLUTTERWAVE" } }
+        })
+        assert.equal(flutterwaveAccount.subaccountCode, before.find((account) => account.provider === "FLUTTERWAVE")?.subaccountCode)
+
+        delete fakes.behaviors.FLUTTERWAVE.update
+        fakes.calls.update.length = 0
+
+        const retried = await request("PUT", "/seller/payout/accounts", changeBankRequest)
+        assert.equal(retried.status, 200)
+        assert.deepEqual(fakes.calls.update.map(({ provider }) => provider), ["FLUTTERWAVE"])
+        assert.equal(fakes.calls.create.length, 0)
+        assert.deepEqual(retried.body.accounts.map((account: { status: string }) => account.status), ["ACTIVE", "ACTIVE"])
     })
 })
