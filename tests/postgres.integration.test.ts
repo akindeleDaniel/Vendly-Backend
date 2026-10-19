@@ -11,12 +11,14 @@ import checkoutRoutes from "../src/routes/checkoutRoutes.js"
 import cartRoutes from "../src/routes/cartRoutes.js"
 import listingRoutes from "../src/routes/listingRoutes.js"
 import app from "../src/app.js"
-import { assertRequiredEnvironment, loadConfig } from "../src/config.js"
+import config, { assertRequiredEnvironment, loadConfig } from "../src/config.js"
 import { payoutFeeTerms } from "../src/controllers/payoutController.js"
 import { setPaymentProvidersForTesting } from "../src/lib/payments/providers.js"
 import {
     PaymentProviderError,
     type CreateSubaccountInput,
+    type InitializePaymentInput,
+    type PaymentVerification,
     type PaymentProviderAdapter,
     type ProviderSubaccount,
     type ResolveAccountInput
@@ -2035,6 +2037,7 @@ test("rejects checkout replacement after payment activity", async () => {
         const paymentAttempt = await prisma.paymentAttempt.create({
             data: {
                 checkoutId,
+                reference: `TEST-${randomUUID()}`,
                 provider: "PAYSTACK",
                 providerRef,
                 amount: new Prisma.Decimal("1500.00"),
@@ -2259,6 +2262,7 @@ test("expires an overdue checkout but protects its reservation while payment is 
         await prisma.paymentAttempt.create({
             data: {
                 checkoutId,
+                reference: `TEST-${randomUUID()}`,
                 provider: "PAYSTACK",
                 providerRef: `checkout-unresolved-${randomUUID()}`,
                 amount: new Prisma.Decimal("3000.00"),
@@ -2311,6 +2315,7 @@ test("protected expired-payment reservations remain unavailable across inventory
             data: [
                 {
                     checkoutId,
+                    reference: `TEST-${randomUUID()}`,
                     provider: "PAYSTACK",
                     providerRef: `checkout-protected-failed-${randomUUID()}`,
                     amount: new Prisma.Decimal("3000.00"),
@@ -2318,6 +2323,7 @@ test("protected expired-payment reservations remain unavailable across inventory
                 },
                 {
                     checkoutId,
+                    reference: `TEST-${randomUUID()}`,
                     provider: "FLUTTERWAVE",
                     providerRef: `checkout-protected-pending-${randomUUID()}`,
                     amount: new Prisma.Decimal("3000.00"),
@@ -2514,6 +2520,7 @@ test("locks delivery changes while an existing checkout has payment activity", a
         await prisma.paymentAttempt.create({
             data: {
                 checkoutId,
+                reference: `TEST-${randomUUID()}`,
                 provider: "PAYSTACK",
                 providerRef: `checkout-delivery-locked-${randomUUID()}`,
                 amount: new Prisma.Decimal("3000.00"),
@@ -2673,6 +2680,7 @@ test("locks replacement when an existing checkout has only failed payment attemp
         await prisma.paymentAttempt.create({
             data: {
                 checkoutId,
+                reference: `TEST-${randomUUID()}`,
                 provider: "PAYSTACK",
                 providerRef: `checkout-failed-payment-lock-${randomUUID()}`,
                 amount: new Prisma.Decimal("3000.00"),
@@ -2953,6 +2961,7 @@ async function expireCheckoutWithPaymentAttempts(
         await prisma.paymentAttempt.create({
             data: {
                 checkoutId,
+                reference: `TEST-${randomUUID()}`,
                 provider: "PAYSTACK",
                 providerRef: `checkout-expired-attempt-${randomUUID()}`,
                 amount: new Prisma.Decimal("3000.00"),
@@ -3260,6 +3269,8 @@ type FakeProviderBehavior = {
     resolve?: (input: ResolveAccountInput) => Promise<{ accountName: string }>
     create?: (input: CreateSubaccountInput) => Promise<ProviderSubaccount>
     update?: (subaccount: ProviderSubaccount, input: CreateSubaccountInput) => Promise<void>
+    initialize?: (input: InitializePaymentInput) => Promise<{ authorizationUrl: string }>
+    verify?: (reference: string) => Promise<PaymentVerification>
 }
 
 // Flutterwave also returns a numeric ID, which it needs for updates.
@@ -3274,11 +3285,21 @@ function installFakePaymentProviders() {
     const calls = {
         resolve: [] as Array<{ provider: PaymentProvider; input: ResolveAccountInput }>,
         create: [] as Array<{ provider: PaymentProvider; input: CreateSubaccountInput }>,
-        update: [] as Array<{ provider: PaymentProvider; subaccount: ProviderSubaccount; input: CreateSubaccountInput }>
+        update: [] as Array<{ provider: PaymentProvider; subaccount: ProviderSubaccount; input: CreateSubaccountInput }>,
+        initialize: [] as Array<{ provider: PaymentProvider; input: InitializePaymentInput }>,
+        verify: [] as Array<{ provider: PaymentProvider; reference: string }>
     }
     const behaviors: Record<PaymentProvider, FakeProviderBehavior> = { PAYSTACK: {}, FLUTTERWAVE: {} }
     const fakeAdapter = (provider: PaymentProvider): PaymentProviderAdapter => ({
         provider,
+        async initializePayment(input) {
+            calls.initialize.push({ provider, input })
+            return behaviors[provider].initialize?.(input) ?? { authorizationUrl: `https://checkout.example.test/${input.reference}` }
+        },
+        async verifyPayment(reference) {
+            calls.verify.push({ provider, reference })
+            return behaviors[provider].verify?.(reference) ?? { outcome: "not_found" }
+        },
         async resolveAccount(input) {
             calls.resolve.push({ provider, input })
             return behaviors[provider].resolve?.(input) ?? { accountName: "ADA OKAFOR" }
@@ -3735,5 +3756,311 @@ test("keeps a failed bank change unusable and retries only the failed provider",
         assert.deepEqual(fakes.calls.update.map(({ provider }) => provider), ["FLUTTERWAVE"])
         assert.equal(fakes.calls.create.length, 0)
         assert.deepEqual(retried.body.accounts.map((account: { status: string }) => account.status), ["ACTIVE", "ACTIVE"])
+    })
+})
+
+type PaymentTestContext = {
+    fixture: CheckoutLifecycleFixture
+    checkoutId: number
+    fakes: ReturnType<typeof installFakePaymentProviders>
+    request(method: "GET" | "POST", path: string, body?: unknown, token?: string): Promise<{ status: number; body: any }>
+    startPayment(token?: string): Promise<{ status: number; body: any }>
+}
+
+// A consumer checkout of 2 × ₦1,500 (₦3,000, free shipping) from one seller who has an active
+// Paystack payout account unless withPayoutAccount is false.
+async function withPaymentCheckout(
+    name: string,
+    run: (context: PaymentTestContext) => Promise<void>,
+    options: { withPayoutAccount?: boolean } = {}
+) {
+    const fixture = await createCheckoutLifecycleFixture(name, 5, 2)
+    const fakes = installFakePaymentProviders()
+
+    try {
+        if (options.withPayoutAccount !== false) {
+            const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+            await prisma.sellerPayoutAccount.create({
+                data: {
+                    sellerProfileId: profile.id,
+                    provider: "PAYSTACK",
+                    status: "ACTIVE",
+                    subaccountCode: `ACCT_test_${name}`,
+                    bankId: "opay",
+                    bankName: "OPay",
+                    accountName: "TEST SELLER",
+                    accountNumberLast4: "6789"
+                }
+            })
+        }
+
+        const checkoutId = await fixture.createCheckout()
+
+        await withAppServer(async (baseUrl) => {
+            const request: PaymentTestContext["request"] = async (method, path, body, token = fixture.token) => {
+                const response = await fetch(`${baseUrl}${path}`, {
+                    method,
+                    headers: {
+                        cookie: `token=${token}`,
+                        ...(body !== undefined ? { "content-type": "application/json" } : {})
+                    },
+                    body: body !== undefined ? JSON.stringify(body) : null
+                })
+                const text = await response.text()
+                return { status: response.status, body: text ? JSON.parse(text) : null }
+            }
+
+            await run({
+                fixture,
+                checkoutId,
+                fakes,
+                request,
+                startPayment: (token) => request("POST", `/checkout/${checkoutId}/payments`, { provider: "PAYSTACK" }, token)
+            })
+        })
+    } finally {
+        setPaymentProvidersForTesting(null)
+        await prisma.sellerPayoutAccount.deleteMany({ where: { sellerProfile: { userId: fixture.sellerId } } })
+        await fixture.cleanup()
+    }
+}
+
+function paystackVerification(
+    outcome: "success" | "failed" | "pending",
+    reference: string,
+    overrides: Partial<{ amountKobo: number; currency: string; providerStatus: string }> = {}
+): PaymentVerification {
+    return {
+        outcome,
+        providerStatus: overrides.providerStatus ?? outcome,
+        reference,
+        amountKobo: overrides.amountKobo ?? 300000,
+        currency: overrides.currency ?? "NGN",
+        transactionId: "5550001"
+    }
+}
+
+test("starts a Paystack payment with each seller's share and extends the checkout hold", async () => {
+    await withPaymentCheckout("payment-start", async ({ checkoutId, fakes, startPayment }) => {
+        const startedAt = Date.now()
+        const started = await startPayment()
+        assert.equal(started.status, 201)
+        assert.equal(started.body.code, "PAYMENT_STARTED")
+        const payment = started.body.payment
+        assert.match(payment.reference, new RegExp(`^VND-${checkoutId}-[0-9a-f]{12}$`))
+        assert.equal(payment.provider, "PAYSTACK")
+        assert.equal(payment.status, "PENDING")
+        assert.equal(payment.amount, "3000.00")
+        assert.equal(payment.authorizationUrl, `https://checkout.example.test/${payment.reference}`)
+
+        assert.equal(fakes.calls.initialize.length, 1)
+        const initialization = fakes.calls.initialize[0]!.input
+        assert.equal(initialization.reference, payment.reference)
+        assert.equal(initialization.amountKobo, 300000)
+        assert.deepEqual(initialization.splits, [{ subaccountCode: "ACCT_test_payment-start", amountKobo: 300000 }])
+        assert.match(initialization.email, /payment-start-consumer-.*@example\.test/)
+        assert.equal(initialization.callbackUrl, `${config.frontendUrl}/checkout/payment-return`)
+
+        const checkout = await prisma.checkout.findUniqueOrThrow({
+            where: { id: checkoutId },
+            include: { inventoryReservations: true, paymentAttempts: true }
+        })
+        assert.equal(checkout.status, "PAYMENT_PENDING")
+        assert.ok(checkout.expiresAt.getTime() >= startedAt + 29 * 60 * 1000)
+        assert.ok(checkout.inventoryReservations.every((reservation) =>
+            reservation.status === "ACTIVE" && reservation.expiresAt.getTime() === checkout.expiresAt.getTime()))
+        assert.equal(checkout.paymentAttempts.length, 1)
+        assert.equal(checkout.paymentAttempts[0]!.authorizationUrl, payment.authorizationUrl)
+
+        const repeated = await startPayment()
+        assert.equal(repeated.status, 200)
+        assert.equal(repeated.body.code, "PAYMENT_REUSED")
+        assert.equal(repeated.body.payment.reference, payment.reference)
+        assert.equal(fakes.calls.initialize.length, 1)
+    })
+})
+
+test("refuses payment while a seller has no active payout account for the provider", async () => {
+    await withPaymentCheckout("payment-seller-not-ready", async ({ checkoutId, fakes, startPayment }) => {
+        const response = await startPayment()
+        assert.equal(response.status, 409)
+        assert.equal(response.body.code, "PAYMENT_SELLER_NOT_READY")
+        assert.deepEqual(response.body.sellers, ["payment-seller-not-ready Shop"])
+        assert.equal(fakes.calls.initialize.length, 0)
+
+        const checkout = await prisma.checkout.findUniqueOrThrow({ where: { id: checkoutId }, include: { paymentAttempts: true } })
+        assert.equal(checkout.status, "PENDING")
+        assert.equal(checkout.paymentAttempts.length, 0)
+    }, { withPayoutAccount: false })
+})
+
+test("refuses payment for other consumers' checkouts, unavailable providers and invalid input", async () => {
+    await withPaymentCheckout("payment-guards", async ({ fixture, checkoutId, fakes, request }) => {
+        const other = await fixture.addConsumer(1)
+        const otherConsumer = await request("POST", `/checkout/${checkoutId}/payments`, { provider: "PAYSTACK" }, other.token)
+        assert.equal(otherConsumer.status, 404)
+
+        const flutterwave = await request("POST", `/checkout/${checkoutId}/payments`, { provider: "FLUTTERWAVE" })
+        assert.equal(flutterwave.status, 400)
+        assert.equal(flutterwave.body.code, "PAYMENT_PROVIDER_NOT_AVAILABLE")
+
+        const unknownProvider = await request("POST", `/checkout/${checkoutId}/payments`, { provider: "CASH" })
+        assert.equal(unknownProvider.status, 400)
+
+        const badId = await request("POST", "/checkout/abc/payments", { provider: "PAYSTACK" })
+        assert.equal(badId.status, 400)
+
+        const sellerToken = await request("POST", `/checkout/${checkoutId}/payments`, { provider: "PAYSTACK" }, fixture.sellerToken)
+        assert.equal(sellerToken.status, 403)
+        assert.equal(fakes.calls.initialize.length, 0)
+    })
+})
+
+test("refuses payment on an expired checkout", async () => {
+    await withPaymentCheckout("payment-expired", async ({ checkoutId, fakes, startPayment }) => {
+        await prisma.checkout.update({ where: { id: checkoutId }, data: { expiresAt: new Date(Date.now() - 1000) } })
+
+        const response = await startPayment()
+        assert.equal(response.status, 409)
+        assert.equal(response.body.code, "CHECKOUT_EXPIRED")
+        assert.equal(fakes.calls.initialize.length, 0)
+    })
+})
+
+test("records a verified payment only when the reference, amount and currency match", async (t) => {
+    const consoleError = t.mock.method(console, "error", () => {})
+
+    await withPaymentCheckout("payment-verify", async ({ checkoutId, fakes, request, startPayment }) => {
+        const started = await startPayment()
+        const reference = started.body.payment.reference as string
+
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("success", reference, { amountKobo: 100 })
+        const mismatched = await request("GET", `/payments/${reference}`)
+        assert.equal(mismatched.status, 200)
+        assert.equal(mismatched.body.payment.status, "PENDING")
+        assert.equal(mismatched.body.payment.failureReason, "The payment details did not match and need review")
+        assert.equal(consoleError.mock.callCount(), 1)
+
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("success", reference, { currency: "USD" })
+        assert.equal((await request("GET", `/payments/${reference}`)).body.payment.status, "PENDING")
+
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("success", reference)
+        const verified = await request("GET", `/payments/${reference}`)
+        assert.equal(verified.body.payment.status, "SUCCESS")
+        assert.equal(verified.body.payment.failureReason, null)
+        assert.equal(verified.body.payment.authorizationUrl, null)
+
+        const attempt = await prisma.paymentAttempt.findUniqueOrThrow({ where: { reference } })
+        assert.equal(attempt.providerTransactionId, "5550001")
+        assert.equal(attempt.providerStatus, "success")
+        assert.ok(attempt.verifiedAt instanceof Date)
+
+        // Settlement (completing the checkout and orders) is a separate step.
+        assert.equal((await prisma.checkout.findUniqueOrThrow({ where: { id: checkoutId } })).status, "PAYMENT_PENDING")
+
+        fakes.calls.verify.length = 0
+        const again = await request("GET", `/payments/${reference}`)
+        assert.equal(again.body.payment.status, "SUCCESS")
+        assert.equal(fakes.calls.verify.length, 0)
+
+        const restart = await startPayment()
+        assert.equal(restart.status, 409)
+        assert.equal(restart.body.code, "PAYMENT_ALREADY_COMPLETED")
+    })
+})
+
+test("records a failed payment and lets the consumer retry with a new reference", async () => {
+    await withPaymentCheckout("payment-failed", async ({ fakes, request, startPayment }) => {
+        const first = await startPayment()
+        const firstReference = first.body.payment.reference as string
+
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("pending", firstReference, { providerStatus: "abandoned" })
+        const stillPending = await request("GET", `/payments/${firstReference}`)
+        assert.equal(stillPending.body.payment.status, "PENDING")
+        assert.equal((await prisma.paymentAttempt.findUniqueOrThrow({ where: { reference: firstReference } })).providerStatus, "abandoned")
+
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("failed", firstReference)
+        const failed = await request("GET", `/payments/${firstReference}`)
+        assert.equal(failed.body.payment.status, "FAILED")
+        assert.equal(failed.body.payment.failureReason, "The payment was not completed")
+
+        const retry = await startPayment()
+        assert.equal(retry.status, 201)
+        assert.notEqual(retry.body.payment.reference, firstReference)
+        assert.equal(fakes.calls.initialize.length, 2)
+    })
+})
+
+test("keeps a timed-out initialization pending and reconciles it before starting again", async (t) => {
+    t.mock.method(console, "error", () => {})
+
+    await withPaymentCheckout("payment-timeout", async ({ checkoutId, fakes, startPayment }) => {
+        fakes.behaviors.PAYSTACK.initialize = async () => {
+            throw new PaymentProviderError("unavailable", "Paystack could not be reached", "TimeoutError")
+        }
+
+        const timedOut = await startPayment()
+        assert.equal(timedOut.status, 502)
+        assert.equal(timedOut.body.code, "PAYMENT_PROVIDER_UNAVAILABLE")
+        const [attempt] = await prisma.paymentAttempt.findMany({ where: { checkoutId } })
+        assert.equal(attempt?.status, "PENDING")
+        assert.equal(attempt?.authorizationUrl, null)
+
+        const tooSoon = await startPayment()
+        assert.equal(tooSoon.status, 409)
+        assert.equal(tooSoon.body.code, "PAYMENT_INITIALIZING")
+
+        await prisma.$executeRaw`
+            UPDATE "PaymentAttempt" SET "createdAt" = (NOW() AT TIME ZONE 'UTC') - INTERVAL '2 minutes' WHERE id = ${attempt!.id}
+        `
+        delete fakes.behaviors.PAYSTACK.initialize
+        fakes.behaviors.PAYSTACK.verify = async () => ({ outcome: "not_found" })
+
+        const restarted = await startPayment()
+        assert.equal(restarted.status, 201)
+        assert.deepEqual(fakes.calls.verify.map(({ reference }) => reference), [attempt!.reference])
+
+        const closed = await prisma.paymentAttempt.findUniqueOrThrow({ where: { id: attempt!.id } })
+        assert.equal(closed.status, "FAILED")
+        assert.equal(closed.failureReason, "The payment was never started")
+    })
+})
+
+test("closes an attempt the provider rejected and reports it", async (t) => {
+    t.mock.method(console, "error", () => {})
+
+    await withPaymentCheckout("payment-rejected", async ({ checkoutId, fakes, startPayment }) => {
+        fakes.behaviors.PAYSTACK.initialize = async () => {
+            throw new PaymentProviderError("rejected", "Paystack rejected the request", "HTTP 400: Invalid split")
+        }
+
+        const rejected = await startPayment()
+        assert.equal(rejected.status, 502)
+        assert.equal(rejected.body.code, "PAYMENT_PROVIDER_REJECTED")
+        const [attempt] = await prisma.paymentAttempt.findMany({ where: { checkoutId } })
+        assert.equal(attempt?.status, "FAILED")
+        assert.equal(attempt?.failureReason, "Paystack rejected the payment request")
+    })
+})
+
+test("returns the saved payment status when the provider cannot be reached and hides other consumers' payments", async (t) => {
+    t.mock.method(console, "error", () => {})
+
+    await withPaymentCheckout("payment-status", async ({ fixture, fakes, request, startPayment }) => {
+        const started = await startPayment()
+        const reference = started.body.payment.reference as string
+        fakes.behaviors.PAYSTACK.verify = async () => {
+            throw new PaymentProviderError("unavailable", "Paystack could not be reached", "TimeoutError")
+        }
+
+        const status = await request("GET", `/payments/${reference}`)
+        assert.equal(status.status, 200)
+        assert.equal(status.body.payment.status, "PENDING")
+        assert.equal(status.body.payment.authorizationUrl, started.body.payment.authorizationUrl)
+
+        const other = await fixture.addConsumer(1)
+        const hidden = await request("GET", `/payments/${reference}`, undefined, other.token)
+        assert.equal(hidden.status, 404)
+        assert.equal((await request("GET", "/payments/VND-unknown")).status, 404)
     })
 })

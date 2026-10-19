@@ -269,10 +269,20 @@ model PaymentAttempt {
   id          Int             @id @default(autoincrement())
   checkoutId  Int
   provider    PaymentProvider
+  // Vendly's reference, created before the provider is called (Paystack reference, Flutterwave tx_ref).
+  reference   String          @unique
   providerRef String?
   amount      Decimal         @db.Decimal(12, 2)
   currency    String          @default("NGN")
   status      PaymentStatus   @default(PENDING)
+
+  providerTransactionId String?
+  authorizationUrl      String?
+  // The provider's own status word from the latest check, kept for support and reconciliation.
+  providerStatus        String?
+  failureReason         String?
+  lastCheckedAt         DateTime?
+  verifiedAt            DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

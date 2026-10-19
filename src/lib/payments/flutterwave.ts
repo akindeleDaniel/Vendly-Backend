@@ -24,8 +24,21 @@ function flutterwaveRequest(path: string, options: { method?: "GET" | "POST" | "
     })
 }
 
+// Flutterwave payments are built in Phase 8; until then only payout accounts are supported.
+function paymentsNotAvailable(): never {
+    throw new PaymentProviderError("unavailable", "Flutterwave payments are not available yet")
+}
+
 export const flutterwaveAdapter: PaymentProviderAdapter = {
     provider: "FLUTTERWAVE",
+
+    async initializePayment() {
+        return paymentsNotAvailable()
+    },
+
+    async verifyPayment() {
+        return paymentsNotAvailable()
+    },
 
     async resolveAccount({ bankCode, accountNumber }) {
         const body = await flutterwaveRequest("/accounts/resolve", {

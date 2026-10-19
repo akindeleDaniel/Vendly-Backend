@@ -13,10 +13,35 @@ export type CreateSubaccountInput = {
     accountNumber: string
 }
 
+// Amounts are whole kobo; each adapter converts to the unit its provider expects.
+export type InitializePaymentInput = {
+    reference: string
+    amountKobo: number
+    email: string
+    callbackUrl: string
+    // Each seller's share of the payment. The shares add up to amountKobo, so Vendly's share is zero.
+    splits: Array<{ subaccountCode: string; amountKobo: number }>
+}
+
+// "success" and "failed" are final. "pending" means the customer may still pay.
+// "not_found" means the provider has no transaction with this reference.
+export type PaymentVerification =
+    | { outcome: "not_found" }
+    | {
+        outcome: "success" | "failed" | "pending"
+        providerStatus: string
+        reference: string
+        amountKobo: number
+        currency: string
+        transactionId: string | null
+    }
+
 // The provider calls Vendly makes. Each provider implements this; tests use a fake.
-// Payment initialization, verification and webhooks join this interface in later phases.
+// Webhooks join this interface in a later phase.
 export interface PaymentProviderAdapter {
     readonly provider: PaymentProvider
+    initializePayment(input: InitializePaymentInput): Promise<{ authorizationUrl: string }>
+    verifyPayment(reference: string): Promise<PaymentVerification>
     resolveAccount(input: ResolveAccountInput): Promise<{ accountName: string }>
     createSubaccount(input: CreateSubaccountInput): Promise<ProviderSubaccount>
     // Points an existing subaccount at different bank details. The subaccount code stays the same.

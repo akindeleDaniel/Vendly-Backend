@@ -355,7 +355,7 @@ function deliveryMatchesCheckout(delivery: DeliveryInput, checkout: {
         delivery.instructions === checkout.deliveryInstructions
 }
 
-async function acquireCheckoutCreationLock(tx: Prisma.TransactionClient, userId: number): Promise<void> {
+export async function acquireCheckoutCreationLock(tx: Prisma.TransactionClient, userId: number): Promise<void> {
     await tx.$queryRaw`
         WITH lock_acquired AS MATERIALIZED (
             SELECT pg_advisory_xact_lock(1447380556, ${userId}::integer)
@@ -364,7 +364,7 @@ async function acquireCheckoutCreationLock(tx: Prisma.TransactionClient, userId:
     `
 }
 
-async function expireExpiredCheckouts(userId: number, now = new Date()): Promise<void> {
+export async function expireExpiredCheckouts(userId: number, now = new Date()): Promise<void> {
     await prisma.$transaction(async (tx) => {
         const expiredCheckouts = await tx.checkout.findMany({
             where: {

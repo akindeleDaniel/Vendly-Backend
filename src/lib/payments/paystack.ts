@@ -1,5 +1,5 @@
 import { readDataString, sendProviderRequest } from "./providerRequest.js"
-import type { PaymentProviderAdapter } from "./types.js"
+import { PaymentProviderError, type PaymentProviderAdapter } from "./types.js"
 
 const baseUrl = "https://api.paystack.co"
 
@@ -13,8 +13,69 @@ function paystackRequest(path: string, options: { method?: "GET" | "POST" | "PUT
     })
 }
 
+const successStatuses = new Set(["success"])
+const failedStatuses = new Set(["failed", "reversed"])
+
 export const paystackAdapter: PaymentProviderAdapter = {
     provider: "PAYSTACK",
+
+    async initializePayment(input) {
+        // A flat split with the sellers' shares adding up to the total leaves Vendly ₦0, and
+        // all-proportional makes each seller bear the fee on their own share (confirmed in test mode).
+        const body = await paystackRequest("/transaction/initialize", {
+            method: "POST",
+            body: {
+                email: input.email,
+                amount: input.amountKobo,
+                currency: "NGN",
+                reference: input.reference,
+                callback_url: input.callbackUrl,
+                split: {
+                    type: "flat",
+                    bearer_type: "all-proportional",
+                    subaccounts: input.splits.map((split) => ({
+                        subaccount: split.subaccountCode,
+                        share: split.amountKobo
+                    }))
+                }
+            }
+        })
+        return { authorizationUrl: readDataString(body, "authorization_url") }
+    },
+
+    async verifyPayment(reference) {
+        let body: Record<string, unknown>
+
+        try {
+            body = await paystackRequest(`/transaction/verify/${encodeURIComponent(reference)}`)
+        } catch (error) {
+            // Paystack answers an unknown reference with a 4xx "Transaction reference not found".
+            if (error instanceof PaymentProviderError && error.kind === "rejected") {
+                return { outcome: "not_found" }
+            }
+
+            throw error
+        }
+
+        const data = body.data as Record<string, unknown> | undefined
+        const providerStatus = String(data?.status ?? "")
+        const amountKobo = Number(data?.amount)
+
+        if (!data || !providerStatus || !Number.isSafeInteger(amountKobo)) {
+            throw new PaymentProviderError("unavailable", "Unexpected provider response", "Missing verification fields")
+        }
+
+        return {
+            outcome: successStatuses.has(providerStatus)
+                ? "success"
+                : failedStatuses.has(providerStatus) ? "failed" : "pending",
+            providerStatus,
+            reference: String(data.reference ?? ""),
+            amountKobo,
+            currency: String(data.currency ?? ""),
+            transactionId: data.id === undefined || data.id === null ? null : String(data.id)
+        }
+    },
 
     async resolveAccount({ bankCode, accountNumber }) {
         const query = new URLSearchParams({ account_number: accountNumber, bank_code: bankCode })
