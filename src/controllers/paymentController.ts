@@ -12,11 +12,11 @@ import { PaymentProviderError, type PaymentVerification } from "../lib/payments/
 const paymentWindowMs = 30 * 60 * 1000
 // An attempt without a payment link younger than this may still be waiting for the provider.
 const initializingGraceMs = 60 * 1000
-// A payment Paystack still reports as "abandoned" (the customer never tried to pay) this long after
-// its checkout expired is closed, releasing the stock. Paystack never marks such payments failed.
+// A payment the customer never tried to pay is closed this long after its checkout expired,
+// releasing the stock. Providers never mark these failed: Paystack keeps reporting "abandoned" and
+// Flutterwave keeps answering that no transaction exists.
 const abandonedAfterExpiryMs = 30 * 60 * 1000
-// Flutterwave payments arrive in Phase 8.
-const availablePaymentProviders: readonly PaymentProvider[] = ["PAYSTACK"]
+const availablePaymentProviders: readonly PaymentProvider[] = ["PAYSTACK", "FLUTTERWAVE"]
 
 export type PaymentErrorCode =
     | "PAYMENT_PROVIDER_NOT_AVAILABLE"
@@ -100,8 +100,21 @@ async function applyVerification(attempt: PaymentAttempt, verification: PaymentV
     const now = new Date()
     const stillPending = { id: attempt.id, status: "PENDING" as const }
 
+    const isPastAbandonDeadline = async () => {
+        const checkout = await prisma.checkout.findUniqueOrThrow({
+            where: { id: attempt.checkoutId },
+            select: { expiresAt: true }
+        })
+        return checkout.expiresAt.getTime() <= now.getTime() - abandonedAfterExpiryMs
+    }
+    const closedInTime = { status: "FAILED" as const, failureReason: "The payment was not completed in time" }
+
     if (verification.outcome === "not_found") {
-        await prisma.paymentAttempt.updateMany({ where: stillPending, data: { lastCheckedAt: now } })
+        const abandoned = attempt.authorizationUrl !== null && await isPastAbandonDeadline()
+        await prisma.paymentAttempt.updateMany({
+            where: stillPending,
+            data: abandoned ? { lastCheckedAt: now, ...closedInTime } : { lastCheckedAt: now }
+        })
         return
     }
 
@@ -112,18 +125,10 @@ async function applyVerification(attempt: PaymentAttempt, verification: PaymentV
     }
 
     if (verification.outcome === "pending") {
-        const checkout = await prisma.checkout.findUniqueOrThrow({
-            where: { id: attempt.checkoutId },
-            select: { expiresAt: true }
-        })
-        const abandonedTooLong = verification.providerStatus === "abandoned" &&
-            checkout.expiresAt.getTime() <= now.getTime() - abandonedAfterExpiryMs
-
+        const abandoned = verification.providerStatus === "abandoned" && await isPastAbandonDeadline()
         await prisma.paymentAttempt.updateMany({
             where: stillPending,
-            data: abandonedTooLong
-                ? { ...observed, status: "FAILED", failureReason: "The payment was not completed in time" }
-                : observed
+            data: abandoned ? { ...observed, ...closedInTime } : observed
         })
         return
     }

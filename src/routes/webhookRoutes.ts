@@ -7,5 +7,6 @@ const router = Router()
 // (whatever its content type) instead of the app-wide JSON parser.
 router.use(express.raw({ type: () => true, limit: "1mb" }))
 router.post("/paystack", handlePaymentWebhook("PAYSTACK"))
+router.post("/flutterwave", handlePaymentWebhook("FLUTTERWAVE"))
 
 export default router

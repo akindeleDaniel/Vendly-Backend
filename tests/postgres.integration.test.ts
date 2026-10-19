@@ -14,6 +14,7 @@ import app from "../src/app.js"
 import config, { assertRequiredEnvironment, loadConfig } from "../src/config.js"
 import { payoutFeeTerms } from "../src/controllers/payoutController.js"
 import { checkStuckPayments } from "../src/lib/payments/paymentChecker.js"
+import { flutterwaveAdapter } from "../src/lib/payments/flutterwave.js"
 import { paystackAdapter } from "../src/lib/payments/paystack.js"
 import { setPaymentProvidersForTesting } from "../src/lib/payments/providers.js"
 import {
@@ -3293,11 +3294,12 @@ function installFakePaymentProviders() {
         verify: [] as Array<{ provider: PaymentProvider; reference: string }>
     }
     const behaviors: Record<PaymentProvider, FakeProviderBehavior> = { PAYSTACK: {}, FLUTTERWAVE: {} }
-    // Webhook signatures and parsing use the real Paystack code, which needs no network.
+    // Webhook signatures and parsing use the real provider code, which needs no network.
+    const realAdapters = { PAYSTACK: paystackAdapter, FLUTTERWAVE: flutterwaveAdapter }
     const fakeAdapter = (provider: PaymentProvider): PaymentProviderAdapter => ({
         provider,
-        verifyWebhook: (rawBody, headers) => provider === "PAYSTACK" && paystackAdapter.verifyWebhook(rawBody, headers),
-        parseWebhook: (rawBody) => provider === "PAYSTACK" ? paystackAdapter.parseWebhook(rawBody) : null,
+        verifyWebhook: (rawBody, headers) => realAdapters[provider].verifyWebhook(rawBody, headers),
+        parseWebhook: (rawBody) => realAdapters[provider].parseWebhook(rawBody),
         async initializePayment(input) {
             calls.initialize.push({ provider, input })
             return behaviors[provider].initialize?.(input) ?? { authorizationUrl: `https://checkout.example.test/${input.reference}` }
@@ -3775,11 +3777,12 @@ type PaymentTestContext = {
 }
 
 // A consumer checkout of 2 × ₦1,500 (₦3,000, free shipping) from one seller who has an active
-// Paystack payout account unless withPayoutAccount is false.
+// payout account for each of payoutProviders (Paystack only by default), or none when
+// withPayoutAccount is false.
 async function withPaymentCheckout(
     name: string,
     run: (context: PaymentTestContext) => Promise<void>,
-    options: { withPayoutAccount?: boolean } = {}
+    options: { withPayoutAccount?: boolean; payoutProviders?: PaymentProvider[] } = {}
 ) {
     const fixture = await createCheckoutLifecycleFixture(name, 5, 2)
     const fakes = installFakePaymentProviders()
@@ -3787,18 +3790,22 @@ async function withPaymentCheckout(
     try {
         if (options.withPayoutAccount !== false) {
             const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
-            await prisma.sellerPayoutAccount.create({
-                data: {
-                    sellerProfileId: profile.id,
-                    provider: "PAYSTACK",
-                    status: "ACTIVE",
-                    subaccountCode: `ACCT_test_${name}`,
-                    bankId: "opay",
-                    bankName: "OPay",
-                    accountName: "TEST SELLER",
-                    accountNumberLast4: "6789"
-                }
-            })
+
+            for (const provider of options.payoutProviders ?? ["PAYSTACK"]) {
+                await prisma.sellerPayoutAccount.create({
+                    data: {
+                        sellerProfileId: profile.id,
+                        provider,
+                        status: "ACTIVE",
+                        subaccountCode: provider === "PAYSTACK" ? `ACCT_test_${name}` : `RS_test_${name}`,
+                        providerAccountId: provider === "FLUTTERWAVE" ? "1" : null,
+                        bankId: "opay",
+                        bankName: "OPay",
+                        accountName: "TEST SELLER",
+                        accountNumberLast4: "6789"
+                    }
+                })
+            }
         }
 
         const checkoutId = await fixture.createCheckout()
@@ -3908,9 +3915,10 @@ test("refuses payment for other consumers' checkouts, unavailable providers and 
         const otherConsumer = await request("POST", `/checkout/${checkoutId}/payments`, { provider: "PAYSTACK" }, other.token)
         assert.equal(otherConsumer.status, 404)
 
+        // This seller only has a Paystack payout account.
         const flutterwave = await request("POST", `/checkout/${checkoutId}/payments`, { provider: "FLUTTERWAVE" })
-        assert.equal(flutterwave.status, 400)
-        assert.equal(flutterwave.body.code, "PAYMENT_PROVIDER_NOT_AVAILABLE")
+        assert.equal(flutterwave.status, 409)
+        assert.equal(flutterwave.body.code, "PAYMENT_SELLER_NOT_READY")
 
         const unknownProvider = await request("POST", `/checkout/${checkoutId}/payments`, { provider: "CASH" })
         assert.equal(unknownProvider.status, 400)
@@ -4352,4 +4360,149 @@ test("opens one recovery case for a verified payment that cannot be settled", as
             1
         )
     })
+})
+
+const bothProviders: PaymentProvider[] = ["PAYSTACK", "FLUTTERWAVE"]
+
+function flutterwaveVerification(
+    outcome: "success" | "failed" | "pending",
+    reference: string,
+    providerStatus = outcome === "success" ? "successful" : outcome
+): PaymentVerification {
+    return { outcome, providerStatus, reference, amountKobo: 300000, currency: "NGN", transactionId: "8880001" }
+}
+
+async function postFlutterwaveWebhook(baseUrl: string, body: string, hash: string | null) {
+    const response = await fetch(`${baseUrl}/payments/webhooks/flutterwave`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...(hash !== null ? { "verif-hash": hash } : {}) },
+        body
+    })
+    return { status: response.status, body: await response.json() as { message?: string } }
+}
+
+function flutterwaveWebhookBody(reference: string, eventId: number, status = "successful") {
+    return JSON.stringify({ event: "charge.completed", data: { id: eventId, tx_ref: reference, status, amount: 3000, currency: "NGN" } })
+}
+
+test("starts a Flutterwave payment and refuses a second provider while one is pending", async () => {
+    await withPaymentCheckout("flutterwave-start", async ({ checkoutId, fakes, request }) => {
+        const started = await request("POST", `/checkout/${checkoutId}/payments`, { provider: "FLUTTERWAVE" })
+        assert.equal(started.status, 201)
+        assert.equal(started.body.payment.provider, "FLUTTERWAVE")
+        assert.deepEqual(fakes.calls.initialize.map(({ provider }) => provider), ["FLUTTERWAVE"])
+        assert.deepEqual(fakes.calls.initialize[0]!.input.splits, [{ subaccountCode: "RS_test_flutterwave-start", amountKobo: 300000 }])
+
+        const otherProvider = await request("POST", `/checkout/${checkoutId}/payments`, { provider: "PAYSTACK" })
+        assert.equal(otherProvider.status, 409)
+        assert.equal(otherProvider.body.code, "PAYMENT_IN_PROGRESS")
+        assert.equal(otherProvider.body.message, "A Flutterwave payment is already in progress for this checkout")
+    }, { payoutProviders: bothProviders })
+})
+
+test("settles a Flutterwave payment from a webhook with the right secret hash", async (t) => {
+    process.env.FLUTTERWAVE_WEBHOOK_SECRET ||= "integration-flutterwave-hash"
+    t.mock.method(console, "warn", () => {})
+
+    await withPaymentCheckout("flutterwave-webhook", async ({ fixture, checkoutId, fakes, baseUrl, request }) => {
+        const reference = (await request("POST", `/checkout/${checkoutId}/payments`, { provider: "FLUTTERWAVE" })).body.payment.reference as string
+        fakes.behaviors.FLUTTERWAVE.verify = async () => flutterwaveVerification("success", reference)
+        const body = flutterwaveWebhookBody(reference, 777001)
+
+        assert.equal((await postFlutterwaveWebhook(baseUrl, body, null)).status, 401)
+        assert.equal((await postFlutterwaveWebhook(baseUrl, body, "wrong-hash")).status, 401)
+        assert.equal(fakes.calls.verify.length, 0)
+
+        const delivered = await postFlutterwaveWebhook(baseUrl, body, process.env.FLUTTERWAVE_WEBHOOK_SECRET!)
+        assert.equal(delivered.status, 200)
+        assert.equal(delivered.body.message, "Event received")
+        assert.deepEqual(await loadSettlementState(fixture, checkoutId), { ...settledState, cartQuantity: 0 })
+    }, { payoutProviders: bothProviders })
+
+    await prisma.paymentEvent.deleteMany({ where: { provider: "FLUTTERWAVE", eventKey: "charge.completed:777001" } })
+})
+
+test("records a failed Flutterwave payment reported by webhook and lets the consumer retry", async () => {
+    process.env.FLUTTERWAVE_WEBHOOK_SECRET ||= "integration-flutterwave-hash"
+
+    await withPaymentCheckout("flutterwave-failed", async ({ fixture, checkoutId, fakes, baseUrl, request }) => {
+        const reference = (await request("POST", `/checkout/${checkoutId}/payments`, { provider: "FLUTTERWAVE" })).body.payment.reference as string
+        fakes.behaviors.FLUTTERWAVE.verify = async () => flutterwaveVerification("failed", reference)
+
+        const delivered = await postFlutterwaveWebhook(baseUrl, flutterwaveWebhookBody(reference, 777002, "failed"), process.env.FLUTTERWAVE_WEBHOOK_SECRET!)
+        assert.equal(delivered.status, 200)
+        assert.equal((await prisma.paymentAttempt.findUniqueOrThrow({ where: { reference } })).status, "FAILED")
+        assert.equal((await loadSettlementState(fixture, checkoutId)).checkoutStatus, "PAYMENT_PENDING")
+
+        const retry = await request("POST", `/checkout/${checkoutId}/payments`, { provider: "PAYSTACK" })
+        assert.equal(retry.status, 201)
+    }, { payoutProviders: bothProviders })
+
+    await prisma.paymentEvent.deleteMany({ where: { provider: "FLUTTERWAVE", eventKey: "charge.completed:777002" } })
+})
+
+test("closes a Flutterwave payment that was never paid 30 minutes after its checkout expired", async () => {
+    await withPaymentCheckout("flutterwave-unpaid", async ({ fixture, checkoutId, fakes, request }) => {
+        const reference = (await request("POST", `/checkout/${checkoutId}/payments`, { provider: "FLUTTERWAVE" })).body.payment.reference as string
+        fakes.behaviors.FLUTTERWAVE.verify = async () => ({ outcome: "not_found" })
+
+        assert.equal((await request("GET", `/payments/${reference}`)).body.payment.status, "PENDING")
+
+        await expireCheckoutAt(checkoutId, 31)
+        const closed = await request("GET", `/payments/${reference}`)
+        assert.equal(closed.body.payment.status, "FAILED")
+        assert.equal(closed.body.payment.failureReason, "The payment was not completed in time")
+        assert.deepEqual((await loadSettlementState(fixture, checkoutId)).reservationStatuses, ["EXPIRED"])
+    }, { payoutProviders: bothProviders })
+})
+
+test("the real adapters send each provider its own amount format and split", async (t) => {
+    process.env.PAYSTACK_SECRET_KEY ||= "sk_test_integration"
+    process.env.FLUTTERWAVE_SECRET_KEY ||= "FLWSECK_TEST-integration"
+    const requests: Array<{ url: string; body: any }> = []
+    let nextResponse: unknown = {}
+    t.mock.method(globalThis, "fetch", async (url: string, init?: RequestInit) => {
+        requests.push({ url: String(url), body: init?.body ? JSON.parse(String(init.body)) : null })
+        return new Response(JSON.stringify(nextResponse), { status: 200, headers: { "content-type": "application/json" } })
+    })
+    const initialization = {
+        reference: "VND-1-abc",
+        amountKobo: 3000000,
+        email: "buyer@example.test",
+        callbackUrl: "http://localhost:5173/checkout/payment-return",
+        splits: [{ subaccountCode: "SUB_A", amountKobo: 2000000 }, { subaccountCode: "SUB_B", amountKobo: 1000000 }]
+    }
+
+    nextResponse = { status: true, data: { authorization_url: "https://checkout.paystack.com/x" } }
+    await paystackAdapter.initializePayment(initialization)
+    assert.equal(requests[0]!.url, "https://api.paystack.co/transaction/initialize")
+    assert.equal(requests[0]!.body.amount, 3000000)
+    assert.deepEqual(requests[0]!.body.split, {
+        type: "flat",
+        bearer_type: "all-proportional",
+        subaccounts: [{ subaccount: "SUB_A", share: 2000000 }, { subaccount: "SUB_B", share: 1000000 }]
+    })
+
+    nextResponse = { status: "success", data: { link: "https://checkout.flutterwave.com/x" } }
+    const flutterwave = await flutterwaveAdapter.initializePayment(initialization)
+    assert.equal(flutterwave.authorizationUrl, "https://checkout.flutterwave.com/x")
+    assert.equal(requests[1]!.url, "https://api.flutterwave.com/v3/payments")
+    assert.equal(requests[1]!.body.amount, 30000)
+    assert.equal(requests[1]!.body.tx_ref, "VND-1-abc")
+    assert.equal(requests[1]!.body.redirect_url, initialization.callbackUrl)
+    assert.deepEqual(requests[1]!.body.subaccounts, [
+        { id: "SUB_A", transaction_split_ratio: 2, transaction_charge_type: "flat", transaction_charge: 0 },
+        { id: "SUB_B", transaction_split_ratio: 1, transaction_charge_type: "flat", transaction_charge: 0 }
+    ])
+
+    nextResponse = { status: "success", data: { id: 42, tx_ref: "VND-1-abc", status: "successful", amount: 30000.5, currency: "NGN" } }
+    assert.deepEqual(await flutterwaveAdapter.verifyPayment("VND-1-abc"), {
+        outcome: "success",
+        providerStatus: "successful",
+        reference: "VND-1-abc",
+        amountKobo: 3000050,
+        currency: "NGN",
+        transactionId: "42"
+    })
+    assert.equal(requests[2]!.url, "https://api.flutterwave.com/v3/transactions/verify_by_reference?tx_ref=VND-1-abc")
 })
