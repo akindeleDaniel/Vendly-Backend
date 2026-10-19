@@ -21,7 +21,7 @@ export async function settleCheckoutPayment(attemptId: number): Promise<Settleme
             return await settleOnce(attemptId)
         } catch (error) {
             if (error instanceof SettlementNeedsReview) {
-                console.error("Payment settlement needs review", { attemptId, reason: error.message })
+                await openRecoveryCase(attemptId, error.message)
                 return "needs_review"
             }
 
@@ -30,6 +30,18 @@ export async function settleCheckoutPayment(attemptId: number): Promise<Settleme
             if (!serializationFailure || attempt >= maximumSerializationRetries) {
                 throw error
             }
+        }
+    }
+}
+
+// Records the payment for manual recovery once; later calls for the same payment do nothing.
+async function openRecoveryCase(attemptId: number, reason: string): Promise<void> {
+    try {
+        await prisma.paymentRecoveryCase.create({ data: { paymentAttemptId: attemptId, reason } })
+        console.error("Payment settlement needs review", { attemptId, reason })
+    } catch (error) {
+        if (!(error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002")) {
+            throw error
         }
     }
 }

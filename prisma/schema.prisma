@@ -287,10 +287,30 @@ model PaymentAttempt {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  checkout Checkout @relation(fields: [checkoutId], references: [id])
+  checkout     Checkout             @relation(fields: [checkoutId], references: [id])
+  recoveryCase PaymentRecoveryCase?
 
   @@unique([provider, providerRef])
   @@index([checkoutId])
+}
+
+enum PaymentRecoveryStatus {
+  OPEN
+  RESOLVED
+}
+
+// A verified payment Vendly could not complete automatically, for example one that arrived after
+// the checkout's stock was released. Each needs a person to fulfil or refund it.
+model PaymentRecoveryCase {
+  id               Int                   @id @default(autoincrement())
+  paymentAttemptId Int                   @unique
+  reason           String
+  status           PaymentRecoveryStatus @default(OPEN)
+  resolutionNote   String?
+  createdAt        DateTime              @default(now())
+  resolvedAt       DateTime?
+
+  paymentAttempt PaymentAttempt @relation(fields: [paymentAttemptId], references: [id])
 }
 
 // One row per provider webhook event, so redelivered events are recognised and not processed

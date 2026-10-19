@@ -12,6 +12,9 @@ import { PaymentProviderError, type PaymentVerification } from "../lib/payments/
 const paymentWindowMs = 30 * 60 * 1000
 // An attempt without a payment link younger than this may still be waiting for the provider.
 const initializingGraceMs = 60 * 1000
+// A payment Paystack still reports as "abandoned" (the customer never tried to pay) this long after
+// its checkout expired is closed, releasing the stock. Paystack never marks such payments failed.
+const abandonedAfterExpiryMs = 30 * 60 * 1000
 // Flutterwave payments arrive in Phase 8.
 const availablePaymentProviders: readonly PaymentProvider[] = ["PAYSTACK"]
 
@@ -109,7 +112,19 @@ async function applyVerification(attempt: PaymentAttempt, verification: PaymentV
     }
 
     if (verification.outcome === "pending") {
-        await prisma.paymentAttempt.updateMany({ where: stillPending, data: observed })
+        const checkout = await prisma.checkout.findUniqueOrThrow({
+            where: { id: attempt.checkoutId },
+            select: { expiresAt: true }
+        })
+        const abandonedTooLong = verification.providerStatus === "abandoned" &&
+            checkout.expiresAt.getTime() <= now.getTime() - abandonedAfterExpiryMs
+
+        await prisma.paymentAttempt.updateMany({
+            where: stillPending,
+            data: abandonedTooLong
+                ? { ...observed, status: "FAILED", failureReason: "The payment was not completed in time" }
+                : observed
+        })
         return
     }
 
@@ -202,11 +217,24 @@ export async function syncPayment(attempt: PaymentAttempt): Promise<void> {
 
     const current = await prisma.paymentAttempt.findUniqueOrThrow({
         where: { id: attempt.id },
-        select: { id: true, status: true, checkout: { select: { status: true } } }
+        select: { id: true, status: true, checkout: { select: { status: true, userId: true } } }
     })
 
     if (current.status === "SUCCESS" && current.checkout.status !== "COMPLETED") {
         await settleCheckoutPayment(current.id)
+    }
+
+    // A payment that failed after its checkout expired no longer protects the checkout's stock.
+    // The expired checkout is not reopened.
+    // A conflicting write means another request is already expiring it; the next request retries.
+    if (current.status === "FAILED" && attempt.status === "PENDING") {
+        try {
+            await expireExpiredCheckouts(current.checkout.userId)
+        } catch (error) {
+            if (!(error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2034")) {
+                throw error
+            }
+        }
     }
 }
 

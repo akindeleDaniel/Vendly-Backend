@@ -13,6 +13,7 @@ import listingRoutes from "../src/routes/listingRoutes.js"
 import app from "../src/app.js"
 import config, { assertRequiredEnvironment, loadConfig } from "../src/config.js"
 import { payoutFeeTerms } from "../src/controllers/payoutController.js"
+import { checkStuckPayments } from "../src/lib/payments/paymentChecker.js"
 import { paystackAdapter } from "../src/lib/payments/paystack.js"
 import { setPaymentProvidersForTesting } from "../src/lib/payments/providers.js"
 import {
@@ -203,6 +204,7 @@ async function createCheckoutLifecycleFixture(
                 await prisma.order.deleteMany({ where: { checkoutId: { in: checkoutIds } } })
                 await prisma.checkoutItem.deleteMany({ where: { checkoutId: { in: checkoutIds } } })
                 await prisma.inventoryReservation.deleteMany({ where: { checkoutId: { in: checkoutIds } } })
+                await prisma.paymentRecoveryCase.deleteMany({ where: { paymentAttempt: { checkoutId: { in: checkoutIds } } } })
                 await prisma.paymentAttempt.deleteMany({ where: { checkoutId: { in: checkoutIds } } })
                 await prisma.checkout.deleteMany({ where: { id: { in: checkoutIds } } })
             }
@@ -4249,5 +4251,105 @@ test("does not settle a verified payment whose stock is no longer held and flags
         assert.deepEqual(state.orderStatuses, ["PENDING_PAYMENT"])
         assert.equal(state.cartQuantity, 2)
         assert.ok(consoleError.mock.calls.some((call) => call.arguments[0] === "Payment settlement needs review"))
+    })
+})
+
+async function backdatePaymentAttempt(reference: string, minutes: number) {
+    await prisma.$executeRaw`
+        UPDATE "PaymentAttempt"
+        SET "createdAt" = (NOW() AT TIME ZONE 'UTC') - make_interval(mins => ${minutes}::integer)
+        WHERE reference = ${reference}
+    `
+}
+
+async function expireCheckoutAt(checkoutId: number, minutesAgo: number) {
+    const expiresAt = new Date(Date.now() - minutesAgo * 60 * 1000)
+    await prisma.checkout.update({ where: { id: checkoutId }, data: { expiresAt } })
+    await prisma.inventoryReservation.updateMany({ where: { checkoutId }, data: { expiresAt } })
+}
+
+test("the stuck-payment checker settles old pending payments and skips recent ones", async () => {
+    await withPaymentCheckout("checker-settle", async ({ fixture, checkoutId, fakes, startPayment }) => {
+        const reference = (await startPayment()).body.payment.reference as string
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("success", reference)
+
+        await checkStuckPayments()
+        assert.equal(fakes.calls.verify.filter((call) => call.reference === reference).length, 0)
+
+        await backdatePaymentAttempt(reference, 15)
+        await checkStuckPayments()
+        assert.equal(fakes.calls.verify.filter((call) => call.reference === reference).length, 1)
+        assert.deepEqual(await loadSettlementState(fixture, checkoutId), { ...settledState, cartQuantity: 0 })
+
+        // A payment checked moments ago is not checked again.
+        await checkStuckPayments()
+        assert.equal(fakes.calls.verify.filter((call) => call.reference === reference).length, 1)
+    })
+})
+
+test("closes a payment abandoned 30 minutes after its checkout expired and releases the stock", async () => {
+    await withPaymentCheckout("checker-abandoned", async ({ fixture, checkoutId, fakes, request, startPayment }) => {
+        const reference = (await startPayment()).body.payment.reference as string
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("pending", reference, { providerStatus: "abandoned" })
+
+        await expireCheckoutAt(checkoutId, 5)
+        const recent = await request("GET", `/payments/${reference}`)
+        assert.equal(recent.body.payment.status, "PENDING")
+
+        await expireCheckoutAt(checkoutId, 31)
+        const closed = await request("GET", `/payments/${reference}`)
+        assert.equal(closed.body.payment.status, "FAILED")
+        assert.equal(closed.body.payment.failureReason, "The payment was not completed in time")
+
+        const state = await loadSettlementState(fixture, checkoutId)
+        assert.equal(state.checkoutStatus, "EXPIRED")
+        assert.deepEqual(state.reservationStatuses, ["EXPIRED"])
+        assert.deepEqual(state.orderStatuses, ["CANCELLED"])
+        assert.equal(state.stockQuantity, 5)
+    })
+})
+
+test("a verified failure after expiry releases the stock and does not reopen the checkout", async () => {
+    await withPaymentCheckout("checker-failed-late", async ({ fixture, checkoutId, fakes, request, startPayment }) => {
+        const reference = (await startPayment()).body.payment.reference as string
+        await expireCheckoutAt(checkoutId, 1)
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("failed", reference)
+
+        const failed = await request("GET", `/payments/${reference}`)
+        assert.equal(failed.body.payment.status, "FAILED")
+        assert.equal(failed.body.payment.checkout.status, "EXPIRED")
+
+        const state = await loadSettlementState(fixture, checkoutId)
+        assert.deepEqual(state.reservationStatuses, ["EXPIRED"])
+        assert.deepEqual(state.orderStatuses, ["CANCELLED"])
+
+        const retry = await request("POST", `/checkout/${checkoutId}/payments`, { provider: "PAYSTACK" })
+        assert.equal(retry.status, 409)
+        assert.equal(retry.body.code, "CHECKOUT_EXPIRED")
+    })
+})
+
+test("opens one recovery case for a verified payment that cannot be settled", async (t) => {
+    const consoleError = t.mock.method(console, "error", () => {})
+
+    await withPaymentCheckout("checker-recovery", async ({ checkoutId, fakes, request, startPayment }) => {
+        const reference = (await startPayment()).body.payment.reference as string
+        await prisma.inventoryReservation.updateMany({ where: { checkoutId }, data: { status: "RELEASED" } })
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("success", reference)
+
+        await request("GET", `/payments/${reference}`)
+        await request("GET", `/payments/${reference}`)
+        await backdatePaymentAttempt(reference, 15)
+        await prisma.paymentAttempt.update({ where: { reference }, data: { lastCheckedAt: null } })
+        await checkStuckPayments()
+
+        const cases = await prisma.paymentRecoveryCase.findMany({ where: { paymentAttempt: { reference } } })
+        assert.equal(cases.length, 1)
+        assert.equal(cases[0]!.status, "OPEN")
+        assert.match(cases[0]!.reason, /stock is no longer held/)
+        assert.equal(
+            consoleError.mock.calls.filter((call) => call.arguments[0] === "Payment settlement needs review").length,
+            1
+        )
     })
 })
