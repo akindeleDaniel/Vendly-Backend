@@ -292,3 +292,18 @@ model PaymentAttempt {
   @@unique([provider, providerRef])
   @@index([checkoutId])
 }
+
+// One row per provider webhook event, so redelivered events are recognised and not processed
+// twice. Only what is needed for deduplication and support is kept, never card or customer details.
+model PaymentEvent {
+  id          Int             @id @default(autoincrement())
+  provider    PaymentProvider
+  eventKey    String
+  eventType   String
+  reference   String?
+  receivedAt  DateTime        @default(now())
+  processedAt DateTime?
+
+  @@unique([provider, eventKey])
+  @@index([reference])
+}

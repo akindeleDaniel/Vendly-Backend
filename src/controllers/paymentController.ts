@@ -5,6 +5,7 @@ import prisma from "../lib/prisma.js"
 import { Prisma, type PaymentAttempt, type PaymentProvider } from "../generated/prisma/client.js"
 import { acquireCheckoutCreationLock, expireExpiredCheckouts } from "./checkoutController.js"
 import { getPaymentProvider, paymentProviderNames, paymentProviders } from "../lib/payments/providers.js"
+import { settleCheckoutPayment } from "../lib/payments/settlement.js"
 import { PaymentProviderError, type PaymentVerification } from "../lib/payments/types.js"
 
 // Starting a payment extends the checkout and its stock hold to this long from that moment.
@@ -186,6 +187,29 @@ async function reconcileUnstartedAttempt(attempt: PaymentAttempt): Promise<void>
     })
 }
 
+// Brings a payment up to date with its provider and settles it once verified as successful.
+// Used by the status endpoint, webhooks and payment start. Throws when the provider cannot be
+// reached, so callers decide whether that matters (a webhook asks to be retried; the status
+// endpoint returns the saved status).
+export async function syncPayment(attempt: PaymentAttempt): Promise<void> {
+    if (attempt.status === "PENDING") {
+        if (!attempt.authorizationUrl && attempt.createdAt.getTime() <= Date.now() - initializingGraceMs) {
+            await reconcileUnstartedAttempt(attempt)
+        } else {
+            await applyVerification(attempt, await getPaymentProvider(attempt.provider).verifyPayment(attempt.reference))
+        }
+    }
+
+    const current = await prisma.paymentAttempt.findUniqueOrThrow({
+        where: { id: attempt.id },
+        select: { id: true, status: true, checkout: { select: { status: true } } }
+    })
+
+    if (current.status === "SUCCESS" && current.checkout.status !== "COMPLETED") {
+        await settleCheckoutPayment(current.id)
+    }
+}
+
 // Starts (or resumes) payment for one of the consumer's checkouts with the chosen provider and
 // returns the provider's hosted payment page. The attempt is saved, and the checkout moved to
 // PAYMENT_PENDING with a 30-minute hold, before the provider is called outside the transaction.
@@ -224,7 +248,7 @@ export async function createCheckoutPayment(req: Request, res: Response) {
         })
 
         if (unstartedAttempt) {
-            await reconcileUnstartedAttempt(unstartedAttempt)
+            await syncPayment(unstartedAttempt)
         }
 
         const prepared = await prisma.$transaction(async (tx) => {
@@ -419,7 +443,8 @@ export async function createCheckoutPayment(req: Request, res: Response) {
 }
 
 // Returns the authoritative status of one of the consumer's payments. A PENDING payment is
-// verified with the provider first; if the provider cannot be reached the saved status is returned.
+// verified with the provider first, and a verified payment is settled if it is not yet; if the
+// provider cannot be reached the saved status is returned.
 // The browser's return from the payment page is never treated as proof of payment.
 export async function getPayment(req: Request, res: Response) {
     const reference = String(req.params.reference)
@@ -432,13 +457,9 @@ export async function getPayment(req: Request, res: Response) {
         return
     }
 
-    if (attempt.status === "PENDING") {
+    if (attempt.status === "PENDING" || (attempt.status === "SUCCESS" && attempt.checkout.status !== "COMPLETED")) {
         try {
-            if (!attempt.authorizationUrl && attempt.createdAt.getTime() <= Date.now() - initializingGraceMs) {
-                await reconcileUnstartedAttempt(attempt)
-            } else {
-                await applyVerification(attempt, await getPaymentProvider(attempt.provider).verifyPayment(reference))
-            }
+            await syncPayment(attempt)
         } catch (error) {
             // An unreachable provider is not an error for the client: the saved status is returned.
             if (error instanceof PaymentProviderError) {

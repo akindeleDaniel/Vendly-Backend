@@ -32,6 +32,14 @@ function paymentsNotAvailable(): never {
 export const flutterwaveAdapter: PaymentProviderAdapter = {
     provider: "FLUTTERWAVE",
 
+    verifyWebhook() {
+        return false
+    },
+
+    parseWebhook() {
+        return null
+    },
+
     async initializePayment() {
         return paymentsNotAvailable()
     },

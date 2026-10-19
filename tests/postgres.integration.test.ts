@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { randomUUID } from "node:crypto"
+import { createHmac, randomUUID } from "node:crypto"
 import { createServer, type Server } from "node:http"
 import { after, before, test } from "node:test"
 import cookieParser from "cookie-parser"
@@ -13,6 +13,7 @@ import listingRoutes from "../src/routes/listingRoutes.js"
 import app from "../src/app.js"
 import config, { assertRequiredEnvironment, loadConfig } from "../src/config.js"
 import { payoutFeeTerms } from "../src/controllers/payoutController.js"
+import { paystackAdapter } from "../src/lib/payments/paystack.js"
 import { setPaymentProvidersForTesting } from "../src/lib/payments/providers.js"
 import {
     PaymentProviderError,
@@ -3290,8 +3291,11 @@ function installFakePaymentProviders() {
         verify: [] as Array<{ provider: PaymentProvider; reference: string }>
     }
     const behaviors: Record<PaymentProvider, FakeProviderBehavior> = { PAYSTACK: {}, FLUTTERWAVE: {} }
+    // Webhook signatures and parsing use the real Paystack code, which needs no network.
     const fakeAdapter = (provider: PaymentProvider): PaymentProviderAdapter => ({
         provider,
+        verifyWebhook: (rawBody, headers) => provider === "PAYSTACK" && paystackAdapter.verifyWebhook(rawBody, headers),
+        parseWebhook: (rawBody) => provider === "PAYSTACK" ? paystackAdapter.parseWebhook(rawBody) : null,
         async initializePayment(input) {
             calls.initialize.push({ provider, input })
             return behaviors[provider].initialize?.(input) ?? { authorizationUrl: `https://checkout.example.test/${input.reference}` }
@@ -3761,6 +3765,7 @@ test("keeps a failed bank change unusable and retries only the failed provider",
 
 type PaymentTestContext = {
     fixture: CheckoutLifecycleFixture
+    baseUrl: string
     checkoutId: number
     fakes: ReturnType<typeof installFakePaymentProviders>
     request(method: "GET" | "POST", path: string, body?: unknown, token?: string): Promise<{ status: number; body: any }>
@@ -3812,6 +3817,7 @@ async function withPaymentCheckout(
 
             await run({
                 fixture,
+                baseUrl,
                 checkoutId,
                 fakes,
                 request,
@@ -3955,8 +3961,8 @@ test("records a verified payment only when the reference, amount and currency ma
         assert.equal(attempt.providerStatus, "success")
         assert.ok(attempt.verifiedAt instanceof Date)
 
-        // Settlement (completing the checkout and orders) is a separate step.
-        assert.equal((await prisma.checkout.findUniqueOrThrow({ where: { id: checkoutId } })).status, "PAYMENT_PENDING")
+        // A verified payment is settled straight away.
+        assert.equal((await prisma.checkout.findUniqueOrThrow({ where: { id: checkoutId } })).status, "COMPLETED")
 
         fakes.calls.verify.length = 0
         const again = await request("GET", `/payments/${reference}`)
@@ -4062,5 +4068,186 @@ test("returns the saved payment status when the provider cannot be reached and h
         const hidden = await request("GET", `/payments/${reference}`, undefined, other.token)
         assert.equal(hidden.status, 404)
         assert.equal((await request("GET", "/payments/VND-unknown")).status, 404)
+    })
+})
+
+async function loadSettlementState(fixture: CheckoutLifecycleFixture, checkoutId: number) {
+    const checkout = await prisma.checkout.findUniqueOrThrow({
+        where: { id: checkoutId },
+        include: { inventoryReservations: true, orders: true }
+    })
+    const listing = await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })
+    const cartItem = await prisma.cartItem.findFirst({ where: { cart: { userId: fixture.consumerId }, listingId: fixture.listingId } })
+    return {
+        checkoutStatus: checkout.status,
+        reservationStatuses: checkout.inventoryReservations.map(({ status }) => status),
+        orderStatuses: checkout.orders.map(({ status }) => status),
+        stockQuantity: listing.stockQuantity,
+        cartQuantity: cartItem?.quantity ?? 0
+    }
+}
+
+const settledState = {
+    checkoutStatus: "COMPLETED",
+    reservationStatuses: ["CONSUMED"],
+    orderStatuses: ["PAID"],
+    stockQuantity: 3
+}
+
+test("settles a verified payment once and removes only the paid quantity from the cart", async () => {
+    await withPaymentCheckout("settle-status", async ({ fixture, checkoutId, fakes, request, startPayment }) => {
+        const reference = (await startPayment()).body.payment.reference as string
+        // The consumer adds one more of the same item after checking out.
+        await prisma.cartItem.updateMany({
+            where: { cart: { userId: fixture.consumerId }, listingId: fixture.listingId },
+            data: { quantity: 3 }
+        })
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("success", reference)
+
+        const status = await request("GET", `/payments/${reference}`)
+        assert.equal(status.body.payment.status, "SUCCESS")
+        assert.equal(status.body.payment.checkout.status, "COMPLETED")
+        assert.deepEqual(await loadSettlementState(fixture, checkoutId), { ...settledState, cartQuantity: 1 })
+
+        const again = await request("GET", `/payments/${reference}`)
+        assert.equal(again.body.payment.checkout.status, "COMPLETED")
+        assert.deepEqual(await loadSettlementState(fixture, checkoutId), { ...settledState, cartQuantity: 1 })
+    })
+})
+
+function paystackWebhookBody(reference: string, event = "charge.success", eventId = 987654) {
+    return JSON.stringify({ event, data: { id: eventId, reference, status: "success", amount: 300000, currency: "NGN" } })
+}
+
+async function postPaystackWebhook(baseUrl: string, body: string, signature = signPaystackWebhook(body)) {
+    const response = await fetch(`${baseUrl}/payments/webhooks/paystack`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "x-paystack-signature": signature },
+        body
+    })
+    return { status: response.status, body: await response.json() as { message?: string } }
+}
+
+function signPaystackWebhook(body: string) {
+    const secret = process.env.PAYSTACK_SECRET_KEY
+    assert.ok(secret, "PAYSTACK_SECRET_KEY must be set for webhook signature tests")
+    return createHmac("sha512", secret).update(body).digest("hex")
+}
+
+test("settles a payment from a signed Paystack webhook exactly once", async (t) => {
+    process.env.PAYSTACK_SECRET_KEY ||= "sk_test_integration_webhook_secret"
+    const consoleWarn = t.mock.method(console, "warn", () => {})
+
+    await withPaymentCheckout("settle-webhook", async ({ fixture, checkoutId, fakes, baseUrl, startPayment }) => {
+        const reference = (await startPayment()).body.payment.reference as string
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("success", reference)
+        const body = paystackWebhookBody(reference)
+
+        const forged = await postPaystackWebhook(baseUrl, body, "0".repeat(128))
+        assert.equal(forged.status, 401)
+        assert.equal(consoleWarn.mock.callCount(), 1)
+        assert.equal(fakes.calls.verify.length, 0)
+        assert.equal(await prisma.paymentEvent.count({ where: { reference } }), 0)
+
+        const delivered = await postPaystackWebhook(baseUrl, body)
+        assert.equal(delivered.status, 200)
+        assert.equal(delivered.body.message, "Event received")
+        assert.equal(fakes.calls.verify.length, 1)
+        assert.deepEqual(await loadSettlementState(fixture, checkoutId), { ...settledState, cartQuantity: 0 })
+
+        const event = await prisma.paymentEvent.findFirstOrThrow({ where: { reference } })
+        assert.equal(event.eventKey, "charge.success:987654")
+        assert.ok(event.processedAt instanceof Date)
+
+        const redelivered = await postPaystackWebhook(baseUrl, body)
+        assert.equal(redelivered.status, 200)
+        assert.equal(redelivered.body.message, "Event already processed")
+        assert.equal(fakes.calls.verify.length, 1)
+        assert.deepEqual(await loadSettlementState(fixture, checkoutId), { ...settledState, cartQuantity: 0 })
+
+        const otherEvent = await postPaystackWebhook(baseUrl, paystackWebhookBody(reference, "transfer.success", 111))
+        assert.equal(otherEvent.body.message, "Event ignored")
+
+        const notJson = "not json"
+        const malformed = await postPaystackWebhook(baseUrl, notJson)
+        assert.equal(malformed.status, 400)
+    })
+
+    await prisma.paymentEvent.deleteMany({ where: { eventKey: "charge.success:987654" } })
+})
+
+test("asks Paystack to redeliver a webhook when verification fails, then settles", async (t) => {
+    process.env.PAYSTACK_SECRET_KEY ||= "sk_test_integration_webhook_secret"
+    t.mock.method(console, "error", () => {})
+
+    await withPaymentCheckout("settle-webhook-retry", async ({ fixture, checkoutId, fakes, baseUrl, startPayment }) => {
+        const reference = (await startPayment()).body.payment.reference as string
+        const body = paystackWebhookBody(reference, "charge.success", 987655)
+        fakes.behaviors.PAYSTACK.verify = async () => {
+            throw new PaymentProviderError("unavailable", "Paystack could not be reached", "TimeoutError")
+        }
+
+        const failed = await postPaystackWebhook(baseUrl, body)
+        assert.equal(failed.status, 500)
+        assert.equal((await prisma.paymentEvent.findFirstOrThrow({ where: { reference } })).processedAt, null)
+        assert.equal((await loadSettlementState(fixture, checkoutId)).checkoutStatus, "PAYMENT_PENDING")
+
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("success", reference)
+        const redelivered = await postPaystackWebhook(baseUrl, body)
+        assert.equal(redelivered.status, 200)
+        assert.deepEqual(await loadSettlementState(fixture, checkoutId), { ...settledState, cartQuantity: 0 })
+    })
+
+    await prisma.paymentEvent.deleteMany({ where: { eventKey: "charge.success:987655" } })
+})
+
+test("settles once when a webhook and a status check arrive together", async () => {
+    process.env.PAYSTACK_SECRET_KEY ||= "sk_test_integration_webhook_secret"
+
+    await withPaymentCheckout("settle-concurrent", async ({ fixture, checkoutId, fakes, baseUrl, request, startPayment }) => {
+        const reference = (await startPayment()).body.payment.reference as string
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("success", reference)
+
+        const [webhook, status] = await Promise.all([
+            postPaystackWebhook(baseUrl, paystackWebhookBody(reference, "charge.success", 987656)),
+            request("GET", `/payments/${reference}`)
+        ])
+        assert.equal(webhook.status, 200)
+        assert.equal(status.status, 200)
+        assert.deepEqual(await loadSettlementState(fixture, checkoutId), { ...settledState, cartQuantity: 0 })
+    })
+
+    await prisma.paymentEvent.deleteMany({ where: { eventKey: "charge.success:987656" } })
+})
+
+test("settles a verified payment that arrives after the checkout expired while stock was protected", async () => {
+    await withPaymentCheckout("settle-late", async ({ fixture, checkoutId, fakes, request, startPayment }) => {
+        const reference = (await startPayment()).body.payment.reference as string
+        await prisma.checkout.update({ where: { id: checkoutId }, data: { status: "EXPIRED", expiresAt: new Date(Date.now() - 1000) } })
+        await prisma.inventoryReservation.updateMany({ where: { checkoutId }, data: { status: "PROTECTED" } })
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("success", reference)
+
+        const status = await request("GET", `/payments/${reference}`)
+        assert.equal(status.body.payment.status, "SUCCESS")
+        assert.deepEqual(await loadSettlementState(fixture, checkoutId), { ...settledState, cartQuantity: 0 })
+    })
+})
+
+test("does not settle a verified payment whose stock is no longer held and flags it for review", async (t) => {
+    const consoleError = t.mock.method(console, "error", () => {})
+
+    await withPaymentCheckout("settle-review", async ({ fixture, checkoutId, fakes, request, startPayment }) => {
+        const reference = (await startPayment()).body.payment.reference as string
+        await prisma.inventoryReservation.updateMany({ where: { checkoutId }, data: { status: "RELEASED" } })
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("success", reference)
+
+        const status = await request("GET", `/payments/${reference}`)
+        assert.equal(status.body.payment.status, "SUCCESS")
+        assert.equal(status.body.payment.checkout.status, "PAYMENT_PENDING")
+        const state = await loadSettlementState(fixture, checkoutId)
+        assert.equal(state.stockQuantity, 5)
+        assert.deepEqual(state.orderStatuses, ["PENDING_PAYMENT"])
+        assert.equal(state.cartQuantity, 2)
+        assert.ok(consoleError.mock.calls.some((call) => call.arguments[0] === "Payment settlement needs review"))
     })
 })

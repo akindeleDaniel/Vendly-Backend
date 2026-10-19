@@ -36,10 +36,25 @@ export type PaymentVerification =
         transactionId: string | null
     }
 
+// A webhook event reduced to what Vendly needs. The payload itself is never trusted: a payment
+// event only prompts Vendly to verify the reference with the provider.
+export type WebhookEvent = {
+    // Unique per event, used to recognise redeliveries.
+    eventKey: string
+    eventType: string
+    reference: string | null
+    isPaymentEvent: boolean
+}
+
+export type WebhookHeaders = Record<string, string | string[] | undefined>
+
 // The provider calls Vendly makes. Each provider implements this; tests use a fake.
-// Webhooks join this interface in a later phase.
 export interface PaymentProviderAdapter {
     readonly provider: PaymentProvider
+    // Checks the webhook signature against the exact bytes received.
+    verifyWebhook(rawBody: Buffer, headers: WebhookHeaders): boolean
+    // Returns null when the body is not a recognisable event.
+    parseWebhook(rawBody: Buffer): WebhookEvent | null
     initializePayment(input: InitializePaymentInput): Promise<{ authorizationUrl: string }>
     verifyPayment(reference: string): Promise<PaymentVerification>
     resolveAccount(input: ResolveAccountInput): Promise<{ accountName: string }>

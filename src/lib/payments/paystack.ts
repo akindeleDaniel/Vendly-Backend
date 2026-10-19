@@ -1,3 +1,4 @@
+import { createHmac, timingSafeEqual } from "node:crypto"
 import { readDataString, sendProviderRequest } from "./providerRequest.js"
 import { PaymentProviderError, type PaymentProviderAdapter } from "./types.js"
 
@@ -18,6 +19,41 @@ const failedStatuses = new Set(["failed", "reversed"])
 
 export const paystackAdapter: PaymentProviderAdapter = {
     provider: "PAYSTACK",
+
+    // Paystack signs the raw body with HMAC-SHA512 using the secret key (x-paystack-signature).
+    verifyWebhook(rawBody, headers) {
+        const secretKey = process.env.PAYSTACK_SECRET_KEY?.trim()
+        const signature = headers["x-paystack-signature"]
+
+        if (!secretKey || typeof signature !== "string" || !/^[0-9a-f]{128}$/i.test(signature)) {
+            return false
+        }
+
+        const expected = createHmac("sha512", secretKey).update(rawBody).digest()
+        return timingSafeEqual(expected, Buffer.from(signature, "hex"))
+    },
+
+    parseWebhook(rawBody) {
+        let body: { event?: unknown; data?: { id?: unknown; reference?: unknown } }
+
+        try {
+            body = JSON.parse(rawBody.toString("utf8"))
+        } catch {
+            return null
+        }
+
+        if (typeof body?.event !== "string" || body.data?.id === undefined || body.data.id === null) {
+            return null
+        }
+
+        return {
+            eventKey: `${body.event}:${String(body.data.id)}`,
+            eventType: body.event,
+            reference: typeof body.data.reference === "string" ? body.data.reference : null,
+            // Paystack only sends webhooks for successful charges, not failures.
+            isPaymentEvent: body.event === "charge.success"
+        }
+    },
 
     async initializePayment(input) {
         // A flat split with the sellers' shares adding up to the total leaves Vendly ₦0, and
