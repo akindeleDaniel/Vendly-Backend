@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { createHmac, randomUUID } from "node:crypto"
+import { createHash, createHmac, randomUUID } from "node:crypto"
 import { createServer, type Server } from "node:http"
 import { after, before, test } from "node:test"
 import cookieParser from "cookie-parser"
@@ -17,6 +17,11 @@ import { checkStuckPayments } from "../src/lib/payments/paymentChecker.js"
 import { escalateOverdueDisputes } from "../src/lib/disputes.js"
 import { checkOpenRefunds } from "../src/lib/payments/refunds.js"
 import { purgeOldRefreshTokens } from "../src/lib/sessions.js"
+import { setEmailSenderForTesting, type OutgoingEmail } from "../src/lib/email/index.js"
+import { assertEmailEnvironment, loadEmailConfig } from "../src/lib/email/config.js"
+import { otpDailyLimit } from "../src/lib/otp.js"
+import { purgeStaleAccountRecords } from "../src/lib/accountCleanup.js"
+import { setGoogleVerifierForTesting, type GoogleIdentity } from "../src/lib/google.js"
 import { flutterwaveAdapter } from "../src/lib/payments/flutterwave.js"
 import { paystackAdapter } from "../src/lib/payments/paystack.js"
 import { setPaymentProvidersForTesting } from "../src/lib/payments/providers.js"
@@ -34,6 +39,35 @@ import {
 import bcrypt from "bcrypt"
 
 let prisma: PrismaClient
+
+const sentEmails: OutgoingEmail[] = []
+setEmailSenderForTesting(async (email) => { sentEmails.push(email) })
+
+// Google sign-in tokens, as the fake verifier knows them: the token is just a key into this table.
+const googleIdentities = new Map<string, GoogleIdentity>()
+setGoogleVerifierForTesting(async (credential) => googleIdentities.get(credential) ?? null)
+
+function googleToken(identity: GoogleIdentity): string {
+    const credential = `fake-google-token-${randomUUID()}`
+    googleIdentities.set(credential, identity)
+    return credential
+}
+
+function newGoogleIdentity(prefix = "google"): GoogleIdentity {
+    return { googleId: `google-sub-${randomUUID()}`, email: `${prefix}-${randomUUID()}@example.test`, name: "Grace Hopper" }
+}
+
+function emailsTo(address: string) {
+    return sentEmails.filter((email) => email.to === address)
+}
+
+function codeSentTo(address: string): string {
+    const email = emailsTo(address).at(-1)
+    assert.ok(email, `No email was sent to ${address}`)
+    const match = /Your Vendly code is (\d{6})/.exec(email.text)
+    assert.ok(match?.[1], "The email has no code in it")
+    return match[1]
+}
 
 before(async () => {
     prisma = await connectTestDatabase()
@@ -3256,18 +3290,22 @@ test("sets and clears the login cookie with the configured attributes", async ()
             name: "Cookie attributes test consumer",
             email,
             passwordHash: await bcrypt.hash(password, 4),
-            role: "CONSUMER"
+            role: "CONSUMER",
+            emailVerifiedAt: new Date()
         }
     })
 
     try {
         await withAppServer(async (baseUrl) => {
-            const login = await fetch(`${baseUrl}/users/login`, {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ email, password })
-            })
+            const passwordStep = await postJson(baseUrl, "/users/login", { email, password })
+            assert.equal(passwordStep.status, 200)
+            const login = await postJson(baseUrl, "/users/login/verify", { email, code: codeSentTo(email) })
             assert.equal(login.status, 200)
+            const trustedCookie = login.headers.getSetCookie().find((cookie) => cookie.startsWith("trustedDevice=")) ?? ""
+            assert.match(trustedCookie, /Path=\/users/)
+            assert.match(trustedCookie, /HttpOnly/)
+            assert.match(trustedCookie, /Max-Age=259\d{4}\b/)
+            assert.match(trustedCookie, /SameSite=Lax/)
             const loginCookie = login.headers.getSetCookie().find((cookie) => cookie.startsWith("token=")) ?? ""
             assert.match(loginCookie, /^token=[^;]+;/)
             assert.match(loginCookie, /Max-Age=900/)
@@ -6223,7 +6261,7 @@ async function withSessionUser(run: (context: SessionContext) => Promise<void>) 
     const password = "a-long-test-password"
     const email = `session-${randomUUID()}@example.test`
     const user = await prisma.user.create({
-        data: { name: "Session user", email, passwordHash: await bcrypt.hash(password, 4), role: "CONSUMER" }
+        data: { name: "Session user", email, passwordHash: await bcrypt.hash(password, 4), role: "CONSUMER", emailVerifiedAt: new Date() }
     })
     const server = createServer(app)
 
@@ -6239,12 +6277,20 @@ async function withSessionUser(run: (context: SessionContext) => Promise<void>) 
     }
 }
 
-async function loginForSession(context: SessionContext) {
-    const response = await fetch(`${context.baseUrl}/users/login`, {
+function postJson(baseUrl: string, path: string, body: Record<string, unknown>, cookie?: string) {
+    return fetch(`${baseUrl}${path}`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ email: context.email, password: context.password })
+        headers: { "content-type": "application/json", ...(cookie ? { cookie } : {}) },
+        body: JSON.stringify(body)
     })
+}
+
+// Logs in the way a person does on a device we do not know: password, then the emailed code.
+async function loginForSession(context: SessionContext) {
+    const passwordStep = await postJson(context.baseUrl, "/users/login", { email: context.email, password: context.password })
+    assert.equal(passwordStep.status, 200)
+    assert.equal((await passwordStep.json() as { otpRequired?: boolean }).otpRequired, true)
+    const response = await postJson(context.baseUrl, "/users/login/verify", { email: context.email, code: codeSentTo(context.email) })
     assert.equal(response.status, 200)
     const cookies = cookiesFrom(response)
     const access = cookies.token?.value
@@ -6275,23 +6321,98 @@ test("logging in gives a 15-minute access cookie and a 30-day refresh cookie tha
     })
 })
 
-test("registering also starts a session", async () => {
-    await withSessionUser(async (context) => {
+test("registering sends a code and does not log in; the code confirms the account and logs in", async () => {
+    await withAppServer(async (baseUrl) => {
         const email = `registered-${randomUUID()}@example.test`
-        const response = await fetch(`${context.baseUrl}/users/register`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ name: "New person", email, password: "a-long-test-password", role: "CONSUMER" })
-        })
 
         try {
+            const response = await register(baseUrl, { name: "New person", email, password: goodPassword, role: "CONSUMER" })
             assert.equal(response.status, 200)
-            const cookies = cookiesFrom(response)
-            assert.ok(cookies.token?.value)
-            assert.ok(cookies.refreshToken?.value)
+            assert.equal(response.headers.getSetCookie().length, 0)
+            assert.deepEqual(await response.json(), { message: "Check your email for a code to finish creating your account", email })
+
+            const user = await prisma.user.findUniqueOrThrow({ where: { email }, include: { cart: true } })
+            assert.equal(user.emailVerifiedAt, null)
+            assert.ok(user.cart)
+            assert.equal(emailsTo(email).length, 1)
+            assert.match(emailsTo(email)[0]?.subject ?? "", /Confirm your email: \d{6}/)
+
+            // Until the email is confirmed the account cannot log in, even with the right password.
+            const blocked = await postJson(baseUrl, "/users/login", { email, password: goodPassword })
+            assert.equal(blocked.status, 403)
+            assert.equal((await blocked.json() as { code: string }).code, "EMAIL_NOT_VERIFIED")
+            assert.equal(blocked.headers.getSetCookie().length, 0)
+
+            const wrong = await postJson(baseUrl, "/users/verify-email", { email, code: "000000" })
+            assert.equal(wrong.status, 400)
+            assert.deepEqual(await wrong.json(), { message: "That code is not right or has expired. Ask for a new one." })
+
+            const code = codeSentTo(email)
+            const confirmed = await postJson(baseUrl, "/users/verify-email", { email: email.toUpperCase(), code })
+            assert.equal(confirmed.status, 200)
+            assert.equal((await confirmed.json() as { role: string }).role, "CONSUMER")
+            const cookies = cookiesFrom(confirmed)
+            assert.ok(cookies.token?.value && cookies.refreshToken?.value && cookies.trustedDevice?.value)
+            assert.ok((await prisma.user.findUniqueOrThrow({ where: { email } })).emailVerifiedAt)
+
+            // The code works once.
+            assert.equal((await postJson(baseUrl, "/users/verify-email", { email, code })).status, 400)
+
+            // This browser was just proven, so logging in from it needs no code.
+            const later = await postJson(baseUrl, "/users/login", { email, password: goodPassword }, `trustedDevice=${cookies.trustedDevice.value}`)
+            assert.equal(later.status, 200)
+            assert.equal((await later.json() as { role: string }).role, "CONSUMER")
+            assert.ok(cookiesFrom(later).token?.value)
         } finally {
-            await prisma.cart.deleteMany({ where: { user: { email } } })
-            await prisma.user.deleteMany({ where: { email } })
+            await deleteRegistered([email])
+        }
+    })
+})
+
+test("signing up with an address that already has an account looks the same, changes nothing and warns the owner", async () => {
+    await withSessionUser(async (context) => {
+        const freshEmail = `fresh-${randomUUID()}@example.test`
+
+        try {
+            const existing = await register(context.baseUrl, { name: "Impostor", email: context.email.toUpperCase(), password: "impostor-password-1", role: "SELLER" })
+            const fresh = await register(context.baseUrl, { name: "Someone", email: freshEmail, password: goodPassword, role: "CONSUMER" })
+            assert.equal(existing.status, 200)
+            assert.equal(fresh.status, 200)
+            assert.equal((await existing.json() as { message: string }).message, (await fresh.json() as { message: string }).message)
+
+            const unchanged = await prisma.user.findUniqueOrThrow({ where: { id: context.userId } })
+            assert.equal(unchanged.role, "CONSUMER")
+            assert.ok(await bcrypt.compare(context.password, unchanged.passwordHash))
+            assert.equal(emailsTo(context.email).at(-1)?.subject, "You already have a Vendly account")
+            assert.equal(await prisma.emailOtp.count({ where: { userId: context.userId, purpose: "VERIFY_EMAIL" } }), 0)
+        } finally {
+            await deleteRegistered([freshEmail])
+        }
+    })
+})
+
+test("signing up again before confirming starts over with the new details and an unused old code stops working", async () => {
+    await withAppServer(async (baseUrl) => {
+        const email = `again-${randomUUID()}@example.test`
+
+        try {
+            await register(baseUrl, { name: "First try", email, password: goodPassword, role: "CONSUMER" })
+            const firstCode = codeSentTo(email)
+            await register(baseUrl, { name: "Second try", email, password: "a-different-password", role: "SELLER" })
+            const secondCode = codeSentTo(email)
+            assert.notEqual(firstCode, secondCode)
+
+            const user = await prisma.user.findUniqueOrThrow({ where: { email }, include: { cart: true } })
+            assert.equal(user.name, "Second try")
+            assert.equal(user.role, "SELLER")
+            assert.equal(user.cart, null)
+            assert.ok(await bcrypt.compare("a-different-password", user.passwordHash))
+            assert.equal(await prisma.user.count({ where: { email } }), 1)
+
+            assert.equal((await postJson(baseUrl, "/users/verify-email", { email, code: firstCode })).status, 400)
+            assert.equal((await postJson(baseUrl, "/users/verify-email", { email, code: secondCode })).status, 200)
+        } finally {
+            await deleteRegistered([email])
         }
     })
 })
@@ -6516,6 +6637,7 @@ function register(baseUrl: string, body: Record<string, unknown>) {
 
 async function deleteRegistered(emails: string[]) {
     await prisma.cart.deleteMany({ where: { user: { email: { in: emails } } } })
+    await prisma.sellerProfile.deleteMany({ where: { user: { email: { in: emails } } } })
     await prisma.user.deleteMany({ where: { email: { in: emails } } })
 }
 
@@ -6553,7 +6675,7 @@ test("registration refuses weak passwords, bad emails, bad names and any role bu
     })
 })
 
-test("registration stores the email trimmed and lowercase, and the same address cannot register twice", async () => {
+test("registration stores the email trimmed and lowercase, so capital letters make no second account", async () => {
     await withAppServer(async (baseUrl) => {
         const local = `mixed-${randomUUID()}`
         const stored = `${local}@example.test`.toLowerCase()
@@ -6566,38 +6688,28 @@ test("registration stores the email trimmed and lowercase, and the same address 
             assert.equal(user.role, "SELLER")
             assert.equal(user.isAdmin, false)
 
-            const again = await register(baseUrl, { name: "Someone", email: stored.toUpperCase(), password: goodPassword, role: "CONSUMER" })
-            assert.equal(again.status, 400)
-            assert.deepEqual(await again.json(), { message: "The email has already been registered" })
+            await register(baseUrl, { name: "Ada Obi", email: stored.toUpperCase(), password: goodPassword, role: "SELLER" })
+            assert.equal(await prisma.user.count({ where: { email: { equals: stored, mode: "insensitive" } } }), 1)
 
-            // Logging in works whatever the capital letters or spaces.
-            const login = await fetch(`${baseUrl}/users/login`, {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ email: ` ${stored.toUpperCase()} `, password: goodPassword })
-            })
+            // Logging in works whatever the capital letters or spaces, once the email is confirmed.
+            await postJson(baseUrl, "/users/verify-email", { email: stored, code: codeSentTo(stored) })
+            const login = await postJson(baseUrl, "/users/login", { email: ` ${stored.toUpperCase()} `, password: goodPassword })
             assert.equal(login.status, 200)
-            assert.equal((await login.json() as { role: string }).role, "SELLER")
+            assert.equal((await login.json() as { otpRequired: boolean }).otpRequired, true)
         } finally {
             await deleteRegistered([stored])
         }
     })
 })
 
-test("two registrations with the same email at the same moment give one account and a friendly message, never a server error", async () => {
+test("two registrations with the same email at the same moment give one account and the same answer, never a server error", async () => {
     await withAppServer(async (baseUrl) => {
         const email = `race-${randomUUID()}@example.test`
 
         try {
             const responses = await Promise.all(Array.from({ length: 4 }, () =>
                 register(baseUrl, { name: "Racer", email, password: goodPassword, role: "CONSUMER" })))
-            const statuses = responses.map((response) => response.status).sort()
-            assert.deepEqual(statuses, [200, 400, 400, 400])
-
-            for (const response of responses.filter((candidate) => candidate.status === 400)) {
-                assert.deepEqual(await response.json(), { message: "The email has already been registered" })
-            }
-
+            assert.deepEqual(responses.map((response) => response.status), [200, 200, 200, 200])
             assert.equal(await prisma.user.count({ where: { email } }), 1)
         } finally {
             await deleteRegistered([email])
@@ -6633,5 +6745,620 @@ test("login gives the same answer for an unknown email, a wrong password and a m
         }
 
         assert.equal((await attempt({ email: context.email.toUpperCase(), password: context.password })).status, 200)
+    })
+})
+
+// ---- Login codes, trusted devices, password reset and change ----
+
+async function setUpAccount(context: SessionContext, changes: { isAdmin?: boolean } = {}) {
+    if (changes.isAdmin) {
+        await prisma.user.update({ where: { id: context.userId }, data: { isAdmin: true } })
+    }
+}
+
+test("logging in from an unknown device needs the emailed code, which works once and survives four wrong guesses at most", async () => {
+    await withSessionUser(async (context) => {
+        const step = await postJson(context.baseUrl, "/users/login", { email: context.email, password: context.password })
+        assert.equal(step.status, 200)
+        assert.deepEqual(await step.json(), {
+            otpRequired: true,
+            message: "Enter the code we emailed you to log in on this device.",
+            email: context.email
+        })
+        assert.equal(step.headers.getSetCookie().length, 0)
+        assert.match(emailsTo(context.email).at(-1)?.subject ?? "", /Your login code: \d{6}/)
+
+        const code = codeSentTo(context.email)
+        const wrong = code === "000000" ? "111111" : "000000"
+
+        for (let attempt = 0; attempt < 4; attempt++) {
+            assert.equal((await postJson(context.baseUrl, "/users/login/verify", { email: context.email, code: wrong })).status, 400)
+        }
+
+        // Malformed codes are refused without counting as guesses.
+        assert.equal((await postJson(context.baseUrl, "/users/login/verify", { email: context.email, code: "12ab56" })).status, 400)
+        assert.equal((await postJson(context.baseUrl, "/users/login/verify", { email: context.email, code: { $ne: null } })).status, 400)
+
+        const good = await postJson(context.baseUrl, "/users/login/verify", { email: context.email, code })
+        assert.equal(good.status, 200)
+        assert.ok(cookiesFrom(good).trustedDevice?.value)
+        assert.equal((await postJson(context.baseUrl, "/users/login/verify", { email: context.email, code })).status, 400)
+    })
+})
+
+test("five wrong guesses kill the code, even the right one afterwards", async () => {
+    await withSessionUser(async (context) => {
+        await postJson(context.baseUrl, "/users/login", { email: context.email, password: context.password })
+        const code = codeSentTo(context.email)
+        const wrong = code === "000000" ? "111111" : "000000"
+
+        for (let attempt = 0; attempt < 5; attempt++) {
+            assert.equal((await postJson(context.baseUrl, "/users/login/verify", { email: context.email, code: wrong })).status, 400)
+        }
+
+        assert.equal((await postJson(context.baseUrl, "/users/login/verify", { email: context.email, code })).status, 400)
+    })
+})
+
+test("a code needs the password step first and a wrong password never sends one", async () => {
+    await withSessionUser(async (context) => {
+        const before = emailsTo(context.email).length
+        const wrongPassword = await postJson(context.baseUrl, "/users/login", { email: context.email, password: "definitely-not-it" })
+        assert.equal(wrongPassword.status, 400)
+        assert.equal(emailsTo(context.email).length, before)
+
+        const noCode = await postJson(context.baseUrl, "/users/login/verify", { email: context.email, code: "123456" })
+        assert.equal(noCode.status, 400)
+    })
+})
+
+test("a trusted device skips the code for 30 days, then asks again; other browsers are not trusted", async () => {
+    await withSessionUser(async (context) => {
+        const first = await loginForSession(context)
+        const trusted = first.cookies.trustedDevice?.value
+        assert.ok(trusted)
+        const cookie = `trustedDevice=${trusted}`
+
+        const skipped = await postJson(context.baseUrl, "/users/login", { email: context.email, password: context.password }, cookie)
+        assert.equal(skipped.status, 200)
+        assert.ok(cookiesFrom(skipped).token?.value)
+
+        const stranger = await postJson(context.baseUrl, "/users/login", { email: context.email, password: context.password }, "trustedDevice=not-a-real-secret")
+        assert.equal((await stranger.json() as { otpRequired?: boolean }).otpRequired, true)
+
+        // The trust lasts a fixed 30 days.
+        await prisma.trustedDevice.updateMany({ where: { userId: context.userId }, data: { expiresAt: new Date(Date.now() - 1000) } })
+        const expired = await postJson(context.baseUrl, "/users/login", { email: context.email, password: context.password }, cookie)
+        assert.equal((await expired.json() as { otpRequired?: boolean }).otpRequired, true)
+    })
+})
+
+test("a trusted device belongs to one account and logging out everywhere forgets it", async () => {
+    await withSessionUser(async (context) => {
+        const other = await prisma.user.create({
+            data: { name: "Other", email: `other-${randomUUID()}@example.test`, passwordHash: await bcrypt.hash(goodPassword, 4), role: "CONSUMER", emailVerifiedAt: new Date() }
+        })
+
+        try {
+            const mine = await loginForSession(context)
+            const cookie = `trustedDevice=${mine.cookies.trustedDevice?.value}`
+
+            const theirs = await postJson(context.baseUrl, "/users/login", { email: other.email, password: goodPassword }, cookie)
+            assert.equal((await theirs.json() as { otpRequired?: boolean }).otpRequired, true)
+
+            await fetch(`${context.baseUrl}/users/logout-all`, { method: "POST", headers: { cookie: `token=${mine.access}` } })
+            const afterwards = await postJson(context.baseUrl, "/users/login", { email: context.email, password: context.password }, cookie)
+            assert.equal((await afterwards.json() as { otpRequired?: boolean }).otpRequired, true)
+        } finally {
+            await prisma.user.delete({ where: { id: other.id } })
+        }
+    })
+})
+
+test("administrators enter a code every time and their devices are never remembered", async () => {
+    await withSessionUser(async (context) => {
+        await setUpAccount(context, { isAdmin: true })
+        const first = await loginForSession(context)
+        assert.equal(first.cookies.trustedDevice, undefined)
+        assert.equal(await prisma.trustedDevice.count({ where: { userId: context.userId } }), 0)
+
+        // Even a trusted-device cookie that was somehow valid does not let an administrator skip the code.
+        const planted = "planted-secret"
+        await prisma.trustedDevice.create({
+            data: { userId: context.userId, tokenHash: createHash("sha256").update(planted).digest("hex"), expiresAt: new Date(Date.now() + 60_000) }
+        })
+        const step = await postJson(context.baseUrl, "/users/login", { email: context.email, password: context.password }, `trustedDevice=${planted}`)
+        assert.equal((await step.json() as { otpRequired?: boolean }).otpRequired, true)
+    })
+})
+
+test("codes can be requested again once a minute, and only by someone who passed the password step", async () => {
+    await withSessionUser(async (context) => {
+        const stranger = await postJson(context.baseUrl, "/users/resend-code", { email: context.email, purpose: "LOGIN" })
+        assert.equal(stranger.status, 200)
+        assert.equal(emailsTo(context.email).length, 0)
+
+        await postJson(context.baseUrl, "/users/login", { email: context.email, password: context.password })
+        const firstCode = codeSentTo(context.email)
+        assert.equal(emailsTo(context.email).length, 1)
+
+        // Within the minute the code already sent stays in place and nothing new is emailed.
+        const tooSoon = await postJson(context.baseUrl, "/users/resend-code", { email: context.email, purpose: "LOGIN" })
+        assert.equal(tooSoon.status, 200)
+        assert.equal(emailsTo(context.email).length, 1)
+
+        await prisma.emailOtp.updateMany({ where: { userId: context.userId }, data: { createdAt: new Date(Date.now() - 2 * 60 * 1000) } })
+        await postJson(context.baseUrl, "/users/resend-code", { email: context.email, purpose: "LOGIN" })
+        assert.equal(emailsTo(context.email).length, 2)
+        const secondCode = codeSentTo(context.email)
+
+        if (secondCode !== firstCode) {
+            assert.equal((await postJson(context.baseUrl, "/users/login/verify", { email: context.email, code: firstCode })).status, 400)
+        }
+
+        assert.equal((await postJson(context.baseUrl, "/users/login/verify", { email: context.email, code: secondCode })).status, 200)
+
+        const badPurpose = await postJson(context.baseUrl, "/users/resend-code", { email: context.email, purpose: "PASSWORD_RESET" })
+        assert.equal(badPurpose.status, 400)
+    })
+})
+
+test("an unknown address gets the same answer when asking for codes, and no email", async () => {
+    await withAppServer(async (baseUrl) => {
+        const unknown = `nobody-${randomUUID()}@example.test`
+        const known = await prisma.user.create({
+            data: { name: "Known", email: `known-${randomUUID()}@example.test`, passwordHash: "x", role: "CONSUMER", emailVerifiedAt: new Date() }
+        })
+
+        try {
+            for (const path of ["/users/forgot-password", "/users/resend-code"]) {
+                const body = (email: string) => ({ email, purpose: "VERIFY_EMAIL" })
+                const asked = await postJson(baseUrl, path, body(unknown))
+                const askedKnown = await postJson(baseUrl, path, body(known.email))
+                assert.equal(asked.status, 200)
+                assert.equal(askedKnown.status, 200)
+                assert.deepEqual(await asked.json(), await askedKnown.json())
+            }
+
+            assert.equal(emailsTo(unknown).length, 0)
+            // Forgot password does send to a real account; resending a sign-up code does not (it is already confirmed).
+            assert.equal(emailsTo(known.email).length, 1)
+            assert.match(emailsTo(known.email)[0]?.subject ?? "", /Reset your password: \d{6}/)
+        } finally {
+            await prisma.user.delete({ where: { id: known.id } })
+        }
+    })
+})
+
+test("an account gets at most ten codes a day", async () => {
+    await withSessionUser(async (context) => {
+        await prisma.emailOtp.createMany({
+            data: Array.from({ length: otpDailyLimit }, () => ({
+                userId: context.userId, purpose: "PASSWORD_RESET" as const, codeHash: "x", consumedAt: new Date(), expiresAt: new Date(Date.now() - 1000)
+            }))
+        })
+
+        const step = await postJson(context.baseUrl, "/users/login", { email: context.email, password: context.password })
+        assert.equal(step.status, 200)
+        assert.equal(emailsTo(context.email).length, 0)
+
+        await prisma.emailOtp.updateMany({ where: { userId: context.userId }, data: { createdAt: new Date(Date.now() - 25 * 60 * 60 * 1000) } })
+        await postJson(context.baseUrl, "/users/login", { email: context.email, password: context.password })
+        assert.equal(emailsTo(context.email).length, 1)
+    })
+})
+
+test("a failed email send does not block asking again", async (t) => {
+    await withSessionUser(async (context) => {
+        const consoleError = t.mock.method(console, "error", () => {})
+        setEmailSenderForTesting(async () => { throw new Error("the email service is down") })
+
+        try {
+            const step = await postJson(context.baseUrl, "/users/login", { email: context.email, password: context.password })
+            assert.equal(step.status, 200)
+            assert.equal(consoleError.mock.callCount(), 1)
+        } finally {
+            setEmailSenderForTesting(async (email) => { sentEmails.push(email) })
+        }
+
+        // The unsent code was set aside, so the very next attempt sends a fresh one at once.
+        await postJson(context.baseUrl, "/users/login", { email: context.email, password: context.password })
+        assert.equal(emailsTo(context.email).length, 1)
+    })
+})
+
+test("forgot password sends a code, a weak new password does not use up a try, and a reset ends every login", async () => {
+    await withSessionUser(async (context) => {
+        const laptop = await loginForSession(context)
+        await postJson(context.baseUrl, "/users/forgot-password", { email: context.email })
+        const code = codeSentTo(context.email)
+
+        const weak = await postJson(context.baseUrl, "/users/reset-password", { email: context.email, code, newPassword: "short" })
+        assert.equal(weak.status, 400)
+        assert.match((await weak.json() as { message: string }).message, /at least 10 characters/)
+
+        const wrongCode = code === "000000" ? "111111" : "000000"
+        assert.equal((await postJson(context.baseUrl, "/users/reset-password", { email: context.email, code: wrongCode, newPassword: "a-brand-new-password" })).status, 400)
+
+        const reset = await postJson(context.baseUrl, "/users/reset-password", { email: context.email, code, newPassword: "a-brand-new-password" })
+        assert.equal(reset.status, 200)
+        assert.equal(reset.headers.getSetCookie().length, 0)
+
+        // The old logins and trusted devices are gone, and only the new password works.
+        assert.equal((await checkWithAccess(context, laptop.access)).status, 401)
+        assert.equal((await refreshSessionRequest(context, laptop.refresh)).status, 401)
+        assert.equal((await postJson(context.baseUrl, "/users/login", { email: context.email, password: context.password })).status, 400)
+        const again = await postJson(context.baseUrl, "/users/login", { email: context.email, password: "a-brand-new-password" }, `trustedDevice=${laptop.cookies.trustedDevice?.value}`)
+        assert.equal((await again.json() as { otpRequired?: boolean }).otpRequired, true)
+
+        // The code works once.
+        assert.equal((await postJson(context.baseUrl, "/users/reset-password", { email: context.email, code, newPassword: "another-new-password" })).status, 400)
+    })
+})
+
+test("a reset finishes an unconfirmed sign-up, because the code proves the email", async () => {
+    await withAppServer(async (baseUrl) => {
+        const email = `reset-unconfirmed-${randomUUID()}@example.test`
+
+        try {
+            await register(baseUrl, { name: "Forgetful", email, password: goodPassword, role: "CONSUMER" })
+            await postJson(baseUrl, "/users/forgot-password", { email })
+            const reset = await postJson(baseUrl, "/users/reset-password", { email, code: codeSentTo(email), newPassword: "the-password-i-chose-2" })
+            assert.equal(reset.status, 200)
+            assert.ok((await prisma.user.findUniqueOrThrow({ where: { email } })).emailVerifiedAt)
+        } finally {
+            await deleteRegistered([email])
+        }
+    })
+})
+
+test("changing the password needs the current one, ends the other logins and keeps this one", async () => {
+    await withSessionUser(async (context) => {
+        const laptop = await loginForSession(context)
+        const phone = await loginForSession(context)
+        const change = (body: Record<string, unknown>, access = laptop.access) =>
+            postJson(context.baseUrl, "/users/change-password", body, `token=${access}`)
+
+        assert.equal((await postJson(context.baseUrl, "/users/change-password", { currentPassword: context.password, newPassword: "a-brand-new-password" })).status, 401)
+        assert.equal((await change({ newPassword: "a-brand-new-password" })).status, 400)
+        const wrongCurrent = await change({ currentPassword: "not-my-password", newPassword: "a-brand-new-password" })
+        assert.equal(wrongCurrent.status, 400)
+        assert.deepEqual(await wrongCurrent.json(), { message: "Your current password is not right" })
+        assert.equal((await change({ currentPassword: context.password, newPassword: "short" })).status, 400)
+        assert.equal((await change({ currentPassword: context.password, newPassword: context.password })).status, 400)
+
+        const changed = await change({ currentPassword: context.password, newPassword: "a-brand-new-password" })
+        assert.equal(changed.status, 200)
+        const cookies = cookiesFrom(changed)
+        assert.ok(cookies.token?.value && cookies.refreshToken?.value)
+
+        // This device carries on with a fresh login; every other login has ended.
+        assert.equal((await checkWithAccess(context, cookies.token.value)).status, 200)
+        assert.equal((await checkWithAccess(context, laptop.access)).status, 401)
+        assert.equal((await checkWithAccess(context, phone.access)).status, 401)
+        assert.equal((await refreshSessionRequest(context, phone.refresh)).status, 401)
+        assert.equal((await refreshSessionRequest(context, cookies.refreshToken.value)).status, 200)
+
+        assert.equal((await postJson(context.baseUrl, "/users/login", { email: context.email, password: context.password })).status, 400)
+    })
+})
+
+test("accounts never confirmed within a week are removed, and old codes and device records are cleaned up", async () => {
+    const stale = await prisma.user.create({
+        data: { name: "Stale", email: `stale-${randomUUID()}@example.test`, passwordHash: "x", role: "CONSUMER", cart: { create: {} }, createdAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000) }
+    })
+    const recent = await prisma.user.create({ data: { name: "Recent", email: `recent-${randomUUID()}@example.test`, passwordHash: "x", role: "CONSUMER" } })
+    const oldConfirmed = await prisma.user.create({
+        data: { name: "Old", email: `old-${randomUUID()}@example.test`, passwordHash: "x", role: "CONSUMER", emailVerifiedAt: new Date(), createdAt: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) }
+    })
+
+    try {
+        const longAgo = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000)
+        await prisma.emailOtp.createMany({
+            data: [
+                { userId: oldConfirmed.id, purpose: "LOGIN", codeHash: "x", expiresAt: longAgo },
+                { userId: oldConfirmed.id, purpose: "LOGIN", codeHash: "y", expiresAt: new Date(Date.now() + 60_000) }
+            ]
+        })
+        await prisma.trustedDevice.createMany({
+            data: [
+                { userId: oldConfirmed.id, tokenHash: `old-${randomUUID()}`, expiresAt: longAgo },
+                { userId: oldConfirmed.id, tokenHash: `live-${randomUUID()}`, expiresAt: new Date(Date.now() + 60_000) }
+            ]
+        })
+
+        await purgeStaleAccountRecords()
+
+        assert.equal(await prisma.user.count({ where: { id: stale.id } }), 0)
+        assert.equal(await prisma.user.count({ where: { id: { in: [recent.id, oldConfirmed.id] } } }), 2)
+        assert.equal(await prisma.emailOtp.count({ where: { userId: oldConfirmed.id } }), 1)
+        assert.equal(await prisma.trustedDevice.count({ where: { userId: oldConfirmed.id } }), 1)
+    } finally {
+        await prisma.user.deleteMany({ where: { id: { in: [stale.id, recent.id, oldConfirmed.id] } } })
+    }
+})
+
+test("email settings: console mode for development, SMTP needs its settings, production must really send", () => {
+    assert.deepEqual(loadEmailConfig({}), { mode: "console", from: "Vendly <no-reply@vendly.local>" })
+    assert.throws(() => loadEmailConfig({ EMAIL_MODE: "carrier-pigeon" }), /EMAIL_MODE must be console or smtp/)
+    assert.throws(() => loadEmailConfig({ EMAIL_MODE: "smtp" }), /SMTP_HOST, SMTP_USER, SMTP_PASSWORD/)
+    assert.throws(() => loadEmailConfig({ EMAIL_MODE: "smtp", SMTP_HOST: "h", SMTP_USER: "u", SMTP_PASSWORD: "p", SMTP_PORT: "99999" }), /SMTP_PORT/)
+
+    const smtp = { EMAIL_MODE: "smtp", EMAIL_FROM: "Vendly <hello@example.test>", SMTP_HOST: "smtp.example.test", SMTP_USER: "u", SMTP_PASSWORD: "p" }
+    const config = loadEmailConfig(smtp)
+    assert.equal(config.mode, "smtp")
+    assert.equal(config.mode === "smtp" ? config.smtp.port : 0, 587)
+
+    assert.doesNotThrow(() => assertEmailEnvironment({}))
+    assert.throws(() => assertEmailEnvironment({ NODE_ENV: "production" }), /EMAIL_MODE must be smtp in production/)
+    assert.throws(() => assertEmailEnvironment({ ...smtp, NODE_ENV: "production", EMAIL_FROM: "" }), /EMAIL_FROM must be set in production/)
+    assert.doesNotThrow(() => assertEmailEnvironment({ ...smtp, NODE_ENV: "production" }))
+})
+
+// ---- Google sign-in ----
+
+async function withGoogleServer(emails: string[], run: (baseUrl: string) => Promise<void>) {
+    try {
+        await withAppServer(run)
+    } finally {
+        await deleteRegistered(emails)
+    }
+}
+
+test("a new person signs in with Google, says whether they buy or sell, and gets a confirmed account with no password", async () => {
+    const identity = newGoogleIdentity()
+
+    await withGoogleServer([identity.email], async (baseUrl) => {
+        const token = googleToken(identity)
+        const asked = await postJson(baseUrl, "/users/google", { credential: token })
+        assert.equal(asked.status, 200)
+        const askedBody = await asked.json() as { roleRequired: boolean; name: string; email: string }
+        assert.equal(askedBody.roleRequired, true)
+        assert.equal(askedBody.name, "Grace Hopper")
+        assert.equal(askedBody.email, identity.email)
+        assert.equal(asked.headers.getSetCookie().length, 0)
+        assert.equal(await prisma.user.count({ where: { email: identity.email } }), 0)
+
+        assert.equal((await postJson(baseUrl, "/users/google", { credential: token, role: "ADMIN" })).headers.getSetCookie().length, 0)
+        assert.equal(await prisma.user.count({ where: { email: identity.email } }), 0)
+
+        const created = await postJson(baseUrl, "/users/google", { credential: token, role: "CONSUMER" })
+        assert.equal(created.status, 200)
+        const createdBody = await created.json() as { role: string; isNewAccount: boolean }
+        assert.equal(createdBody.role, "CONSUMER")
+        assert.equal(createdBody.isNewAccount, true)
+        const cookies = cookiesFrom(created)
+        assert.ok(cookies.token?.value && cookies.refreshToken?.value)
+
+        const user = await prisma.user.findUniqueOrThrow({ where: { email: identity.email }, include: { cart: true } })
+        assert.equal(user.googleId, identity.googleId)
+        assert.equal(user.passwordHash, null)
+        assert.ok(user.emailVerifiedAt)
+        assert.ok(user.cart)
+        assert.equal(user.isAdmin, false)
+
+        const check = await fetch(`${baseUrl}/users/check`, { headers: { cookie: `token=${cookies.token.value}` } })
+        assert.equal((await check.json() as { hasPassword: boolean }).hasPassword, false)
+    })
+})
+
+test("a seller can sign up with Google and gets no cart", async () => {
+    const identity = newGoogleIdentity("seller")
+
+    await withGoogleServer([identity.email], async (baseUrl) => {
+        const created = await postJson(baseUrl, "/users/google", { credential: googleToken(identity), role: "SELLER" })
+        assert.equal(created.status, 200)
+        const user = await prisma.user.findUniqueOrThrow({ where: { email: identity.email }, include: { cart: true } })
+        assert.equal(user.role, "SELLER")
+        assert.equal(user.cart, null)
+    })
+})
+
+test("someone who signed up with Google logs straight back in without a code, from any device", async () => {
+    const identity = newGoogleIdentity()
+
+    await withGoogleServer([identity.email], async (baseUrl) => {
+        await postJson(baseUrl, "/users/google", { credential: googleToken(identity), role: "CONSUMER" })
+        const emailsBefore = emailsTo(identity.email).length
+
+        const again = await postJson(baseUrl, "/users/google", { credential: googleToken(identity) })
+        assert.equal(again.status, 200)
+        const body = await again.json() as { role: string; isNewAccount?: boolean }
+        assert.equal(body.role, "CONSUMER")
+        assert.equal(body.isNewAccount, undefined)
+        assert.ok(cookiesFrom(again).token?.value)
+        assert.equal(emailsTo(identity.email).length, emailsBefore)
+
+        // The same Google person is recognised by Google's id, even if the address on the Google account changed.
+        const moved = await postJson(baseUrl, "/users/google", { credential: googleToken({ ...identity, email: `changed-${randomUUID()}@example.test` }) })
+        assert.equal(moved.status, 200)
+        assert.ok(cookiesFrom(moved).token?.value)
+        assert.equal(await prisma.user.count({ where: { googleId: identity.googleId } }), 1)
+    })
+})
+
+test("Google sign-in refuses tokens that do not check out and says so when it is not set up", async () => {
+    await withAppServer(async (baseUrl) => {
+        for (const body of [{}, { credential: "" }, { credential: 123 }, { credential: "x".repeat(5000) }, { credential: "not-a-token-we-know" }]) {
+            const response = await postJson(baseUrl, "/users/google", body)
+            assert.equal(response.status, 400, JSON.stringify(body).slice(0, 40))
+            assert.deepEqual(await response.json(), { message: "Google sign-in could not be checked. Try again." })
+            assert.equal(response.headers.getSetCookie().length, 0)
+        }
+
+        const savedClientId = process.env.GOOGLE_CLIENT_ID
+        delete process.env.GOOGLE_CLIENT_ID
+        setGoogleVerifierForTesting(null)
+
+        try {
+            const unavailable = await postJson(baseUrl, "/users/google", { credential: "anything" })
+            assert.equal(unavailable.status, 503)
+            assert.deepEqual(await unavailable.json(), { message: "Google sign-in is not available right now" })
+        } finally {
+            setGoogleVerifierForTesting(async (credential) => googleIdentities.get(credential) ?? null)
+
+            if (savedClientId !== undefined) {
+                process.env.GOOGLE_CLIENT_ID = savedClientId
+            }
+        }
+    })
+})
+
+test("Google with the email of an existing account is only linked after the owner enters an emailed code", async () => {
+    await withSessionUser(async (context) => {
+        const identity = { googleId: `google-sub-${randomUUID()}`, email: context.email, name: "Grace Hopper" }
+        const token = googleToken(identity)
+
+        const asked = await postJson(context.baseUrl, "/users/google", { credential: token, role: "SELLER" })
+        assert.equal(asked.status, 200)
+        const body = await asked.json() as { linkRequired: boolean; email: string }
+        assert.equal(body.linkRequired, true)
+        assert.equal(body.email, context.email)
+        assert.equal(asked.headers.getSetCookie().length, 0)
+        assert.match(emailsTo(context.email).at(-1)?.subject ?? "", /Link Google to your account: \d{6}/)
+        assert.equal((await prisma.user.findUniqueOrThrow({ where: { id: context.userId } })).googleId, null)
+
+        const code = codeSentTo(context.email)
+        const wrong = code === "000000" ? "111111" : "000000"
+        assert.equal((await postJson(context.baseUrl, "/users/google/link", { credential: token, code: wrong })).status, 400)
+        assert.equal((await postJson(context.baseUrl, "/users/google/link", { credential: "unknown-token", code })).status, 400)
+
+        const linked = await postJson(context.baseUrl, "/users/google/link", { credential: token, code })
+        assert.equal(linked.status, 200)
+        // The account keeps its role and password; Google was only added to it.
+        assert.equal((await linked.json() as { role: string }).role, "CONSUMER")
+        assert.ok(cookiesFrom(linked).token?.value)
+        const user = await prisma.user.findUniqueOrThrow({ where: { id: context.userId } })
+        assert.equal(user.googleId, identity.googleId)
+        assert.ok(user.passwordHash)
+        assert.equal((await postJson(context.baseUrl, "/users/google/link", { credential: token, code })).status, 400)
+
+        // From now on Google signs in without a code, and a different Google account cannot take the address.
+        assert.ok(cookiesFrom(await postJson(context.baseUrl, "/users/google", { credential: googleToken(identity) })).token?.value)
+        const other = await postJson(context.baseUrl, "/users/google", { credential: googleToken({ ...identity, googleId: `google-sub-${randomUUID()}` }) })
+        assert.equal(other.status, 400)
+        assert.match((await other.json() as { message: string }).message, /different Google account/)
+    })
+})
+
+test("Google with the address of a sign-up that was never confirmed takes the account over and throws the typed password away", async () => {
+    await withAppServer(async (baseUrl) => {
+        const identity = newGoogleIdentity("unconfirmed")
+
+        try {
+            await register(baseUrl, { name: "Sneaky", email: identity.email, password: "sneaky-chosen-password", role: "SELLER" })
+            const oldCode = codeSentTo(identity.email)
+
+            const signedIn = await postJson(baseUrl, "/users/google", { credential: googleToken(identity) })
+            assert.equal(signedIn.status, 200)
+            assert.equal((await signedIn.json() as { role: string }).role, "SELLER")
+
+            const user = await prisma.user.findUniqueOrThrow({ where: { email: identity.email } })
+            assert.equal(user.googleId, identity.googleId)
+            assert.equal(user.passwordHash, null)
+            assert.ok(user.emailVerifiedAt)
+
+            assert.equal((await postJson(baseUrl, "/users/login", { email: identity.email, password: "sneaky-chosen-password" })).status, 400)
+            assert.equal((await postJson(baseUrl, "/users/verify-email", { email: identity.email, code: oldCode })).status, 400)
+        } finally {
+            await deleteRegistered([identity.email])
+        }
+    })
+})
+
+test("an administrator signing in with Google still enters an emailed code", async () => {
+    const identity = newGoogleIdentity("admin")
+
+    await withGoogleServer([identity.email], async (baseUrl) => {
+        await postJson(baseUrl, "/users/google", { credential: googleToken(identity), role: "CONSUMER" })
+        await prisma.user.update({ where: { email: identity.email }, data: { isAdmin: true } })
+
+        const step = await postJson(baseUrl, "/users/google", { credential: googleToken(identity) })
+        assert.equal(step.status, 200)
+        assert.equal((await step.json() as { otpRequired: boolean }).otpRequired, true)
+        assert.equal(step.headers.getSetCookie().length, 0)
+
+        const done = await postJson(baseUrl, "/users/login/verify", { email: identity.email, code: codeSentTo(identity.email) })
+        assert.equal(done.status, 200)
+        assert.equal(cookiesFrom(done).trustedDevice, undefined)
+    })
+})
+
+test("an account made with Google has no password to log in with until it sets one with an emailed code", async () => {
+    const identity = newGoogleIdentity()
+
+    await withGoogleServer([identity.email], async (baseUrl) => {
+        const created = await postJson(baseUrl, "/users/google", { credential: googleToken(identity), role: "CONSUMER" })
+        const first = cookiesFrom(created)
+        const second = cookiesFrom(await postJson(baseUrl, "/users/google", { credential: googleToken(identity) }))
+        assert.ok(first.token?.value && second.token?.value && second.refreshToken?.value)
+        const access = first.token.value
+
+        const passwordLogin = await postJson(baseUrl, "/users/login", { email: identity.email, password: "a-guessed-password" })
+        assert.equal(passwordLogin.status, 400)
+        assert.deepEqual(await passwordLogin.json(), { message: "Invalid email or password" })
+
+        const change = await postJson(baseUrl, "/users/change-password", { currentPassword: "anything-at-all", newPassword: "a-brand-new-password" }, `token=${access}`)
+        assert.equal(change.status, 400)
+        assert.equal((await change.json() as { code: string }).code, "NO_PASSWORD")
+
+        assert.equal((await postJson(baseUrl, "/users/set-password/send-code", {})).status, 401)
+        assert.equal((await postJson(baseUrl, "/users/set-password/send-code", {}, `token=${access}`)).status, 200)
+        assert.match(emailsTo(identity.email).at(-1)?.subject ?? "", /Set your password: \d{6}/)
+        const code = codeSentTo(identity.email)
+
+        const weak = await postJson(baseUrl, "/users/set-password", { code, newPassword: "short" }, `token=${access}`)
+        assert.equal(weak.status, 400)
+        assert.match((await weak.json() as { message: string }).message, /at least 10 characters/)
+        const wrong = code === "000000" ? "111111" : "000000"
+        assert.equal((await postJson(baseUrl, "/users/set-password", { code: wrong, newPassword: "a-brand-new-password" }, `token=${access}`)).status, 400)
+
+        const set = await postJson(baseUrl, "/users/set-password", { code, newPassword: "a-brand-new-password" }, `token=${access}`)
+        assert.equal(set.status, 200)
+        const after = cookiesFrom(set)
+        assert.ok(after.token?.value)
+        // This device carries on; the other login ended.
+        assert.equal((await fetch(`${baseUrl}/users/check`, { headers: { cookie: `token=${after.token.value}` } })).status, 200)
+        assert.equal((await fetch(`${baseUrl}/users/check`, { headers: { cookie: `token=${second.token.value}` } })).status, 401)
+
+        // Now it has a password, and the password route needs the usual code on a new device.
+        const loginStep = await postJson(baseUrl, "/users/login", { email: identity.email, password: "a-brand-new-password" })
+        assert.equal((await loginStep.json() as { otpRequired: boolean }).otpRequired, true)
+        assert.equal((await postJson(baseUrl, "/users/set-password/send-code", {}, `token=${after.token.value}`)).status, 400)
+        const again = await postJson(baseUrl, "/users/set-password", { code, newPassword: "yet-another-password" }, `token=${after.token.value}`)
+        assert.equal(again.status, 400)
+        assert.equal((await again.json() as { code: string }).code, "HAS_PASSWORD")
+    })
+})
+
+test("a seller with no password cannot change their bank account until they set one", async () => {
+    const identity = newGoogleIdentity("seller")
+
+    await withGoogleServer([identity.email], async (baseUrl) => {
+        const created = await postJson(baseUrl, "/users/google", { credential: googleToken(identity), role: "SELLER" })
+        const access = cookiesFrom(created).token?.value
+        assert.ok(access)
+        const user = await prisma.user.findUniqueOrThrow({ where: { email: identity.email } })
+        await prisma.sellerProfile.create({
+            data: {
+                userId: user.id,
+                businessName: "Google Shop",
+                state: "Lagos",
+                lga: "Ikeja",
+                location: "Ikeja, Lagos",
+                logoUrl: "https://example.test/logo.png",
+                slug: `google-shop-${randomUUID()}`,
+                shippingPolicy: "FREE",
+                shippingCost: null
+            }
+        })
+
+        const response = await fetch(`${baseUrl}/seller/payout/accounts`, {
+            method: "PUT",
+            headers: { "content-type": "application/json", cookie: `token=${access}` },
+            body: JSON.stringify(changeBankRequest)
+        })
+        assert.equal(response.status, 403)
+        assert.equal((await response.json() as { code: string }).code, "PAYOUT_PASSWORD_REQUIRED")
     })
 })

@@ -19,6 +19,7 @@
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^26.4.0",
+    "@types/nodemailer": "^8.0.2",
     "prisma": "^6.19.3",
     "tsx": "^4.23.12",
     "typescript": "^7.0.2"
@@ -30,7 +31,9 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "google-auth-library": "^11.3.1",
     "jsonwebtoken": "^9.0.3",
-    "nigerian-states-and-lgas": "^1.0.8"
+    "nigerian-states-and-lgas": "^1.0.8",
+    "nodemailer": "^10.1.7"
   }
 }

@@ -36,7 +36,10 @@ model User {
   id            Int            @id @default(autoincrement())
   name          String
   email         String         @unique
-  passwordHash  String
+  // Null for an account created with Google that has not set a password yet.
+  passwordHash  String?
+  // Google's stable id for this person (the "sub" of their sign-in token).
+  googleId      String?        @unique
   // Administrators can issue refunds. Only scripts/makeAdmin.ts sets this; registration never does.
   isAdmin       Boolean        @default(false)
   listings      Listing[]
@@ -52,6 +55,11 @@ model User {
   refreshTokens RefreshToken[]
   // Set by "log out everywhere" and password changes: access tokens issued before this stop working at once.
   sessionsValidFrom DateTime?
+  // Null until the person proves they own the email (a code we email, or Google). Unverified accounts cannot log in.
+  emailVerifiedAt DateTime?
+  createdAt     DateTime       @default(now())
+  emailOtps     EmailOtp[]
+  trustedDevices TrustedDevice[]
 }
 
 enum Role {
@@ -562,4 +570,43 @@ model RefreshToken {
   @@index([userId])
   @@index([familyId])
   @@index([expiresAt])
+}
+
+enum OtpPurpose {
+  VERIFY_EMAIL
+  LOGIN
+  PASSWORD_RESET
+  GOOGLE_LINK
+  SET_PASSWORD
+}
+
+// A one-time code we email. Only a keyed hash of the code is stored.
+model EmailOtp {
+  id         Int        @id @default(autoincrement())
+  userId     Int
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  purpose    OtpPurpose
+  codeHash   String
+  attempts   Int        @default(0)
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime   @default(now())
+
+  @@index([userId, purpose])
+  @@index([expiresAt])
+}
+
+// A browser that proved itself with a code, so later logins from it skip the code until it expires.
+model TrustedDevice {
+  id         Int       @id @default(autoincrement())
+  userId     Int
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash  String    @unique
+  userAgent  String?
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime  @default(now())
+  expiresAt  DateTime
+  revokedAt  DateTime?
+
+  @@index([userId])
 }

@@ -20,6 +20,7 @@ export type PayoutErrorCode =
     | "PAYOUT_SETUP_IN_PROGRESS"
     | "PAYOUT_SETUP_INCOMPLETE"
     | "PAYOUT_PASSWORD_INCORRECT"
+    | "PAYOUT_PASSWORD_REQUIRED"
     | "PAYOUT_ACCOUNTS_NOT_SET_UP"
     | "PAYOUT_ACCOUNT_UNCHANGED"
 
@@ -410,6 +411,11 @@ export const changePayoutBankAccount = async (req: Request, res: Response) => {
         if (!profile) {
             res.status(404).send({ message: "Store profile not found" })
             return
+        }
+
+        // An account created with Google has no password to confirm with; it must set one first.
+        if (!profile.user.passwordHash) {
+            throw new PayoutRequestError(403, "Set a password on your account before changing your bank account", "PAYOUT_PASSWORD_REQUIRED")
         }
 
         // 403 rather than 401: the session is valid, and the frontend signs the user out on 401.
