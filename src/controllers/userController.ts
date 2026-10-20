@@ -1,13 +1,49 @@
 import bcrypt from "bcrypt"
 import prisma from "../lib/prisma.js"
 import type { Request, Response } from "express"
+import { Prisma } from "../generated/prisma/client.js"
 import { clearSessionCookies, endAllSessions, endSession, refreshSession, startSession } from "../lib/sessions.js"
+import { isRegistrationRole, normaliseEmail, validateName, validatePassword } from "../lib/accountRules.js"
+
+// Compared against when an email is unknown, so a wrong email takes as long to refuse as a wrong
+// password and the response time does not reveal which emails are registered.
+const timingEqualiserHash = bcrypt.hashSync("timing-equaliser", 10)
+
+const emailTakenMessage = "The email has already been registered"
 
 export const createUser = async (req: Request, res: Response) => {
-    const { name, email, password, role } = req.body;
+    const { name: rawName, email: rawEmail, password, role } = req.body;
 
-    if (!name || !email || !password || !role) {
+    if (!rawName || !rawEmail || !password || !role) {
         res.status(400).send({ message: "All areas are required" });
+        return;
+    }
+
+    const nameProblem = validateName(rawName);
+
+    if (nameProblem) {
+        res.status(400).send({ message: nameProblem });
+        return;
+    }
+
+    const email = normaliseEmail(rawEmail);
+
+    if (!email) {
+        res.status(400).send({ message: "Enter a valid email address" });
+        return;
+    }
+
+    // Only these two roles can be chosen at registration; administrators are made by a script.
+    if (!isRegistrationRole(role)) {
+        res.status(400).send({ message: "Role must be CONSUMER or SELLER" });
+        return;
+    }
+
+    const name = (rawName as string).trim();
+    const passwordProblem = validatePassword(password, { email, name });
+
+    if (passwordProblem) {
+        res.status(400).send({ message: passwordProblem });
         return;
     }
 
@@ -17,7 +53,7 @@ export const createUser = async (req: Request, res: Response) => {
 
     if (emailCheck) {
         res.status(400).send({
-            message: "The email has already been registered"
+            message: emailTakenMessage
         });
         return;
     }
@@ -51,6 +87,12 @@ export const createUser = async (req: Request, res: Response) => {
         res.send({ message: "Registration successful" });
 
     } catch (error) {
+        // Two sign-ups with the same email at the same moment: the database lets only one through.
+        if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
+            res.status(400).send({ message: emailTakenMessage });
+            return;
+        }
+
         console.error(error);
         res.status(500).send({
             message: "Sorry there is an issue on our end"
@@ -59,23 +101,25 @@ export const createUser = async (req: Request, res: Response) => {
 };
 
 export const loginUser = async(req: Request, res: Response) =>{
-    const {email, password} = req.body
+    const {email: rawEmail, password} = req.body
 
-    if(!email || !password){
+    if(!rawEmail || !password){
         res.status(400).send({message:"All areas are required"})
         return
     }
 
-    const existingUser = await prisma.user.findUnique({where:{email}})
+    const email = normaliseEmail(rawEmail)
+    // A password that is not text, or longer than any allowed password, cannot be right.
+    const passwordIsPlausible = typeof password === "string" && Buffer.byteLength(password, "utf8") <= 1024
+    const existingUser = email ? await prisma.user.findUnique({where:{email}}) : null
 
-    if (!existingUser){
-        res.status(400).send({message:"Invalid email or password"})
-        return
-    }
+    // Always do one password comparison, so unknown emails and wrong passwords take the same time.
+    const passwordMatches = await bcrypt.compare(
+        passwordIsPlausible ? password : "not-a-password",
+        existingUser?.passwordHash ?? timingEqualiserHash
+    )
 
-    const passwordMatches = await bcrypt.compare(password, existingUser.passwordHash)
-
-    if(!passwordMatches){
+    if(!existingUser || !passwordIsPlausible || !passwordMatches){
         res.status(400).send({message:"Invalid email or password"})
         return
     }

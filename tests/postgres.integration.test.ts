@@ -3154,11 +3154,13 @@ test("answers unknown routes and missing login cookies with JSON errors", async 
 test("logs unexpected errors outside controller error handling and returns a generic JSON 500", async (t) => {
     await withAppServer(async (baseUrl) => {
         const consoleError = t.mock.method(console, "error", () => {})
+        // The login handler has no error handling around its password check, so a failure there reaches the app's own handler.
+        t.mock.method(bcrypt, "compare", async () => { throw new Error("simulated failure") })
 
         const response = await fetch(`${baseUrl}/users/login`, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ email: { not: "a string" }, password: "integration-test-not-a-password" })
+            body: JSON.stringify({ email: "someone@example.test", password: "integration-test-not-a-password" })
         })
         assert.equal(response.status, 500)
         assert.deepEqual(await readJsonResponse(response), { message: "Sorry there is an issue on our end" })
@@ -6497,5 +6499,139 @@ test("an access token for an account that no longer exists is refused", async ()
         await prisma.user.delete({ where: { id: context.userId } })
         assert.equal((await checkWithAccess(context, access)).status, 401)
         // The fixture cleanup deletes by id and tolerates the account being gone already.
+    })
+})
+
+// ---- Registration and login rules ----
+
+const goodPassword = "a-long-test-password"
+
+function register(baseUrl: string, body: Record<string, unknown>) {
+    return fetch(`${baseUrl}/users/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+    })
+}
+
+async function deleteRegistered(emails: string[]) {
+    await prisma.cart.deleteMany({ where: { user: { email: { in: emails } } } })
+    await prisma.user.deleteMany({ where: { email: { in: emails } } })
+}
+
+test("registration refuses weak passwords, bad emails, bad names and any role but shopper or seller", async () => {
+    await withAppServer(async (baseUrl) => {
+        const email = `rules-${randomUUID()}@example.test`
+        const valid = { name: "Ada Obi", email, password: goodPassword, role: "CONSUMER" }
+        const refused = async (changes: Record<string, unknown>, message: string | RegExp) => {
+            const response = await register(baseUrl, { ...valid, ...changes })
+            assert.equal(response.status, 400, JSON.stringify(changes))
+            const body = await response.json() as { message: string }
+            assert.match(body.message, message instanceof RegExp ? message : new RegExp(message))
+        }
+
+        await refused({ password: "short" }, "at least 10 characters")
+        await refused({ password: "123456789" }, "at least 10 characters")
+        await refused({ password: "Password123" }, "too common")
+        await refused({ password: "qwertyuiop" }, "too common")
+        await refused({ password: "aaaaaaaaaaaa" }, "too common")
+        await refused({ password: "x".repeat(80) }, "72 bytes")
+        await refused({ password: email }, "same as your email")
+        await refused({ password: 12345678901234 }, "Enter a password")
+        await refused({ email: "not-an-email" }, "valid email")
+        await refused({ email: "two@@example.test" }, "valid email")
+        await refused({ email: `${"a".repeat(250)}@example.test` }, "valid email")
+        await refused({ email: { $ne: null } }, "valid email")
+        await refused({ name: "n".repeat(81) }, "80 characters")
+        await refused({ name: "   " }, /name|required/i)
+        await refused({ name: ["Ada"] }, "Enter your name")
+        await refused({ role: "ADMIN" }, "CONSUMER or SELLER")
+        await refused({ role: "consumer" }, "CONSUMER or SELLER")
+        await refused({ role: { x: 1 } }, "CONSUMER or SELLER")
+
+        assert.equal(await prisma.user.count({ where: { email } }), 0)
+    })
+})
+
+test("registration stores the email trimmed and lowercase, and the same address cannot register twice", async () => {
+    await withAppServer(async (baseUrl) => {
+        const local = `mixed-${randomUUID()}`
+        const stored = `${local}@example.test`.toLowerCase()
+
+        try {
+            const first = await register(baseUrl, { name: "  Ada Obi  ", email: `  ${local.toUpperCase()}@Example.TEST `, password: goodPassword, role: "SELLER" })
+            assert.equal(first.status, 200)
+            const user = await prisma.user.findUniqueOrThrow({ where: { email: stored } })
+            assert.equal(user.name, "Ada Obi")
+            assert.equal(user.role, "SELLER")
+            assert.equal(user.isAdmin, false)
+
+            const again = await register(baseUrl, { name: "Someone", email: stored.toUpperCase(), password: goodPassword, role: "CONSUMER" })
+            assert.equal(again.status, 400)
+            assert.deepEqual(await again.json(), { message: "The email has already been registered" })
+
+            // Logging in works whatever the capital letters or spaces.
+            const login = await fetch(`${baseUrl}/users/login`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ email: ` ${stored.toUpperCase()} `, password: goodPassword })
+            })
+            assert.equal(login.status, 200)
+            assert.equal((await login.json() as { role: string }).role, "SELLER")
+        } finally {
+            await deleteRegistered([stored])
+        }
+    })
+})
+
+test("two registrations with the same email at the same moment give one account and a friendly message, never a server error", async () => {
+    await withAppServer(async (baseUrl) => {
+        const email = `race-${randomUUID()}@example.test`
+
+        try {
+            const responses = await Promise.all(Array.from({ length: 4 }, () =>
+                register(baseUrl, { name: "Racer", email, password: goodPassword, role: "CONSUMER" })))
+            const statuses = responses.map((response) => response.status).sort()
+            assert.deepEqual(statuses, [200, 400, 400, 400])
+
+            for (const response of responses.filter((candidate) => candidate.status === 400)) {
+                assert.deepEqual(await response.json(), { message: "The email has already been registered" })
+            }
+
+            assert.equal(await prisma.user.count({ where: { email } }), 1)
+        } finally {
+            await deleteRegistered([email])
+        }
+    })
+})
+
+test("login gives the same answer for an unknown email, a wrong password and a malformed request, and tolerates odd input", async () => {
+    await withSessionUser(async (context) => {
+        const attempt = (body: Record<string, unknown>) => fetch(`${context.baseUrl}/users/login`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(body)
+        })
+        const sameRefusal = { message: "Invalid email or password" }
+
+        const unknown = await attempt({ email: `nobody-${randomUUID()}@example.test`, password: goodPassword })
+        const wrong = await attempt({ email: context.email, password: "definitely-not-it" })
+        assert.equal(unknown.status, 400)
+        assert.equal(wrong.status, 400)
+        assert.deepEqual(await unknown.json(), sameRefusal)
+        assert.deepEqual(await wrong.json(), sameRefusal)
+
+        for (const body of [
+            { email: { $ne: null }, password: goodPassword },
+            { email: context.email, password: { $ne: null } },
+            { email: context.email, password: ["a"] },
+            { email: context.email, password: "x".repeat(5000) }
+        ]) {
+            const response = await attempt(body)
+            assert.equal(response.status, 400, JSON.stringify(body).slice(0, 80))
+            assert.deepEqual(await response.json(), sameRefusal)
+        }
+
+        assert.equal((await attempt({ email: context.email.toUpperCase(), password: context.password })).status, 200)
     })
 })
