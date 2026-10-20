@@ -4,12 +4,15 @@ import type { Request, Response } from "express"
 import { Prisma } from "../generated/prisma/client.js"
 import { clearSessionCookies, endAllSessions, endSession, refreshSession, startSession } from "../lib/sessions.js"
 import { isRegistrationRole, normaliseEmail, validateName, validatePassword } from "../lib/accountRules.js"
+import { sendEmail } from "../lib/email/index.js"
+import { accountExistsEmail } from "../lib/email/templates.js"
+import { issueOtp } from "../lib/otp.js"
+import { isTrustedDevice } from "../lib/trustedDevices.js"
 
 // Compared against when an email is unknown, so a wrong email takes as long to refuse as a wrong
 // password and the response time does not reveal which emails are registered.
 const timingEqualiserHash = bcrypt.hashSync("timing-equaliser", 10)
 
-const emailTakenMessage = "The email has already been registered"
 
 export const createUser = async (req: Request, res: Response) => {
     const { name: rawName, email: rawEmail, password, role } = req.body;
@@ -47,49 +50,58 @@ export const createUser = async (req: Request, res: Response) => {
         return;
     }
 
-    const emailCheck = await prisma.user.findUnique({
-        where: { email }
-    });
-
-    if (emailCheck) {
-        res.status(400).send({
-            message: emailTakenMessage
-        });
-        return;
-    }
-
     const passwordHash = await bcrypt.hash(password, 10);
+    const existing = await prisma.user.findUnique({ where: { email } });
+
+    // The answer is the same for every address, so sign-up cannot be used to find out who is registered.
+    const checkYourEmail = {
+        message: "Check your email for a code to finish creating your account",
+        email
+    };
 
     try {
-        const newUser = await prisma.$transaction(async (tx) => {
-            const user = await tx.user.create({
-                data: {
-                    name,
-                    email,
-                    passwordHash,
-                    role
-                }
+        if (existing?.emailVerifiedAt) {
+            // The person who owns the account is told, by email, that someone tried to register with their address.
+            await sendEmail(accountExistsEmail(email)).catch((error) => {
+                console.error("Could not send the account-exists notice", { reason: error instanceof Error ? error.message : undefined });
             });
+            res.send(checkYourEmail);
+            return;
+        }
+
+        // A sign-up that was never confirmed is simply started again with the new details, so nobody can
+        // block an address by registering it without confirming. It has no logins to protect.
+        const user = await prisma.$transaction(async (tx) => {
+            const saved = existing
+                ? await tx.user.update({ where: { id: existing.id }, data: { name, passwordHash, role } })
+                : await tx.user.create({ data: { name, email, passwordHash, role } });
 
             if (role === "CONSUMER") {
-                await tx.cart.create({
-                    data: {
-                        userId: user.id
-                    }
-                });
+                await tx.cart.upsert({ where: { userId: saved.id }, create: { userId: saved.id }, update: {} });
+            } else {
+                await tx.cart.deleteMany({ where: { userId: saved.id } });
             }
 
-            return user;
+            return saved;
         });
 
-        await startSession(req, res, newUser.id);
+        try {
+            if (existing) {
+                // Starting over: a code sent for the earlier details must not confirm the new ones.
+                await prisma.emailOtp.updateMany({ where: { userId: user.id, purpose: "VERIFY_EMAIL", consumedAt: null }, data: { consumedAt: new Date() } });
+            }
 
-        res.send({ message: "Registration successful" });
+            await issueOtp(user, "VERIFY_EMAIL");
+        } catch (error) {
+            console.error("Could not send a code", { userId: user.id, purpose: "VERIFY_EMAIL", reason: error instanceof Error ? error.message : undefined });
+        }
+
+        res.send(checkYourEmail);
 
     } catch (error) {
-        // Two sign-ups with the same email at the same moment: the database lets only one through.
+        // Two sign-ups with the same email at the same moment: the database lets only one create the account.
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-            res.status(400).send({ message: emailTakenMessage });
+            res.send(checkYourEmail);
             return;
         }
 
@@ -124,10 +136,42 @@ export const loginUser = async(req: Request, res: Response) =>{
         return
     }
     
-    await startSession(req, res, existingUser.id)
+    // An account that never confirmed its email cannot log in. The password was right, so it is safe to say why.
+    if (!existingUser.emailVerifiedAt) {
+        try {
+            await issueOtp(existingUser, "VERIFY_EMAIL")
+        } catch (error) {
+            console.error("Could not send a code", { userId: existingUser.id, purpose: "VERIFY_EMAIL", reason: error instanceof Error ? error.message : undefined })
+        }
+
+        res.status(403).send({
+            code: "EMAIL_NOT_VERIFIED",
+            message: "Confirm your email to continue. We have sent you a code.",
+            email: existingUser.email
+        })
+        return
+    }
+
+    // A browser that entered a code in the last 30 days goes straight in; administrators always enter a code.
+    if (!existingUser.isAdmin && await isTrustedDevice(req, existingUser.id)) {
+        await startSession(req, res, existingUser.id)
+        res.send({
+            message: "Login Successful",
+            role: existingUser.role
+        })
+        return
+    }
+
+    try {
+        await issueOtp(existingUser, "LOGIN")
+    } catch (error) {
+        console.error("Could not send a code", { userId: existingUser.id, purpose: "LOGIN", reason: error instanceof Error ? error.message : undefined })
+    }
+
     res.send({
-        message: "Login Successful",
-        role: existingUser.role
+        otpRequired: true,
+        message: "Enter the code we emailed you to log in on this device.",
+        email: existingUser.email
     })
 }
 
@@ -185,7 +229,8 @@ export const checkAuth = async (req: Request, res: Response) => {
             where: { id: userId },
             select: {
                 role: true,
-                isAdmin: true
+                isAdmin: true,
+                passwordHash: true
             }
         });
 
@@ -200,7 +245,9 @@ export const checkAuth = async (req: Request, res: Response) => {
             message: "Authenticated",
             role: user.role,
             // Lets the frontend show the administrator screens. The server still checks it on every admin request.
-            isAdmin: user.isAdmin
+            isAdmin: user.isAdmin,
+            // False for an account created with Google that has not set a password yet.
+            hasPassword: user.passwordHash !== null
         });
 
     } catch (error) {

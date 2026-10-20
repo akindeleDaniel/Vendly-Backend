@@ -1,6 +1,7 @@
 import { syncPayment } from "../../controllers/paymentController.js"
 import { escalateOverdueDisputes } from "../disputes.js"
 import { checkOpenRefunds } from "./refunds.js"
+import { purgeStaleAccountRecords } from "../accountCleanup.js"
 import { purgeOldRefreshTokens } from "../sessions.js"
 import prisma from "../prisma.js"
 
@@ -89,6 +90,7 @@ export function startPaymentChecker(): void {
 
         try {
             await purgeOldRefreshTokens()
+            await purgeStaleAccountRecords()
         } catch (error) {
             console.error("Old login cleanup failed", { reason: error instanceof Error ? error.message : undefined })
         } finally {

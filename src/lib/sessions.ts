@@ -140,14 +140,15 @@ export async function endSession(req: Request, now = new Date()) {
     }
 }
 
-// Ends every login of this user, on every device (log out everywhere, password change). Access tokens
-// issued before now stop working at once, not when they expire.
+// Ends every login of this user, on every device (log out everywhere, password change), and forgets every
+// trusted device so each needs a code again. Access tokens issued before now stop working at once.
 export async function endAllSessions(userId: number, now = new Date()) {
     await prisma.$transaction([
         prisma.refreshToken.updateMany({
             where: { userId, revokedAt: null },
             data: { revokedAt: now, revokedReason: "LOGOUT_ALL" }
         }),
+        prisma.trustedDevice.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: now } }),
         prisma.user.update({ where: { id: userId }, data: { sessionsValidFrom: now } })
     ])
 }
