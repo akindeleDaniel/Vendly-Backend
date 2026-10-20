@@ -1,6 +1,7 @@
 import { Prisma } from "../../generated/prisma/client.js"
 import { acquireCheckoutCreationLock } from "../../controllers/checkoutController.js"
 import prisma from "../prisma.js"
+import { allocateProportionally, applyRecoveredAmount } from "../liabilities.js"
 import type { SellerShare } from "./types.js"
 
 export type SettlementResult = "settled" | "already_settled" | "needs_review"
@@ -51,7 +52,7 @@ async function settleOnce(attemptId: number): Promise<SettlementResult> {
     return prisma.$transaction(async (tx) => {
         const paymentAttempt = await tx.paymentAttempt.findUniqueOrThrow({
             where: { id: attemptId },
-            select: { status: true, provider: true, sellerShares: true, checkoutId: true, checkout: { select: { userId: true } } }
+            select: { status: true, provider: true, sellerShares: true, vendlyShareKobo: true, checkoutId: true, checkout: { select: { userId: true } } }
         })
 
         if (paymentAttempt.status !== "SUCCESS") {
@@ -68,8 +69,10 @@ async function settleOnce(attemptId: number): Promise<SettlementResult> {
                 orders: {
                     select: {
                         id: true,
+                        sellerId: true,
                         status: true,
                         total: true,
+                        liabilityDeduction: true,
                         seller: {
                             select: {
                                 sellerProfile: {
@@ -143,19 +146,45 @@ async function settleOnce(attemptId: number): Promise<SettlementResult> {
         // Record what the provider reported for each seller's share, so sellers see the real fee.
         const shares = Array.isArray(paymentAttempt.sellerShares) ? paymentAttempt.sellerShares as SellerShare[] : []
 
+        // Vendly may have kept part of some seller orders to recover what those sellers owe for earlier
+        // refunds. Paystack reports Vendly's share as one lump, so it is shared across those orders in
+        // proportion to what each planned to give up; Flutterwave reports it for each seller.
+        const plannedOrders = checkout.orders.filter((order) => order.liabilityDeduction.greaterThan(0))
+        const lumpShares = paymentAttempt.vendlyShareKobo === null
+            ? null
+            : allocateProportionally(
+                paymentAttempt.vendlyShareKobo,
+                plannedOrders.map((order) => ({ key: order.id, weight: order.liabilityDeduction.times(100).toNumber() }))
+            )
+
         for (const order of checkout.orders) {
             const subaccountCode = order.seller.sellerProfile?.payoutAccounts[0]?.subaccountCode
             const share = shares.find((candidate) => candidate.subaccountCode === subaccountCode)
+            const totalKobo = order.total.times(100).toNumber()
+            const plannedKobo = order.liabilityDeduction.times(100).toNumber()
+            // What Vendly actually kept: the provider's per-seller figure, else this order's part of its
+            // reported share, else what was planned if the provider reported nothing.
+            const retainedKobo = plannedKobo === 0 ? 0 : (share?.retainedKobo ?? lumpShares?.get(order.id) ?? plannedKobo)
 
             if (share) {
-                const totalKobo = order.total.times(100).toNumber()
                 await tx.order.update({
                     where: { id: order.id },
                     data: {
                         sellerReceives: new Prisma.Decimal(share.receivedKobo).dividedBy(100),
-                        providerFee: new Prisma.Decimal(share.feeKobo ?? totalKobo - share.receivedKobo).dividedBy(100)
+                        providerFee: new Prisma.Decimal(share.feeKobo ?? totalKobo - share.receivedKobo - retainedKobo).dividedBy(100)
                     }
                 })
+            }
+
+            if (plannedKobo > 0) {
+                await tx.order.update({
+                    where: { id: order.id },
+                    data: { liabilityDeduction: new Prisma.Decimal(retainedKobo).dividedBy(100) }
+                })
+
+                if (retainedKobo > 0) {
+                    await applyRecoveredAmount(tx, order.sellerId, order.id, retainedKobo)
+                }
             }
         }
 

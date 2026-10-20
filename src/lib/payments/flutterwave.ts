@@ -1,6 +1,6 @@
 import { timingSafeEqual } from "node:crypto"
 import { readDataString, sendProviderRequest } from "./providerRequest.js"
-import { PaymentProviderError, type PaymentProviderAdapter, type SellerShare } from "./types.js"
+import { PaymentProviderError, type PaymentProviderAdapter, type ProviderRefund, type SellerShare } from "./types.js"
 
 function readDataId(body: Record<string, unknown>): string {
     const id = (body.data as { id?: unknown } | undefined)?.id
@@ -43,14 +43,50 @@ function readSellerShares(data: Record<string, unknown>): SellerShare[] | null {
         const parsed = JSON.parse(info) as Record<string, unknown>
         const shares = Object.entries(parsed)
             .filter(([key]) => key.startsWith("RS_"))
-            .map(([subaccountCode, value]) => ({
-                subaccountCode,
-                receivedKobo: Math.round(Number((value as { subaccount_earning?: unknown })?.subaccount_earning) * 100),
-                feeKobo: null
-            }))
+            .map(([subaccountCode, value]) => {
+                const commission = (value as { merchant_commission?: unknown })?.merchant_commission
+                return {
+                    subaccountCode,
+                    receivedKobo: Math.round(Number((value as { subaccount_earning?: unknown })?.subaccount_earning) * 100),
+                    feeKobo: null,
+                    // The part of this seller's order Vendly kept, in kobo.
+                    retainedKobo: commission === undefined || commission === null ? null : Math.round(Number(commission) * 100)
+                }
+            })
         return shares.length > 0 && shares.every((share) => Number.isSafeInteger(share.receivedKobo)) ? shares : null
     } catch {
         return null
+    }
+}
+
+// What Flutterwave reports Vendly itself kept from the split (its commission), in kobo.
+function readVendlyShareKobo(shares: SellerShare[] | null): number | null {
+    if (!shares || shares.some((share) => share.retainedKobo === undefined || share.retainedKobo === null)) {
+        return null
+    }
+
+    return shares.reduce((sum, share) => sum + (share.retainedKobo ?? 0), 0)
+}
+
+// A Flutterwave refund. Its status is "completed" (or a variant such as "completed-mpgs") when done.
+function toProviderRefund(data: Record<string, unknown>): ProviderRefund {
+    const providerStatus = String(data.status ?? "")
+    const amount = Number(data.amount_refunded ?? data.AmountRefunded)
+
+    if ((typeof data.id !== "number" && typeof data.id !== "string") || !providerStatus || !Number.isFinite(amount)) {
+        throw new PaymentProviderError("unavailable", "Unexpected provider response", "Missing refund fields")
+    }
+
+    const createdAt = typeof data.created_at === "string" ? new Date(data.created_at) : null
+
+    return {
+        providerRefundId: String(data.id),
+        outcome: providerStatus.startsWith("completed") ? "succeeded" : providerStatus === "failed" ? "failed" : "processing",
+        providerStatus,
+        amountKobo: Math.round(amount * 100),
+        awaitingFunds: false,
+        expectedAt: null,
+        createdAt: createdAt && !Number.isNaN(createdAt.getTime()) ? createdAt : null
     }
 }
 
@@ -92,14 +128,16 @@ export const flutterwaveAdapter: PaymentProviderAdapter = {
             eventType: body.event,
             reference: typeof body.data.tx_ref === "string" ? body.data.tx_ref : null,
             // Sent for both successful and failed charges.
-            isPaymentEvent: body.event === "charge.completed"
+            isPaymentEvent: body.event === "charge.completed",
+            isRefundEvent: false
         }
     },
 
     async initializePayment(input) {
-        // A ratio split by each seller's total, with no Vendly commission, takes Flutterwave's fee off
-        // the settled amount before splitting, so each seller bears it on their own share (confirmed in
-        // test mode). The ratios are reduced to their smallest whole numbers.
+        // A ratio split of what each seller receives, with a flat commission for the part Vendly keeps
+        // (0 normally), takes Flutterwave's fee off the settled amount before splitting, so the sellers
+        // bear it and Vendly's commission arrives in full (confirmed in test mode). The ratios are
+        // reduced to their smallest whole numbers.
         const divisor = input.splits.reduce((gcd, split) => greatestCommonDivisor(gcd, split.amountKobo), 0) || 1
         const body = await flutterwaveRequest("/payments", {
             method: "POST",
@@ -113,7 +151,7 @@ export const flutterwaveAdapter: PaymentProviderAdapter = {
                     id: split.subaccountCode,
                     transaction_split_ratio: split.amountKobo / divisor,
                     transaction_charge_type: "flat",
-                    transaction_charge: 0
+                    transaction_charge: split.retainedKobo / 100
                 }))
             }
         })
@@ -142,6 +180,8 @@ export const flutterwaveAdapter: PaymentProviderAdapter = {
             throw new PaymentProviderError("unavailable", "Unexpected provider response", "Missing verification fields")
         }
 
+        const sellerShares = readSellerShares(data)
+
         return {
             outcome: successStatuses.has(providerStatus)
                 ? "success"
@@ -151,8 +191,44 @@ export const flutterwaveAdapter: PaymentProviderAdapter = {
             amountKobo: Math.round(amount * 100),
             currency: String(data.currency ?? ""),
             transactionId: data.id === undefined || data.id === null ? null : String(data.id),
-            sellerShares: readSellerShares(data)
+            sellerShares,
+            vendlyShareKobo: readVendlyShareKobo(sellerShares)
         }
+    },
+
+    // Written to Flutterwave's documentation: its test mode answers every refund with an internal
+    // "Service error", so refunds could not be exercised end to end. Confirm in live mode.
+    async createRefund(input) {
+        if (!input.transactionId) {
+            throw new PaymentProviderError("unavailable", "Flutterwave transaction ID is missing", "No providerTransactionId saved")
+        }
+
+        const body = await flutterwaveRequest(`/transactions/${encodeURIComponent(input.transactionId)}/refund`, {
+            method: "POST",
+            body: { amount: input.amountKobo / 100, comments: input.customerNote ?? input.merchantNote }
+        })
+        return toProviderRefund((body.data ?? {}) as Record<string, unknown>)
+    },
+
+    async findRefunds({ transactionId, providerRefundId }) {
+        if (providerRefundId) {
+            const body = await flutterwaveRequest(`/refunds/${encodeURIComponent(providerRefundId)}`)
+            return [toProviderRefund((body.data ?? {}) as Record<string, unknown>)]
+        }
+
+        if (!transactionId) {
+            throw new PaymentProviderError("unavailable", "Flutterwave transaction ID is missing", "No providerTransactionId saved")
+        }
+
+        const body = await flutterwaveRequest(`/transactions/${encodeURIComponent(transactionId)}/refunds`)
+        const refunds = Array.isArray(body.data) ? body.data as Array<Record<string, unknown>> : []
+        return refunds.map((refund) => toProviderRefund(refund))
+    },
+
+    async getBalanceKobo() {
+        const body = await flutterwaveRequest("/balances/NGN")
+        const available = Number((body.data as { available_balance?: unknown } | null | undefined)?.available_balance)
+        return Number.isFinite(available) ? Math.round(available * 100) : null
     },
 
     async resolveAccount({ bankCode, accountNumber }) {

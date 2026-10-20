@@ -79,6 +79,41 @@ const orderItemSelect = {
     select: { listingId: true, title: true, unitPrice: true, quantity: true }
 }
 
+// What a buyer sees of a refund: how much, where it stands and the note written for them.
+const customerRefundSelect = {
+    orderBy: { id: "asc" as const },
+    select: { reference: true, amount: true, status: true, customerNote: true, expectedAt: true, createdAt: true, completedAt: true }
+}
+
+function toCustomerRefund(refund: { reference: string; amount: Prisma.Decimal; status: string; customerNote: string | null; expectedAt: Date | null; createdAt: Date; completedAt: Date | null }) {
+    return {
+        reference: refund.reference,
+        amount: money(refund.amount),
+        status: refund.status,
+        note: refund.customerNote,
+        expectedAt: refund.expectedAt,
+        createdAt: refund.createdAt,
+        completedAt: refund.completedAt
+    }
+}
+
+// What a seller sees of a refund on their order, including the reason given to them.
+const sellerRefundSelect = {
+    orderBy: { id: "asc" as const },
+    select: { reference: true, amount: true, status: true, reason: true, createdAt: true, completedAt: true }
+}
+
+function toSellerRefund(refund: { reference: string; amount: Prisma.Decimal; status: string; reason: string; createdAt: Date; completedAt: Date | null }) {
+    return {
+        reference: refund.reference,
+        amount: money(refund.amount),
+        status: refund.status,
+        reason: refund.reason,
+        createdAt: refund.createdAt,
+        completedAt: refund.completedAt
+    }
+}
+
 const sellerNameSelect = { select: { sellerProfile: { select: { businessName: true, slug: true } } } }
 
 function toPaymentSummary(payments: Array<{ reference: string; provider: string; verifiedAt: Date | null }>) {
@@ -118,6 +153,8 @@ export const listMyOrders = async (req: Request, res: Response) => {
                         shippingNote: true,
                         deliveryReportedAt: true,
                         deliveryConfirmedAt: true,
+                        refundedAmount: true,
+                        refunds: customerRefundSelect,
                         seller: sellerNameSelect,
                         orderItems: orderItemSelect
                     }
@@ -143,6 +180,8 @@ export const listMyOrders = async (req: Request, res: Response) => {
                 seller: order.seller.sellerProfile,
                 itemCount: order.orderItems.reduce((count, item) => count + item.quantity, 0),
                 items: order.orderItems.map(toItemResponse),
+                refundedAmount: money(order.refundedAmount),
+                refunds: order.refunds.map(toCustomerRefund),
                 ...toFulfilmentResponse(order)
             }))
         }))
@@ -157,7 +196,7 @@ function findMyOrder(checkoutId: number, userId: number) {
             paymentAttempts: successfulPaymentSelect,
             orders: {
                 orderBy: { id: "asc" },
-                include: { seller: sellerNameSelect, orderItems: orderItemSelect }
+                include: { seller: sellerNameSelect, orderItems: orderItemSelect, refunds: customerRefundSelect }
             }
         }
     })
@@ -186,6 +225,8 @@ function toMyOrderResponse(checkout: NonNullable<Awaited<ReturnType<typeof findM
             shipping: money(order.shippingCost),
             total: money(order.total),
             items: order.orderItems.map(toItemResponse),
+            refundedAmount: money(order.refundedAmount),
+            refunds: order.refunds.map(toCustomerRefund),
             ...toFulfilmentResponse(order)
         }))
     }
@@ -297,7 +338,8 @@ export const listSellerOrders = async (req: Request, res: Response) => {
             take: pageSize,
             include: {
                 checkout: { select: { paymentAttempts: successfulPaymentSelect } },
-                orderItems: orderItemSelect
+                orderItems: orderItemSelect,
+                refunds: sellerRefundSelect
             }
         })
     ])
@@ -318,6 +360,9 @@ export const listSellerOrders = async (req: Request, res: Response) => {
             itemCount: order.orderItems.reduce((count, item) => count + item.quantity, 0),
             items: order.orderItems.map(toItemResponse),
             delivery: toDeliveryResponse(order),
+            liabilityDeduction: money(order.liabilityDeduction),
+            refundedAmount: money(order.refundedAmount),
+            refunds: order.refunds.map(toSellerRefund),
             ...toFulfilmentResponse(order)
         }))
     })
@@ -329,7 +374,8 @@ function findSellerOrder(id: number, sellerId: number) {
         where: { id, sellerId, status: { in: sellerVisibleStatuses } },
         include: {
             checkout: { select: { paymentAttempts: successfulPaymentSelect } },
-            orderItems: orderItemSelect
+            orderItems: orderItemSelect,
+            refunds: sellerRefundSelect
         }
     })
 }
@@ -350,6 +396,9 @@ function toSellerOrderResponse(order: NonNullable<Awaited<ReturnType<typeof find
         sellerReceives: money(order.sellerReceives),
         items: order.orderItems.map(toItemResponse),
         delivery: toDeliveryResponse(order),
+        liabilityDeduction: money(order.liabilityDeduction),
+        refundedAmount: money(order.refundedAmount),
+        refunds: order.refunds.map(toSellerRefund),
         ...toFulfilmentResponse(order)
     }
 }

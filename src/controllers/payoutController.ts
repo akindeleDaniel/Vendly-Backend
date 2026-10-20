@@ -1,21 +1,15 @@
 import bcrypt from "bcrypt"
 import type { Request, Response } from "express"
 import prisma from "../lib/prisma.js"
-import type { PaymentProvider, Prisma, SellerPayoutAccount } from "../generated/prisma/client.js"
+import { Prisma, type PaymentProvider, type SellerPayoutAccount } from "../generated/prisma/client.js"
 import { findPayoutBank, payoutBanks, type PayoutBank } from "../lib/payoutBanks.js"
 import { getPaymentProvider, paymentProviderNames, paymentProviders } from "../lib/payments/providers.js"
 import { PaymentProviderError, type ProviderSubaccount } from "../lib/payments/types.js"
+import { liabilityDeductionCapPercent } from "../lib/liabilities.js"
+import { payoutFeeTerms } from "../lib/payoutTerms.js"
 
-// Sellers must accept the current wording before payout accounts are created. Change the
-// version whenever the wording or the fee arrangement changes, so sellers accept it again.
-export const payoutFeeTerms = {
-    version: "2026-10-18",
-    text: "Payment providers (Paystack or Flutterwave) deduct their transaction fees, VAT on those fees, " +
-        "and any government stamp duty (₦50 on payments of ₦10,000 or more) from your share of each sale " +
-        "before paying you. Vendly takes no commission. Fees vary by provider and payment method. " +
-        "Example: a ₦20,000 sale with a 1.5% + ₦100 card fee has ₦400 deducted, so you receive about ₦19,600, " +
-        "less stamp duty where it applies. Each paid order will show the fee actually deducted."
-}
+// The wording sellers accept lives in src/lib/payoutTerms.ts; it is re-exported here for the routes and tests.
+export { payoutFeeTerms }
 
 export type PayoutErrorCode =
     | "PAYOUT_ACCOUNT_INVALID"
@@ -459,4 +453,80 @@ export const changePayoutBankAccount = async (req: Request, res: Response) => {
             throw error
         }
     }
+}
+
+
+// Records that the seller accepts the current payout terms, for example after the wording changed.
+// Vendly only recovers refunds from the future payments of sellers who have accepted the current terms.
+export const acceptPayoutTerms = async (req: Request, res: Response) => {
+    if (req.body.feeTermsVersion !== payoutFeeTerms.version) {
+        res.status(409).send({
+            message: "The payout terms have changed. Review them and try again.",
+            code: "PAYOUT_FEE_TERMS_OUTDATED"
+        })
+        return
+    }
+
+    const accepted = await prisma.sellerProfile.updateMany({
+        where: { userId: req.user!.id },
+        data: { payoutTermsVersion: payoutFeeTerms.version, payoutTermsAcceptedAt: new Date() }
+    })
+
+    if (accepted.count === 0) {
+        res.status(404).send({ message: "Store profile not found" })
+        return
+    }
+
+    res.send({ acceptedFeeTermsVersion: payoutFeeTerms.version })
+}
+
+// What the seller owes Vendly for refunds, and each deduction taken from their sales so far, so a
+// seller can always see why money was deducted. Nothing is deducted until they accept the terms.
+export const getMyLiabilities = async (req: Request, res: Response) => {
+    const profile = await prisma.sellerProfile.findUnique({
+        where: { userId: req.user!.id },
+        select: { payoutTermsVersion: true }
+    })
+
+    if (!profile) {
+        res.status(404).send({ message: "Store profile not found" })
+        return
+    }
+
+    const liabilities = await prisma.sellerLiability.findMany({
+        where: { sellerId: req.user!.id },
+        orderBy: { id: "desc" },
+        take: 100,
+        include: {
+            refund: { select: { orderId: true, reason: true } },
+            recoveries: { orderBy: { id: "asc" }, select: { orderId: true, amount: true, note: true, createdAt: true } }
+        }
+    })
+    const outstanding = liabilities
+        .filter((liability) => liability.status === "OPEN")
+        .reduce((sum, liability) => sum.plus(liability.amount).minus(liability.recovered), new Prisma.Decimal(0))
+
+    res.send({
+        termsAccepted: profile.payoutTermsVersion === payoutFeeTerms.version,
+        feeTerms: payoutFeeTerms,
+        deductionCapPercent: liabilityDeductionCapPercent,
+        outstanding: outstanding.toFixed(2),
+        liabilities: liabilities.map((liability) => ({
+            id: liability.id,
+            orderId: liability.refund.orderId,
+            reason: liability.refund.reason,
+            amount: liability.amount.toFixed(2),
+            recovered: liability.recovered.toFixed(2),
+            remaining: liability.amount.minus(liability.recovered).toFixed(2),
+            status: liability.status,
+            createdAt: liability.createdAt,
+            closedAt: liability.closedAt,
+            recoveries: liability.recoveries.map((recovery) => ({
+                orderId: recovery.orderId,
+                amount: recovery.amount.toFixed(2),
+                note: recovery.note,
+                createdAt: recovery.createdAt
+            }))
+        }))
+    })
 }

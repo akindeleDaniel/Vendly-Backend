@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto"
 import { readDataString, sendProviderRequest } from "./providerRequest.js"
-import { PaymentProviderError, type PaymentProviderAdapter, type SellerShare } from "./types.js"
+import { PaymentProviderError, type PaymentProviderAdapter, type ProviderRefund, type SellerShare } from "./types.js"
 
 const baseUrl = "https://api.paystack.co"
 
@@ -33,6 +33,41 @@ function readSellerShares(data: Record<string, unknown>): SellerShare[] | null {
         : null
 }
 
+// Paystack reports Vendly's own share, after its part of the fee, as split.shares.integration (kobo).
+function readVendlyShareKobo(data: Record<string, unknown>): number | null {
+    const share = Number((data.split as { shares?: { integration?: unknown } } | null | undefined)?.shares?.integration)
+    return Number.isSafeInteger(share) ? share : null
+}
+
+// A Paystack refund. fully_deducted says whether Vendly's balance has covered it; only the list and
+// fetch responses report that reliably, so the create response never claims the refund awaits funds.
+function toProviderRefund(data: Record<string, unknown>, reportsFunding: boolean): ProviderRefund {
+    const providerStatus = String(data.status ?? "")
+    const amountKobo = Number(data.amount)
+
+    if ((typeof data.id !== "number" && typeof data.id !== "string") || !providerStatus || !Number.isSafeInteger(amountKobo)) {
+        throw new PaymentProviderError("unavailable", "Unexpected provider response", "Missing refund fields")
+    }
+
+    const outcome = providerStatus === "processed"
+        ? "succeeded"
+        : providerStatus === "failed"
+            ? "failed"
+            : providerStatus === "needs-attention" ? "needs_attention" : "processing"
+    const expectedAt = typeof data.expected_at === "string" ? new Date(data.expected_at) : null
+    const createdAt = typeof data.createdAt === "string" ? new Date(data.createdAt) : null
+
+    return {
+        providerRefundId: String(data.id),
+        outcome,
+        providerStatus,
+        amountKobo,
+        awaitingFunds: reportsFunding && outcome === "processing" && !data.fully_deducted,
+        expectedAt: expectedAt && !Number.isNaN(expectedAt.getTime()) ? expectedAt : null,
+        createdAt: createdAt && !Number.isNaN(createdAt.getTime()) ? createdAt : null
+    }
+}
+
 const successStatuses = new Set(["success"])
 const failedStatuses = new Set(["failed", "reversed"])
 
@@ -53,7 +88,7 @@ export const paystackAdapter: PaymentProviderAdapter = {
     },
 
     parseWebhook(rawBody) {
-        let body: { event?: unknown; data?: { id?: unknown; reference?: unknown } }
+        let body: { event?: unknown; data?: { id?: unknown; reference?: unknown; transaction_reference?: unknown } }
 
         try {
             body = JSON.parse(rawBody.toString("utf8"))
@@ -61,7 +96,24 @@ export const paystackAdapter: PaymentProviderAdapter = {
             return null
         }
 
-        if (typeof body?.event !== "string" || body.data?.id === undefined || body.data.id === null) {
+        if (typeof body?.event !== "string") {
+            return null
+        }
+
+        // Refund events (refund.pending, refund.processed and so on) carry the payment's reference
+        // but no ID of their own. Refunds are re-checked with Paystack, so redelivery is harmless.
+        if (body.event.startsWith("refund.")) {
+            const reference = typeof body.data?.transaction_reference === "string" ? body.data.transaction_reference : null
+            return {
+                eventKey: `${body.event}:${reference ?? "unknown"}`,
+                eventType: body.event,
+                reference,
+                isPaymentEvent: false,
+                isRefundEvent: true
+            }
+        }
+
+        if (body.data?.id === undefined || body.data.id === null) {
             return null
         }
 
@@ -70,13 +122,15 @@ export const paystackAdapter: PaymentProviderAdapter = {
             eventType: body.event,
             reference: typeof body.data.reference === "string" ? body.data.reference : null,
             // Paystack only sends webhooks for successful charges, not failures.
-            isPaymentEvent: body.event === "charge.success"
+            isPaymentEvent: body.event === "charge.success",
+            isRefundEvent: false
         }
     },
 
     async initializePayment(input) {
-        // A flat split with the sellers' shares adding up to the total leaves Vendly ₦0, and
-        // all-proportional makes each seller bear the fee on their own share (confirmed in test mode).
+        // A flat split gives each seller their share and sends whatever is left to Vendly: ₦0 normally,
+        // or the amount kept to recover a seller's earlier refund. All-proportional makes every party,
+        // Vendly included, bear the fee in proportion to its share (confirmed in test mode).
         const body = await paystackRequest("/transaction/initialize", {
             method: "POST",
             body: {
@@ -129,8 +183,42 @@ export const paystackAdapter: PaymentProviderAdapter = {
             amountKobo,
             currency: String(data.currency ?? ""),
             transactionId: data.id === undefined || data.id === null ? null : String(data.id),
-            sellerShares: readSellerShares(data)
+            sellerShares: readSellerShares(data),
+            vendlyShareKobo: readVendlyShareKobo(data)
         }
+    },
+
+    async createRefund(input) {
+        const body = await paystackRequest("/refund", {
+            method: "POST",
+            body: {
+                transaction: input.transactionReference,
+                amount: input.amountKobo,
+                currency: "NGN",
+                ...(input.customerNote ? { customer_note: input.customerNote } : {}),
+                merchant_note: input.merchantNote
+            }
+        })
+        return toProviderRefund((body.data ?? {}) as Record<string, unknown>, false)
+    },
+
+    async findRefunds({ transactionId }) {
+        if (!transactionId) {
+            throw new PaymentProviderError("unavailable", "Paystack transaction ID is missing", "No providerTransactionId saved")
+        }
+
+        const query = new URLSearchParams({ transaction: transactionId, perPage: "100" })
+        const body = await paystackRequest(`/refund?${query}`)
+        const refunds = Array.isArray(body.data) ? body.data as Array<Record<string, unknown>> : []
+        return refunds.map((refund) => toProviderRefund(refund, true))
+    },
+
+    async getBalanceKobo() {
+        const body = await paystackRequest("/balance")
+        const balances = Array.isArray(body.data) ? body.data as Array<{ currency?: unknown; balance?: unknown }> : []
+        const naira = balances.find((balance) => balance.currency === "NGN")
+        const kobo = Number(naira?.balance)
+        return Number.isSafeInteger(kobo) ? kobo : null
     },
 
     async resolveAccount({ bankCode, accountNumber }) {

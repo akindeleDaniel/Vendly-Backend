@@ -1,4 +1,5 @@
 import { syncPayment } from "../../controllers/paymentController.js"
+import { checkOpenRefunds } from "./refunds.js"
 import prisma from "../prisma.js"
 
 const checkIntervalMs = 5 * 60 * 1000
@@ -70,6 +71,12 @@ export function startPaymentChecker(): void {
             await checkStuckPayments()
         } catch (error) {
             console.error("Stuck payment checker failed", { reason: error instanceof Error ? error.message : undefined })
+        }
+
+        try {
+            await checkOpenRefunds()
+        } catch (error) {
+            console.error("Refund checker failed", { reason: error instanceof Error ? error.message : undefined })
         } finally {
             running = false
         }

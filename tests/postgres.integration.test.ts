@@ -14,15 +14,18 @@ import app from "../src/app.js"
 import config, { assertRequiredEnvironment, loadConfig } from "../src/config.js"
 import { payoutFeeTerms } from "../src/controllers/payoutController.js"
 import { checkStuckPayments } from "../src/lib/payments/paymentChecker.js"
+import { checkOpenRefunds } from "../src/lib/payments/refunds.js"
 import { flutterwaveAdapter } from "../src/lib/payments/flutterwave.js"
 import { paystackAdapter } from "../src/lib/payments/paystack.js"
 import { setPaymentProvidersForTesting } from "../src/lib/payments/providers.js"
 import {
     PaymentProviderError,
+    type CreateRefundInput,
     type CreateSubaccountInput,
     type InitializePaymentInput,
     type PaymentVerification,
     type PaymentProviderAdapter,
+    type ProviderRefund,
     type ProviderSubaccount,
     type ResolveAccountInput
 } from "../src/lib/payments/types.js"
@@ -201,6 +204,16 @@ async function createCheckoutLifecycleFixture(
                 select: { id: true }
             })).map(({ id }) => id)
             if (checkoutIds.length > 0) {
+                await prisma.liabilityRecovery.deleteMany({
+                    where: {
+                        OR: [
+                            { order: { checkoutId: { in: checkoutIds } } },
+                            { liability: { refund: { paymentAttempt: { checkoutId: { in: checkoutIds } } } } }
+                        ]
+                    }
+                })
+                await prisma.sellerLiability.deleteMany({ where: { refund: { paymentAttempt: { checkoutId: { in: checkoutIds } } } } })
+                await prisma.refund.deleteMany({ where: { paymentAttempt: { checkoutId: { in: checkoutIds } } } })
                 await prisma.orderItem.deleteMany({ where: { order: { checkoutId: { in: checkoutIds } } } })
                 await prisma.order.deleteMany({ where: { checkoutId: { in: checkoutIds } } })
                 await prisma.checkoutItem.deleteMany({ where: { checkoutId: { in: checkoutIds } } })
@@ -3275,6 +3288,22 @@ type FakeProviderBehavior = {
     update?: (subaccount: ProviderSubaccount, input: CreateSubaccountInput) => Promise<void>
     initialize?: (input: InitializePaymentInput) => Promise<{ authorizationUrl: string }>
     verify?: (reference: string) => Promise<PaymentVerification>
+    createRefund?: (input: CreateRefundInput) => Promise<ProviderRefund>
+    findRefunds?: (input: { transactionReference: string; transactionId: string | null; providerRefundId: string | null }) => Promise<ProviderRefund[]>
+    balance?: () => Promise<number | null>
+}
+
+// A refund as a provider reports it. By default it has just been accepted and is processing.
+function fakeProviderRefund(overrides: Partial<ProviderRefund> & { amountKobo: number }): ProviderRefund {
+    return {
+        providerRefundId: `REFUND-${randomUUID()}`,
+        outcome: "processing",
+        providerStatus: "pending",
+        awaitingFunds: false,
+        expectedAt: null,
+        createdAt: new Date(),
+        ...overrides
+    }
 }
 
 // Flutterwave also returns a numeric ID, which it needs for updates.
@@ -3291,7 +3320,9 @@ function installFakePaymentProviders() {
         create: [] as Array<{ provider: PaymentProvider; input: CreateSubaccountInput }>,
         update: [] as Array<{ provider: PaymentProvider; subaccount: ProviderSubaccount; input: CreateSubaccountInput }>,
         initialize: [] as Array<{ provider: PaymentProvider; input: InitializePaymentInput }>,
-        verify: [] as Array<{ provider: PaymentProvider; reference: string }>
+        verify: [] as Array<{ provider: PaymentProvider; reference: string }>,
+        createRefund: [] as Array<{ provider: PaymentProvider; input: CreateRefundInput }>,
+        findRefunds: [] as Array<{ provider: PaymentProvider; providerRefundId: string | null }>
     }
     const behaviors: Record<PaymentProvider, FakeProviderBehavior> = { PAYSTACK: {}, FLUTTERWAVE: {} }
     // Webhook signatures and parsing use the real provider code, which needs no network.
@@ -3319,6 +3350,18 @@ function installFakePaymentProviders() {
         async updateSubaccount(subaccount, input) {
             calls.update.push({ provider, subaccount, input })
             await behaviors[provider].update?.(subaccount, input)
+        },
+        async createRefund(input) {
+            calls.createRefund.push({ provider, input })
+            return behaviors[provider].createRefund?.(input) ?? fakeProviderRefund({ amountKobo: input.amountKobo })
+        },
+        async findRefunds(input) {
+            calls.findRefunds.push({ provider, providerRefundId: input.providerRefundId })
+            return behaviors[provider].findRefunds?.(input) ?? []
+        },
+        async getBalanceKobo() {
+            // Plenty of money unless a test says otherwise, so refunds are not held up by default.
+            return behaviors[provider].balance ? behaviors[provider].balance!() : 100_000_000_00
         }
     })
     setPaymentProvidersForTesting({ PAYSTACK: fakeAdapter("PAYSTACK"), FLUTTERWAVE: fakeAdapter("FLUTTERWAVE") })
@@ -3771,6 +3814,7 @@ type PaymentTestContext = {
     fixture: CheckoutLifecycleFixture
     baseUrl: string
     checkoutId: number
+    adminToken: string
     fakes: ReturnType<typeof installFakePaymentProviders>
     request(method: "GET" | "POST", path: string, body?: unknown, token?: string): Promise<{ status: number; body: any }>
     startPayment(token?: string): Promise<{ status: number; body: any }>
@@ -3786,6 +3830,15 @@ async function withPaymentCheckout(
 ) {
     const fixture = await createCheckoutLifecycleFixture(name, 5, 2)
     const fakes = installFakePaymentProviders()
+    const admin = await prisma.user.create({
+        data: {
+            name: `${name} admin`,
+            email: `${name}-admin-${randomUUID()}@example.test`,
+            passwordHash: "integration-test-not-a-password",
+            role: "CONSUMER",
+            isAdmin: true
+        }
+    })
 
     try {
         if (options.withPayoutAccount !== false) {
@@ -3828,6 +3881,7 @@ async function withPaymentCheckout(
                 fixture,
                 baseUrl,
                 checkoutId,
+                adminToken: jwt.sign({ id: admin.id }, process.env.JWT_SECRET!),
                 fakes,
                 request,
                 startPayment: (token) => request("POST", `/checkout/${checkoutId}/payments`, { provider: "PAYSTACK" }, token)
@@ -3837,6 +3891,7 @@ async function withPaymentCheckout(
         setPaymentProvidersForTesting(null)
         await prisma.sellerPayoutAccount.deleteMany({ where: { sellerProfile: { userId: fixture.sellerId } } })
         await fixture.cleanup()
+        await prisma.user.delete({ where: { id: admin.id } })
     }
 }
 
@@ -3872,7 +3927,7 @@ test("starts a Paystack payment with each seller's share and extends the checkou
         const initialization = fakes.calls.initialize[0]!.input
         assert.equal(initialization.reference, payment.reference)
         assert.equal(initialization.amountKobo, 300000)
-        assert.deepEqual(initialization.splits, [{ subaccountCode: "ACCT_test_payment-start", amountKobo: 300000 }])
+        assert.deepEqual(initialization.splits, [{ subaccountCode: "ACCT_test_payment-start", amountKobo: 300000, retainedKobo: 0 }])
         assert.match(initialization.email, /payment-start-consumer-.*@example\.test/)
         assert.equal(initialization.callbackUrl, `${config.frontendUrl}/checkout/payment-return`)
 
@@ -4391,7 +4446,7 @@ test("starts a Flutterwave payment and refuses a second provider while one is pe
         assert.equal(started.status, 201)
         assert.equal(started.body.payment.provider, "FLUTTERWAVE")
         assert.deepEqual(fakes.calls.initialize.map(({ provider }) => provider), ["FLUTTERWAVE"])
-        assert.deepEqual(fakes.calls.initialize[0]!.input.splits, [{ subaccountCode: "RS_test_flutterwave-start", amountKobo: 300000 }])
+        assert.deepEqual(fakes.calls.initialize[0]!.input.splits, [{ subaccountCode: "RS_test_flutterwave-start", amountKobo: 300000, retainedKobo: 0 }])
 
         const otherProvider = await request("POST", `/checkout/${checkoutId}/payments`, { provider: "PAYSTACK" })
         assert.equal(otherProvider.status, 409)
@@ -4470,7 +4525,7 @@ test("the real adapters send each provider its own amount format and split", asy
         amountKobo: 3000000,
         email: "buyer@example.test",
         callbackUrl: "http://localhost:5173/checkout/payment-return",
-        splits: [{ subaccountCode: "SUB_A", amountKobo: 2000000 }, { subaccountCode: "SUB_B", amountKobo: 1000000 }]
+        splits: [{ subaccountCode: "SUB_A", amountKobo: 2000000, retainedKobo: 0 }, { subaccountCode: "SUB_B", amountKobo: 1000000, retainedKobo: 0 }]
     }
 
     nextResponse = { status: true, data: { authorization_url: "https://checkout.paystack.com/x" } }
@@ -4503,7 +4558,8 @@ test("the real adapters send each provider its own amount format and split", asy
         amountKobo: 3000050,
         currency: "NGN",
         transactionId: "42",
-        sellerShares: null
+        sellerShares: null,
+        vendlyShareKobo: null
     })
     assert.equal(requests[2]!.url, "https://api.flutterwave.com/v3/transactions/verify_by_reference?tx_ref=VND-1-abc")
 })
@@ -4656,9 +4712,10 @@ test("the real adapters read each seller's payout from the provider's verificati
     const flutterwave = await flutterwaveAdapter.verifyPayment("VND-2-abc")
     assert.ok(flutterwave.outcome !== "not_found")
     assert.deepEqual(flutterwave.sellerShares, [
-        { subaccountCode: "RS_A", receivedKobo: 1972000, feeKobo: null },
-        { subaccountCode: "RS_B", receivedKobo: 986000, feeKobo: null }
+        { subaccountCode: "RS_A", receivedKobo: 1972000, feeKobo: null, retainedKobo: 0 },
+        { subaccountCode: "RS_B", receivedKobo: 986000, feeKobo: null, retainedKobo: 0 }
     ])
+    assert.equal(flutterwave.vendlyShareKobo, 0)
 })
 
 // Pays for the fixture's checkout through the fake provider and returns the seller order's ID.
@@ -4792,5 +4849,793 @@ test("refunded orders cannot be shipped or reported delivered", async () => {
             assert.equal(response.status, 409)
             assert.equal(response.body.code, "ORDER_STATUS_INVALID")
         }
+    })
+})
+
+// ---- Refunds, seller liabilities and recovery from later payments ----
+
+function refundOrder(context: PaymentTestContext, orderId: number, body: Record<string, unknown> = {}, token = context.adminToken) {
+    return context.request("POST", `/admin/orders/${orderId}/refunds`, { reason: "Buyer returned the item", ...body }, token)
+}
+
+// Makes the fake provider report one refund, as the provider would after it was issued.
+function providerReports(context: PaymentTestContext, refund: { providerRefundId: string | null }, amountKobo: number, outcome: ProviderRefund["outcome"], providerStatus: string, extra: Partial<ProviderRefund> = {}) {
+    context.fakes.behaviors.PAYSTACK.findRefunds = async () => [
+        fakeProviderRefund({ providerRefundId: refund.providerRefundId!, amountKobo, outcome, providerStatus, ...extra })
+    ]
+}
+
+async function loadStock(listingId: number) {
+    return (await prisma.listing.findUniqueOrThrow({ where: { id: listingId } })).stockQuantity
+}
+
+// Puts the fixture's consumer back to a ready checkout of 2 × ₦1,500, after an earlier order was paid.
+async function createNextCheckout(context: PaymentTestContext) {
+    const cart = await prisma.cart.findUniqueOrThrow({ where: { userId: context.fixture.consumerId } })
+    await prisma.cartItem.create({ data: { cartId: cart.id, listingId: context.fixture.listingId, quantity: 2 } })
+    return context.fixture.createCheckout()
+}
+
+async function acceptCurrentPayoutTerms(sellerId: number) {
+    await prisma.sellerProfile.update({
+        where: { userId: sellerId },
+        data: { payoutTermsVersion: payoutFeeTerms.version, payoutTermsAcceptedAt: new Date() }
+    })
+}
+
+test("an admin refunds a paid order in full, and it completes only when the provider says so", async () => {
+    await withPaymentCheckout("refund-full", async (context) => {
+        const { fixture, checkoutId, fakes, request } = context
+        const orderId = await payForCheckout(context)
+        const attempt = await prisma.paymentAttempt.findFirstOrThrow({ where: { checkoutId, status: "SUCCESS" } })
+        assert.equal(await loadStock(fixture.listingId), 3)
+
+        const issued = await refundOrder(context, orderId, { customerNote: "Your refund is on its way" })
+        assert.equal(issued.status, 201)
+        const refund = issued.body.refund
+        assert.equal(refund.status, "PROCESSING")
+        assert.equal(refund.amount, "3000.00")
+        assert.equal(refund.orderId, orderId)
+        assert.equal(refund.paymentReference, attempt.reference)
+        assert.equal(refund.restock, true)
+        assert.equal(refund.chargeSeller, true)
+        assert.deepEqual(refund.liability && { amount: refund.liability.amount, recovered: refund.liability.recovered, status: refund.liability.status },
+            { amount: "3000.00", recovered: "0.00", status: "OPEN" })
+
+        assert.equal(fakes.calls.createRefund.length, 1)
+        const providerCall = fakes.calls.createRefund[0]!.input
+        assert.equal(providerCall.transactionReference, attempt.reference)
+        assert.equal(providerCall.transactionId, "5550001")
+        assert.equal(providerCall.amountKobo, 300000)
+        assert.equal(providerCall.customerNote, "Your refund is on its way")
+
+        // Accepted by the provider is not completed: the order and the stock have not moved yet.
+        const before = await prisma.order.findUniqueOrThrow({ where: { id: orderId } })
+        assert.equal(before.status, "PAID")
+        assert.equal(before.refundedAmount.toFixed(2), "0.00")
+        assert.equal(await loadStock(fixture.listingId), 3)
+
+        providerReports(context, refund, 300000, "succeeded", "processed")
+        const synced = await request("POST", `/admin/refunds/${refund.id}/sync`, undefined, context.adminToken)
+        assert.equal(synced.status, 200)
+        assert.equal(synced.body.refund.status, "SUCCEEDED")
+        assert.ok(synced.body.refund.completedAt)
+
+        const after = await prisma.order.findUniqueOrThrow({ where: { id: orderId } })
+        assert.equal(after.status, "REFUNDED")
+        assert.equal(after.refundedAmount.toFixed(2), "3000.00")
+        assert.equal(await loadStock(fixture.listingId), 5)
+        assert.ok(synced.body.refund.restockedAt)
+
+        // Checking again repeats nothing.
+        await request("POST", `/admin/refunds/${refund.id}/sync`, undefined, context.adminToken)
+        assert.equal(await loadStock(fixture.listingId), 5)
+        assert.equal(await prisma.sellerLiability.count({ where: { refundId: refund.id } }), 1)
+
+        const buyerView = await request("GET", `/orders/${checkoutId}`)
+        assert.equal(buyerView.body.sellerOrders[0].status, "REFUNDED")
+        assert.equal(buyerView.body.sellerOrders[0].refundedAmount, "3000.00")
+        assert.deepEqual(
+            buyerView.body.sellerOrders[0].refunds.map((item: { status: string; note: string; amount: string }) => [item.status, item.note, item.amount]),
+            [["SUCCEEDED", "Your refund is on its way", "3000.00"]]
+        )
+        assert.equal(JSON.stringify(buyerView.body).includes("Buyer returned the item"), false)
+
+        const sellerView = await request("GET", `/seller/orders/${orderId}`, undefined, fixture.sellerToken)
+        assert.equal(sellerView.body.refunds[0].reason, "Buyer returned the item")
+        assert.equal(sellerView.body.refundedAmount, "3000.00")
+    })
+})
+
+test("partial refunds are limited to what is left, one at a time, and never restock", async () => {
+    await withPaymentCheckout("refund-partial", async (context) => {
+        const { fixture, request } = context
+        const orderId = await payForCheckout(context)
+
+        const restockPartial = await refundOrder(context, orderId, { amount: "1000", restock: true })
+        assert.equal(restockPartial.status, 400)
+        assert.equal(restockPartial.body.code, "REFUND_RESTOCK_NOT_ALLOWED")
+
+        const first = await refundOrder(context, orderId, { amount: 1000 })
+        assert.equal(first.status, 201)
+        assert.equal(first.body.refund.restock, false)
+
+        const overlapping = await refundOrder(context, orderId, { amount: 500 })
+        assert.equal(overlapping.status, 409)
+        assert.equal(overlapping.body.code, "REFUND_IN_PROGRESS")
+
+        providerReports(context, first.body.refund, 100000, "succeeded", "processed")
+        await request("POST", `/admin/refunds/${first.body.refund.id}/sync`, undefined, context.adminToken)
+        const midway = await prisma.order.findUniqueOrThrow({ where: { id: orderId } })
+        assert.equal(midway.status, "PAID")
+        assert.equal(midway.refundedAmount.toFixed(2), "1000.00")
+
+        const tooMuch = await refundOrder(context, orderId, { amount: "2500" })
+        assert.equal(tooMuch.status, 400)
+        assert.equal(tooMuch.body.code, "REFUND_AMOUNT_INVALID")
+        assert.equal(tooMuch.body.maximum, "2000.00")
+
+        const rest = await refundOrder(context, orderId)
+        assert.equal(rest.status, 201)
+        assert.equal(rest.body.refund.amount, "2000.00")
+        providerReports(context, rest.body.refund, 200000, "succeeded", "processed")
+        await request("POST", `/admin/refunds/${rest.body.refund.id}/sync`, undefined, context.adminToken)
+
+        const done = await prisma.order.findUniqueOrThrow({ where: { id: orderId } })
+        assert.equal(done.status, "REFUNDED")
+        assert.equal(done.refundedAmount.toFixed(2), "3000.00")
+        assert.equal(await loadStock(fixture.listingId), 3)
+        assert.equal((await refundOrder(context, orderId)).status, 409)
+    })
+})
+
+test("only administrators can refund, and invalid refund requests are refused before the provider is called", async () => {
+    await withPaymentCheckout("refund-guards", async (context) => {
+        const { fixture, checkoutId, fakes } = context
+        const [unpaid] = await prisma.order.findMany({ where: { checkoutId } })
+        assert.equal((await refundOrder(context, unpaid!.id)).status, 409)
+
+        const orderId = await payForCheckout(context)
+
+        assert.equal((await refundOrder(context, orderId, {}, fixture.token)).status, 403)
+        assert.equal((await refundOrder(context, orderId, {}, fixture.sellerToken)).status, 403)
+        assert.equal((await context.request("POST", `/admin/orders/${orderId}/refunds`, { reason: "x" }, "not-a-token")).status, 401)
+        assert.equal((await context.request("GET", "/admin/refunds", undefined, fixture.token)).status, 403)
+
+        const bad: Array<[Record<string, unknown>, number]> = [
+            [{ reason: undefined }, 400],
+            [{ reason: "  " }, 400],
+            [{ reason: "x".repeat(301) }, 400],
+            [{ amount: "12.345" }, 400],
+            [{ amount: -5 }, 400],
+            [{ amount: "abc" }, 400],
+            [{ amount: 0 }, 400],
+            [{ customerNote: "x".repeat(301) }, 400],
+            [{ restock: "yes" }, 400],
+            [{ chargeSeller: 1 }, 400]
+        ]
+
+        for (const [body, status] of bad) {
+            const response = await refundOrder(context, orderId, body)
+            assert.equal(response.status, status, JSON.stringify(body))
+        }
+
+        assert.equal((await context.request("POST", "/admin/orders/999999/refunds", { reason: "Test" }, context.adminToken)).status, 404)
+        assert.equal((await context.request("POST", "/admin/orders/abc/refunds", { reason: "Test" }, context.adminToken)).status, 404)
+        assert.equal(fakes.calls.createRefund.length, 0)
+        assert.equal(await prisma.refund.count({ where: { orderId } }), 0)
+    })
+})
+
+test("warns before a refund the provider balance cannot cover, unless the admin confirms", async (t) => {
+    const consoleError = t.mock.method(console, "error", () => {})
+
+    await withPaymentCheckout("refund-balance", async (context) => {
+        const { fakes } = context
+        const orderId = await payForCheckout(context)
+
+        fakes.behaviors.PAYSTACK.balance = async () => 100000
+        const warned = await refundOrder(context, orderId)
+        assert.equal(warned.status, 409)
+        assert.equal(warned.body.code, "REFUND_BALANCE_LOW")
+        assert.equal(warned.body.availableBalance, "1000.00")
+        assert.equal(warned.body.required, "3000.00")
+        assert.equal(fakes.calls.createRefund.length, 0)
+        assert.equal(await prisma.refund.count({ where: { orderId } }), 0)
+
+        const confirmed = await refundOrder(context, orderId, { acknowledgeLowBalance: true })
+        assert.equal(confirmed.status, 201)
+        assert.equal(fakes.calls.createRefund.length, 1)
+    })
+
+    await withPaymentCheckout("refund-balance-unknown", async (context) => {
+        const orderId = await payForCheckout(context)
+        context.fakes.behaviors.PAYSTACK.balance = async () => { throw new PaymentProviderError("unavailable", "Paystack could not be reached") }
+        assert.equal((await refundOrder(context, orderId)).status, 201)
+        assert.ok(consoleError.mock.calls.some((call) => call.arguments[0] === "Could not read the provider balance before a refund"))
+    })
+
+    await withPaymentCheckout("refund-balance-null", async (context) => {
+        const orderId = await payForCheckout(context)
+        context.fakes.behaviors.PAYSTACK.balance = async () => null
+        assert.equal((await refundOrder(context, orderId)).status, 201)
+    })
+})
+
+test("a rejected refund is closed and can be issued again, and an unknown outcome is never retried", async (t) => {
+    t.mock.method(console, "error", () => {})
+
+    await withPaymentCheckout("refund-outcomes", async (context) => {
+        const { fakes, request } = context
+        const orderId = await payForCheckout(context)
+
+        fakes.behaviors.PAYSTACK.createRefund = async () => {
+            throw new PaymentProviderError("rejected", "Paystack rejected the request", "HTTP 400: Invalid transaction")
+        }
+        const rejected = await refundOrder(context, orderId)
+        assert.equal(rejected.status, 502)
+        assert.equal(rejected.body.code, "REFUND_PROVIDER_REJECTED")
+        const [closed] = await prisma.refund.findMany({ where: { orderId } })
+        assert.equal(closed?.status, "FAILED")
+        assert.equal(await prisma.sellerLiability.count({ where: { sellerId: (await prisma.order.findUniqueOrThrow({ where: { id: orderId } })).sellerId } }), 0)
+
+        // The provider could not be reached: nobody knows whether it refunded, so it is not retried.
+        fakes.behaviors.PAYSTACK.createRefund = async () => {
+            throw new PaymentProviderError("unavailable", "Paystack could not be reached", "TimeoutError")
+        }
+        const unknown = await refundOrder(context, orderId)
+        assert.equal(unknown.status, 502)
+        assert.equal(unknown.body.code, "REFUND_PROVIDER_UNAVAILABLE")
+        const unknownRefund = await prisma.refund.findUniqueOrThrow({ where: { reference: unknown.body.refundReference } })
+        assert.equal(unknownRefund.status, "PENDING")
+        assert.equal(unknownRefund.providerRefundId, null)
+        assert.equal(await prisma.sellerLiability.count({ where: { refundId: unknownRefund.id } }), 0)
+
+        const blocked = await refundOrder(context, orderId)
+        assert.equal(blocked.status, 409)
+        assert.equal(blocked.body.code, "REFUND_IN_PROGRESS")
+        assert.equal(fakes.calls.createRefund.length, 2)
+
+        // Checking: nothing at the provider yet, and not long enough to give up, so it stays pending.
+        await request("POST", `/admin/refunds/${unknownRefund.id}/sync`, undefined, context.adminToken)
+        assert.equal((await prisma.refund.findUniqueOrThrow({ where: { id: unknownRefund.id } })).status, "PENDING")
+
+        // The provider did make it: it is found by amount and time, then followed like any refund.
+        const found = fakeProviderRefund({ amountKobo: 300000 })
+        fakes.behaviors.PAYSTACK.findRefunds = async () => [found]
+        const adopted = await request("POST", `/admin/refunds/${unknownRefund.id}/sync`, undefined, context.adminToken)
+        assert.equal(adopted.body.refund.status, "PROCESSING")
+        assert.equal(adopted.body.refund.providerRefundId, found.providerRefundId)
+        assert.equal(await prisma.sellerLiability.count({ where: { refundId: unknownRefund.id } }), 1)
+    })
+
+    await withPaymentCheckout("refund-no-record", async (context) => {
+        const { fakes, request } = context
+        const orderId = await payForCheckout(context)
+        fakes.behaviors.PAYSTACK.createRefund = async () => {
+            throw new PaymentProviderError("unavailable", "Paystack could not be reached", "TimeoutError")
+        }
+        const unknown = await refundOrder(context, orderId)
+        const refund = await prisma.refund.findUniqueOrThrow({ where: { reference: unknown.body.refundReference } })
+        await prisma.$executeRaw`UPDATE "Refund" SET "createdAt" = (NOW() AT TIME ZONE 'UTC') - INTERVAL '30 minutes' WHERE id = ${refund.id}`
+
+        // A refund the provider has never heard of is closed after a while, so it can be issued again.
+        const closed = await request("POST", `/admin/refunds/${refund.id}/sync`, undefined, context.adminToken)
+        assert.equal(closed.body.refund.status, "FAILED")
+        assert.equal(closed.body.refund.failureReason, "The payment provider has no record of this refund")
+
+        delete fakes.behaviors.PAYSTACK.createRefund
+        assert.equal((await refundOrder(context, orderId)).status, 201)
+    })
+})
+
+test("a refund that fails at the provider voids the seller's liability and leaves the order alone", async (t) => {
+    t.mock.method(console, "error", () => {})
+
+    await withPaymentCheckout("refund-failed", async (context) => {
+        const { fixture, request } = context
+        const orderId = await payForCheckout(context)
+        const issued = await refundOrder(context, orderId)
+        assert.equal(issued.body.refund.liability.status, "OPEN")
+
+        providerReports(context, issued.body.refund, 300000, "failed", "failed")
+        const failed = await request("POST", `/admin/refunds/${issued.body.refund.id}/sync`, undefined, context.adminToken)
+        assert.equal(failed.body.refund.status, "FAILED")
+        assert.equal(failed.body.refund.liability.status, "VOID")
+
+        const order = await prisma.order.findUniqueOrThrow({ where: { id: orderId } })
+        assert.equal(order.status, "PAID")
+        assert.equal(order.refundedAmount.toFixed(2), "0.00")
+        assert.equal(await loadStock(fixture.listingId), 3)
+        assert.equal((await refundOrder(context, orderId)).status, 201)
+    })
+})
+
+test("records needs-attention and waiting-for-funds states from the provider", async () => {
+    await withPaymentCheckout("refund-states", async (context) => {
+        const { request } = context
+        const orderId = await payForCheckout(context)
+        const issued = await refundOrder(context, orderId)
+        const refundId = issued.body.refund.id as number
+
+        providerReports(context, issued.body.refund, 300000, "processing", "pending", { awaitingFunds: true, expectedAt: new Date("2026-11-01T00:00:00Z") })
+        const waiting = await request("POST", `/admin/refunds/${refundId}/sync`, undefined, context.adminToken)
+        assert.equal(waiting.body.refund.status, "PROCESSING")
+        assert.equal(waiting.body.refund.awaitingFunds, true)
+        assert.equal(waiting.body.refund.expectedAt, "2026-11-01T00:00:00.000Z")
+
+        providerReports(context, issued.body.refund, 300000, "needs_attention", "needs-attention")
+        const attention = await request("POST", `/admin/refunds/${refundId}/sync`, undefined, context.adminToken)
+        assert.equal(attention.body.refund.status, "NEEDS_ATTENTION")
+        assert.equal(attention.body.refund.awaitingFunds, false)
+
+        providerReports(context, issued.body.refund, 300000, "succeeded", "processed")
+        assert.equal((await request("POST", `/admin/refunds/${refundId}/sync`, undefined, context.adminToken)).body.refund.status, "SUCCEEDED")
+
+        const list = await request("GET", "/admin/refunds?status=SUCCEEDED", undefined, context.adminToken)
+        assert.equal(list.status, 200)
+        assert.equal(list.body.refunds.some((refund: { id: number }) => refund.id === refundId), true)
+        assert.equal((await request("GET", "/admin/refunds?status=NOPE", undefined, context.adminToken)).status, 400)
+        assert.equal((await request("GET", `/admin/refunds/${refundId}`, undefined, context.adminToken)).body.refund.reference, issued.body.refund.reference)
+        assert.equal((await request("GET", "/admin/refunds/999999", undefined, context.adminToken)).status, 404)
+    })
+})
+
+test("a signed refund webhook makes Vendly check the provider, and a failure asks for redelivery", async (t) => {
+    process.env.PAYSTACK_SECRET_KEY ||= "sk_test_integration_webhook_secret"
+    t.mock.method(console, "error", () => {})
+
+    await withPaymentCheckout("refund-webhook", async (context) => {
+        const { baseUrl, fakes } = context
+        const orderId = await payForCheckout(context)
+        const attempt = await prisma.paymentAttempt.findFirstOrThrow({ where: { checkoutId: context.checkoutId, status: "SUCCESS" } })
+        const issued = await refundOrder(context, orderId)
+        const event = JSON.stringify({
+            event: "refund.processed",
+            data: { status: "processed", transaction_reference: attempt.reference, refund_reference: null, amount: "300000", currency: "NGN" }
+        })
+
+        fakes.behaviors.PAYSTACK.findRefunds = async () => { throw new PaymentProviderError("unavailable", "Paystack could not be reached") }
+        assert.equal((await postPaystackWebhook(baseUrl, event)).status, 500)
+        assert.equal((await prisma.refund.findUniqueOrThrow({ where: { id: issued.body.refund.id } })).status, "PROCESSING")
+
+        providerReports(context, issued.body.refund, 300000, "succeeded", "processed")
+        assert.equal((await postPaystackWebhook(baseUrl, event)).status, 200)
+        assert.equal((await prisma.refund.findUniqueOrThrow({ where: { id: issued.body.refund.id } })).status, "SUCCEEDED")
+
+        assert.equal((await postPaystackWebhook(baseUrl, event)).status, 200)
+        assert.equal((await prisma.order.findUniqueOrThrow({ where: { id: orderId } })).refundedAmount.toFixed(2), "3000.00")
+
+        assert.equal((await postPaystackWebhook(baseUrl, event, "0".repeat(128))).status, 401)
+        const unknownPayment = JSON.stringify({ event: "refund.processed", data: { transaction_reference: "VND-nothing" } })
+        assert.equal((await postPaystackWebhook(baseUrl, unknownPayment)).status, 200)
+    })
+})
+
+test("the periodic refund check follows open refunds and does nothing when none are open", async () => {
+    await withPaymentCheckout("refund-checker", async (context) => {
+        const { fakes } = context
+        const orderId = await payForCheckout(context)
+
+        const callsBefore = fakes.calls.findRefunds.length
+        assert.equal(await checkOpenRefunds(), 0)
+        assert.equal(fakes.calls.findRefunds.length, callsBefore)
+
+        const issued = await refundOrder(context, orderId)
+        const refundId = issued.body.refund.id as number
+        providerReports(context, issued.body.refund, 300000, "succeeded", "processed")
+
+        // Just checked by issuing it, so it is left alone for now.
+        assert.equal(await checkOpenRefunds(), 0)
+
+        await prisma.refund.update({ where: { id: refundId }, data: { lastCheckedAt: null } })
+        assert.equal(await checkOpenRefunds(), 1)
+        assert.equal((await prisma.refund.findUniqueOrThrow({ where: { id: refundId } })).status, "SUCCEEDED")
+        assert.equal(await checkOpenRefunds(), 0)
+    })
+})
+
+test("a seller's liability is recovered from later payments, never more than half of an order", async () => {
+    await withPaymentCheckout("liability-cap", async (context) => {
+        const { fixture, fakes, request } = context
+        await acceptCurrentPayoutTerms(fixture.sellerId)
+        const orderId = await payForCheckout(context)
+        const issued = await refundOrder(context, orderId)
+        assert.equal(issued.body.refund.liability.amount, "3000.00")
+
+        const nextCheckoutId = await createNextCheckout(context)
+        const started = await request("POST", `/checkout/${nextCheckoutId}/payments`, { provider: "PAYSTACK" })
+        assert.equal(started.status, 201)
+        assert.deepEqual(fakes.calls.initialize.at(-1)!.input.splits, [
+            { subaccountCode: "ACCT_test_liability-cap", amountKobo: 150000, retainedKobo: 150000 }
+        ])
+        const [nextOrder] = await prisma.order.findMany({ where: { checkoutId: nextCheckoutId } })
+        assert.equal(nextOrder!.liabilityDeduction.toFixed(2), "1500.00")
+
+        // Paystack reports Vendly's share as one lump, after Vendly's part of the fee.
+        const reference = started.body.payment.reference as string
+        fakes.behaviors.PAYSTACK.verify = async () => ({
+            ...paystackVerification("success", reference),
+            sellerShares: [{ subaccountCode: "ACCT_test_liability-cap", receivedKobo: 148500, feeKobo: 1500 }],
+            vendlyShareKobo: 147000
+        })
+        await request("GET", `/payments/${reference}`)
+
+        const settled = await prisma.order.findUniqueOrThrow({ where: { id: nextOrder!.id } })
+        assert.equal(settled.status, "PAID")
+        assert.equal(settled.liabilityDeduction.toFixed(2), "1470.00")
+        assert.equal(settled.sellerReceives?.toFixed(2), "1485.00")
+        assert.equal(settled.providerFee?.toFixed(2), "15.00")
+
+        const liability = await prisma.sellerLiability.findUniqueOrThrow({ where: { refundId: issued.body.refund.id }, include: { recoveries: true } })
+        assert.equal(liability.recovered.toFixed(2), "1470.00")
+        assert.equal(liability.status, "OPEN")
+        assert.deepEqual(liability.recoveries.map((recovery) => [recovery.orderId, recovery.amount.toFixed(2)]), [[nextOrder!.id, "1470.00"]])
+
+        const sellerList = await request("GET", "/seller/orders", undefined, fixture.sellerToken)
+        const listed = sellerList.body.orders.find((order: { id: number }) => order.id === nextOrder!.id)
+        assert.equal(listed.liabilityDeduction, "1470.00")
+
+        // Paying again repeats nothing: the settlement already ran.
+        await request("GET", `/payments/${reference}`)
+        assert.equal((await prisma.sellerLiability.findUniqueOrThrow({ where: { id: liability.id } })).recovered.toFixed(2), "1470.00")
+    })
+})
+
+test("a seller who has not accepted the current terms is never charged", async () => {
+    await withPaymentCheckout("liability-terms", async (context) => {
+        const { fakes, request } = context
+        const orderId = await payForCheckout(context)
+        await refundOrder(context, orderId, { amount: 1000 })
+
+        const nextCheckoutId = await createNextCheckout(context)
+        await request("POST", `/checkout/${nextCheckoutId}/payments`, { provider: "PAYSTACK" })
+        assert.deepEqual(fakes.calls.initialize.at(-1)!.input.splits.map((split) => split.retainedKobo), [0])
+        const [nextOrder] = await prisma.order.findMany({ where: { checkoutId: nextCheckoutId } })
+        assert.equal(nextOrder!.liabilityDeduction.toFixed(2), "0.00")
+    })
+})
+
+test("a liability smaller than the cap is cleared in one payment, with Flutterwave's per-seller figure", async () => {
+    await withPaymentCheckout("liability-flutterwave", async (context) => {
+        const { fixture, fakes, request } = context
+        await acceptCurrentPayoutTerms(fixture.sellerId)
+        const orderId = await payForCheckout(context)
+        const issued = await refundOrder(context, orderId, { amount: 1000 })
+
+        const nextCheckoutId = await createNextCheckout(context)
+        const started = await request("POST", `/checkout/${nextCheckoutId}/payments`, { provider: "FLUTTERWAVE" })
+        assert.equal(started.status, 201)
+        assert.deepEqual(fakes.calls.initialize.at(-1)!.input.splits, [
+            { subaccountCode: "RS_test_liability-flutterwave", amountKobo: 200000, retainedKobo: 100000 }
+        ])
+
+        const reference = started.body.payment.reference as string
+        fakes.behaviors.FLUTTERWAVE.verify = async () => ({
+            ...flutterwaveVerification("success", reference),
+            sellerShares: [{ subaccountCode: "RS_test_liability-flutterwave", receivedKobo: 198000, feeKobo: null, retainedKobo: 100000 }],
+            vendlyShareKobo: 100000
+        })
+        await request("GET", `/payments/${reference}`)
+
+        const [nextOrder] = await prisma.order.findMany({ where: { checkoutId: nextCheckoutId } })
+        assert.equal(nextOrder!.liabilityDeduction.toFixed(2), "1000.00")
+        assert.equal(nextOrder!.sellerReceives?.toFixed(2), "1980.00")
+        // Flutterwave reports no fee, so it is what is left after the seller's payout and Vendly's part.
+        assert.equal(nextOrder!.providerFee?.toFixed(2), "20.00")
+
+        const liability = await prisma.sellerLiability.findUniqueOrThrow({ where: { refundId: issued.body.refund.id } })
+        assert.equal(liability.recovered.toFixed(2), "1000.00")
+        assert.equal(liability.status, "CLEARED")
+        assert.ok(liability.closedAt)
+    }, { payoutProviders: ["PAYSTACK", "FLUTTERWAVE"] })
+})
+
+test("two unpaid checkouts never plan to collect the same liability", async () => {
+    await withPaymentCheckout("liability-reserve", async (context) => {
+        const { fixture, fakes, request } = context
+        await acceptCurrentPayoutTerms(fixture.sellerId)
+        const orderId = await payForCheckout(context)
+        await refundOrder(context, orderId, { amount: 1000 })
+
+        const firstCheckoutId = await createNextCheckout(context)
+        await request("POST", `/checkout/${firstCheckoutId}/payments`, { provider: "PAYSTACK" })
+        assert.deepEqual(fakes.calls.initialize.at(-1)!.input.splits.map((split) => split.retainedKobo), [100000])
+
+        // Another shopper pays the same seller while the first payment is still open.
+        const other = await fixture.addConsumer(1)
+        const otherCheckoutId = await fixture.createCheckout(other.token)
+        const otherStart = await request("POST", `/checkout/${otherCheckoutId}/payments`, { provider: "PAYSTACK" }, other.token)
+        assert.equal(otherStart.status, 201)
+        assert.deepEqual(fakes.calls.initialize.at(-1)!.input.splits.map((split) => split.retainedKobo), [0])
+    })
+})
+
+test("sellers see what they owe and accept the terms that allow recovery", async () => {
+    await withPaymentCheckout("liability-seller", async (context) => {
+        const { fixture, request } = context
+        const view = () => request("GET", "/seller/liabilities", undefined, fixture.sellerToken)
+
+        const fresh = await view()
+        assert.equal(fresh.status, 200)
+        assert.equal(fresh.body.termsAccepted, false)
+        assert.equal(fresh.body.outstanding, "0.00")
+        assert.equal(fresh.body.deductionCapPercent, 50)
+        assert.deepEqual(fresh.body.liabilities, [])
+        assert.equal((await request("GET", "/seller/liabilities")).status, 403)
+
+        const stale = await request("POST", "/seller/payout/terms", { feeTermsVersion: "2000-01-01" }, fixture.sellerToken)
+        assert.equal(stale.status, 409)
+        assert.equal(stale.body.code, "PAYOUT_FEE_TERMS_OUTDATED")
+        assert.equal((await request("POST", "/seller/payout/terms", { feeTermsVersion: payoutFeeTerms.version })).status, 403)
+
+        const accepted = await request("POST", "/seller/payout/terms", { feeTermsVersion: payoutFeeTerms.version }, fixture.sellerToken)
+        assert.equal(accepted.status, 200)
+        assert.equal((await view()).body.termsAccepted, true)
+
+        const orderId = await payForCheckout(context)
+        await refundOrder(context, orderId, { amount: "1250.50", reason: "Item arrived damaged" })
+
+        const owing = await view()
+        assert.equal(owing.body.outstanding, "1250.50")
+        assert.deepEqual(
+            owing.body.liabilities.map((item: { orderId: number; reason: string; amount: string; remaining: string; status: string }) =>
+                [item.orderId, item.reason, item.amount, item.remaining, item.status]),
+            [[orderId, "Item arrived damaged", "1250.50", "1250.50", "OPEN"]]
+        )
+        assert.match(owing.body.feeTerms.text, /Refunds:/)
+    })
+})
+
+test("an admin records money collected by hand and can write off what cannot be collected", async () => {
+    await withPaymentCheckout("liability-admin", async (context) => {
+        const { fixture, request, adminToken } = context
+        const orderId = await payForCheckout(context)
+        const first = await refundOrder(context, orderId, { amount: 1000 })
+        providerReports(context, first.body.refund, 100000, "succeeded", "processed")
+        await request("POST", `/admin/refunds/${first.body.refund.id}/sync`, undefined, adminToken)
+        const second = await refundOrder(context, orderId, { amount: 2000 })
+        const firstLiabilityId = first.body.refund.liability.id as number
+        const secondLiabilityId = second.body.refund.liability.id as number
+
+        const open = await request("GET", "/admin/liabilities", undefined, adminToken)
+        assert.equal(open.status, 200)
+        assert.deepEqual(open.body.liabilities.map((item: { id: number }) => item.id).sort(), [firstLiabilityId, secondLiabilityId].sort())
+        assert.equal(open.body.liabilities[0].seller.email.includes("liability-admin-seller"), true)
+        assert.equal((await request("GET", "/admin/liabilities?status=NOPE", undefined, adminToken)).status, 400)
+        assert.equal((await request("GET", "/admin/liabilities", undefined, fixture.sellerToken)).status, 403)
+
+        const record = (id: number, body: Record<string, unknown>) => request("POST", `/admin/liabilities/${id}/manual-recovery`, body, adminToken)
+        assert.equal((await record(firstLiabilityId, { amount: "abc", note: "Bank transfer" })).status, 400)
+        assert.equal((await record(firstLiabilityId, { amount: 100 })).status, 400)
+        const tooMuch = await record(firstLiabilityId, { amount: 4000, note: "Bank transfer" })
+        assert.equal(tooMuch.status, 409)
+        assert.equal(tooMuch.body.code, "LIABILITY_NOT_OPEN")
+        assert.equal((await record(999999, { amount: 100, note: "Bank transfer" })).status, 404)
+
+        const partial = await record(firstLiabilityId, { amount: 400, note: "Bank transfer" })
+        assert.equal(partial.status, 200)
+        assert.equal(partial.body.liability.recovered, "400.00")
+        assert.equal(partial.body.liability.remaining, "600.00")
+        assert.equal(partial.body.liability.recoveries[0].orderId, null)
+        assert.equal(partial.body.liability.recoveries[0].note, "Bank transfer")
+
+        const cleared = await record(firstLiabilityId, { amount: "600.00", note: "Second transfer" })
+        assert.equal(cleared.body.liability.status, "CLEARED")
+        assert.equal((await record(firstLiabilityId, { amount: 1, note: "Too late" })).status, 409)
+
+        const writeOff = (id: number, body: Record<string, unknown>) => request("POST", `/admin/liabilities/${id}/write-off`, body, adminToken)
+        assert.equal((await writeOff(secondLiabilityId, {})).status, 400)
+        const written = await writeOff(secondLiabilityId, { note: "Seller has closed their shop" })
+        assert.equal(written.status, 200)
+        assert.equal(written.body.liability.status, "WRITTEN_OFF")
+        assert.equal((await writeOff(secondLiabilityId, { note: "Again" })).status, 409)
+        assert.equal((await writeOff(firstLiabilityId, { note: "Already cleared" })).status, 409)
+        assert.equal((await writeOff(999999, { note: "Nothing there" })).status, 404)
+        assert.equal((await request("GET", "/admin/liabilities?status=WRITTEN_OFF", undefined, adminToken)).body.liabilities.length >= 1, true)
+    })
+})
+
+// Verifies a payment whose stock was already released, which opens a recovery case.
+async function openRecoveryCase(context: PaymentTestContext) {
+    const reference = (await context.startPayment()).body.payment.reference as string
+    await prisma.inventoryReservation.updateMany({ where: { checkoutId: context.checkoutId }, data: { status: "RELEASED" } })
+    context.fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("success", reference)
+    await context.request("GET", `/payments/${reference}`)
+    return prisma.paymentRecoveryCase.findFirstOrThrow({ where: { paymentAttempt: { reference } } })
+}
+
+test("an admin clears a recovery case by refunding the whole payment", async (t) => {
+    t.mock.method(console, "error", () => {})
+
+    await withPaymentCheckout("recovery-refund", async (context) => {
+        const { fixture, checkoutId, request, adminToken } = context
+        const recoveryCase = await openRecoveryCase(context)
+
+        const list = await request("GET", "/admin/recovery-cases", undefined, adminToken)
+        assert.equal(list.status, 200)
+        const listed = list.body.cases.find((item: { id: number }) => item.id === recoveryCase.id)
+        assert.equal(listed.payment.amount, "3000.00")
+        assert.equal(listed.payment.checkoutId, checkoutId)
+        assert.match(listed.payment.buyer.email, /recovery-refund-consumer/)
+        assert.equal((await request("GET", "/admin/recovery-cases", undefined, fixture.token)).status, 403)
+        assert.equal((await request("GET", "/admin/recovery-cases?status=NOPE", undefined, adminToken)).status, 400)
+
+        const partial = await request("POST", `/admin/recovery-cases/${recoveryCase.id}/refund`, { amount: 100 }, adminToken)
+        assert.equal(partial.status, 400)
+        assert.equal(partial.body.code, "REFUND_AMOUNT_INVALID")
+
+        const refunded = await request("POST", `/admin/recovery-cases/${recoveryCase.id}/refund`, { customerNote: "We could not complete your order" }, adminToken)
+        assert.equal(refunded.status, 201)
+        assert.equal(refunded.body.refund.orderId, null)
+        assert.equal(refunded.body.refund.amount, "3000.00")
+        assert.equal(refunded.body.refund.chargeSeller, false)
+        assert.equal(refunded.body.refund.restock, false)
+        assert.equal(refunded.body.refund.liability, null)
+        assert.equal((await prisma.paymentRecoveryCase.findUniqueOrThrow({ where: { id: recoveryCase.id } })).status, "OPEN")
+
+        providerReports(context, refunded.body.refund, 300000, "succeeded", "processed")
+        await request("POST", `/admin/refunds/${refunded.body.refund.id}/sync`, undefined, adminToken)
+
+        const closed = await prisma.paymentRecoveryCase.findUniqueOrThrow({ where: { id: recoveryCase.id } })
+        assert.equal(closed.status, "RESOLVED")
+        assert.match(closed.resolutionNote ?? "", /Refunded in full \(RFD-/)
+        const [order] = await prisma.order.findMany({ where: { checkoutId } })
+        assert.equal(order!.status, "CANCELLED")
+        assert.equal(await prisma.sellerLiability.count({ where: { refundId: refunded.body.refund.id } }), 0)
+
+        const again = await request("POST", `/admin/recovery-cases/${recoveryCase.id}/refund`, {}, adminToken)
+        assert.equal(again.status, 409)
+    })
+})
+
+test("an admin can close a recovery case that was handled another way", async (t) => {
+    t.mock.method(console, "error", () => {})
+
+    await withPaymentCheckout("recovery-resolve", async (context) => {
+        const { request, adminToken } = context
+        const recoveryCase = await openRecoveryCase(context)
+        const resolve = (id: number, body: Record<string, unknown>) => request("POST", `/admin/recovery-cases/${id}/resolve`, body, adminToken)
+
+        assert.equal((await resolve(recoveryCase.id, {})).status, 400)
+        assert.equal((await resolve(999999, { note: "Nothing there" })).status, 404)
+
+        const resolved = await resolve(recoveryCase.id, { note: "Fulfilled by hand and delivered" })
+        assert.equal(resolved.status, 200)
+        assert.equal(resolved.body.case.status, "RESOLVED")
+        assert.equal(resolved.body.case.resolutionNote, "Fulfilled by hand and delivered")
+        assert.equal((await resolve(recoveryCase.id, { note: "Again" })).status, 409)
+        assert.equal((await request("GET", "/admin/recovery-cases", undefined, adminToken)).body.cases.length, 0)
+        assert.equal((await request("GET", "/admin/recovery-cases?status=RESOLVED", undefined, adminToken)).body.cases.length >= 1, true)
+    })
+})
+
+test("the real adapters send refunds, balance checks and retained shares the way each provider expects", async (t) => {
+    process.env.PAYSTACK_SECRET_KEY ||= "sk_test_integration"
+    process.env.FLUTTERWAVE_SECRET_KEY ||= "FLWSECK_TEST-integration"
+    const requests: Array<{ url: string; method: string; body: any }> = []
+    let nextResponse: unknown = {}
+    t.mock.method(globalThis, "fetch", async (url: string, init?: RequestInit) => {
+        requests.push({ url: String(url), method: init?.method ?? "GET", body: init?.body ? JSON.parse(String(init.body)) : null })
+        return new Response(JSON.stringify(nextResponse), { status: 200, headers: { "content-type": "application/json" } })
+    })
+
+    // Paystack: refund, list, balance
+    nextResponse = { status: true, data: { id: 3018284, status: "pending", amount: 150000, fully_deducted: false, expected_at: "2026-11-01T00:00:00.000Z", createdAt: "2026-10-20T10:00:00.000Z" } }
+    const created = await paystackAdapter.createRefund({ transactionReference: "VND-9-abc", transactionId: "555", amountKobo: 150000, customerNote: "Sorry", merchantNote: "Vendly refund RFD-1" })
+    assert.deepEqual(requests.at(-1), {
+        url: "https://api.paystack.co/refund",
+        method: "POST",
+        body: { transaction: "VND-9-abc", amount: 150000, currency: "NGN", customer_note: "Sorry", merchant_note: "Vendly refund RFD-1" }
+    })
+    assert.equal(created.providerRefundId, "3018284")
+    assert.equal(created.outcome, "processing")
+    // A create response does not claim the refund is waiting for funds.
+    assert.equal(created.awaitingFunds, false)
+
+    nextResponse = {
+        status: true,
+        data: [
+            { id: 1, status: "pending", amount: 100, fully_deducted: 0 },
+            { id: 2, status: "processed", amount: 200, fully_deducted: 1 },
+            { id: 3, status: "needs-attention", amount: 300 },
+            { id: 4, status: "failed", amount: 400 },
+            { id: 5, status: "processing", amount: 500, fully_deducted: 1 }
+        ]
+    }
+    const listed = await paystackAdapter.findRefunds({ transactionReference: "VND-9-abc", transactionId: "555", providerRefundId: null })
+    assert.equal(requests.at(-1)!.url, "https://api.paystack.co/refund?transaction=555&perPage=100")
+    assert.deepEqual(listed.map((refund) => [refund.providerRefundId, refund.outcome, refund.awaitingFunds]), [
+        ["1", "processing", true],
+        ["2", "succeeded", false],
+        ["3", "needs_attention", false],
+        ["4", "failed", false],
+        ["5", "processing", false]
+    ])
+    await assert.rejects(() => paystackAdapter.findRefunds({ transactionReference: "VND-9-abc", transactionId: null, providerRefundId: null }), PaymentProviderError)
+
+    nextResponse = { status: true, data: [{ currency: "GHS", balance: 5 }, { currency: "NGN", balance: 23446800 }] }
+    assert.equal(await paystackAdapter.getBalanceKobo(), 23446800)
+
+    // Paystack: a retained share is whatever the sellers' shares leave over, and Vendly's share is read back.
+    nextResponse = { status: true, data: { authorization_url: "https://checkout.paystack.com/x" } }
+    await paystackAdapter.initializePayment({
+        reference: "VND-9-abc", amountKobo: 3000000, email: "buyer@example.test", callbackUrl: "http://localhost:5173/checkout/payment-return",
+        splits: [{ subaccountCode: "SUB_A", amountKobo: 1800000, retainedKobo: 200000 }, { subaccountCode: "SUB_B", amountKobo: 1000000, retainedKobo: 0 }]
+    })
+    assert.deepEqual(requests.at(-1)!.body.split.subaccounts, [
+        { subaccount: "SUB_A", share: 1800000 },
+        { subaccount: "SUB_B", share: 1000000 }
+    ])
+    nextResponse = {
+        status: true,
+        data: { id: 7, reference: "VND-9-abc", status: "success", amount: 3000000, currency: "NGN",
+            split: { shares: { integration: 196333, subaccounts: [{ subaccount_code: "ACCT_A", amount: 1767000, fees: 33000 }] } } }
+    }
+    const verified = await paystackAdapter.verifyPayment("VND-9-abc")
+    assert.ok(verified.outcome !== "not_found")
+    assert.equal(verified.vendlyShareKobo, 196333)
+
+    // Paystack webhooks for refunds carry no ID of their own.
+    const refundEvent = paystackAdapter.parseWebhook(Buffer.from(JSON.stringify({ event: "refund.processed", data: { transaction_reference: "VND-9-abc", amount: "100" } })))
+    assert.deepEqual(refundEvent, { eventKey: "refund.processed:VND-9-abc", eventType: "refund.processed", reference: "VND-9-abc", isPaymentEvent: false, isRefundEvent: true })
+
+    // Flutterwave: refund by transaction ID, in naira
+    nextResponse = { status: "success", data: { id: 8612, amount_refunded: 1500, status: "completed", created_at: "2026-10-20T10:00:00.000Z" } }
+    const flwRefund = await flutterwaveAdapter.createRefund({ transactionReference: "VND-9-abc", transactionId: "908790", amountKobo: 150000, customerNote: null, merchantNote: "Vendly refund RFD-2" })
+    assert.deepEqual(requests.at(-1), {
+        url: "https://api.flutterwave.com/v3/transactions/908790/refund",
+        method: "POST",
+        body: { amount: 1500, comments: "Vendly refund RFD-2" }
+    })
+    assert.equal(flwRefund.outcome, "succeeded")
+    assert.equal(flwRefund.amountKobo, 150000)
+    await assert.rejects(() => flutterwaveAdapter.createRefund({ transactionReference: "x", transactionId: null, amountKobo: 100, customerNote: null, merchantNote: "n" }), PaymentProviderError)
+
+    nextResponse = { status: "success", data: { id: 469462, amount_refunded: 101.4, status: "completed-mpgs", created_at: "2021-05-12T23:19:11.000Z" } }
+    const flwFound = await flutterwaveAdapter.findRefunds({ transactionReference: "VND-9-abc", transactionId: "908790", providerRefundId: "469462" })
+    assert.equal(requests.at(-1)!.url, "https://api.flutterwave.com/v3/refunds/469462")
+    assert.deepEqual(flwFound.map((refund) => [refund.providerRefundId, refund.outcome, refund.amountKobo]), [["469462", "succeeded", 10140]])
+
+    nextResponse = { status: "success", data: { available_balance: 2500.5 } }
+    assert.equal(await flutterwaveAdapter.getBalanceKobo(), 250050)
+
+    // Flutterwave: a retained share is a flat commission on that seller's order, with the rest split by ratio.
+    nextResponse = { status: "success", data: { link: "https://checkout.flutterwave.com/x" } }
+    await flutterwaveAdapter.initializePayment({
+        reference: "VND-9-abc", amountKobo: 3000000, email: "buyer@example.test", callbackUrl: "http://localhost:5173/checkout/payment-return",
+        splits: [{ subaccountCode: "RS_A", amountKobo: 1800000, retainedKobo: 200000 }, { subaccountCode: "RS_B", amountKobo: 1000000, retainedKobo: 0 }]
+    })
+    assert.deepEqual(requests.at(-1)!.body.subaccounts, [
+        { id: "RS_A", transaction_split_ratio: 9, transaction_charge_type: "flat", transaction_charge: 2000 },
+        { id: "RS_B", transaction_split_ratio: 5, transaction_charge_type: "flat", transaction_charge: 0 }
+    ])
+    nextResponse = {
+        status: "success",
+        data: { id: 9, tx_ref: "VND-9-abc", status: "successful", amount: 30000, currency: "NGN",
+            meta: { split_settlement_info: JSON.stringify({
+                RS_A: { merchant_commission: 2000, subaccount_earning: 17730 },
+                total_merchant_commission: 2000,
+                RS_B: { merchant_commission: 0, subaccount_earning: 9850 }
+            }) } }
+    }
+    const flwVerified = await flutterwaveAdapter.verifyPayment("VND-9-abc")
+    assert.ok(flwVerified.outcome !== "not_found")
+    assert.equal(flwVerified.vendlyShareKobo, 200000)
+    assert.deepEqual(flwVerified.sellerShares, [
+        { subaccountCode: "RS_A", receivedKobo: 1773000, feeKobo: null, retainedKobo: 200000 },
+        { subaccountCode: "RS_B", receivedKobo: 985000, feeKobo: null, retainedKobo: 0 }
+    ])
+})
+
+test("the session check reports whether the user is an administrator", async () => {
+    await withPaymentCheckout("session-admin", async ({ fixture, adminToken, request }) => {
+        const admin = await request("GET", "/users/check", undefined, adminToken)
+        assert.equal(admin.status, 200)
+        assert.equal(admin.body.isAdmin, true)
+
+        const consumer = await request("GET", "/users/check", undefined, fixture.token)
+        assert.equal(consumer.body.isAdmin, false)
+        assert.equal(consumer.body.role, "CONSUMER")
     })
 })

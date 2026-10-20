@@ -2,6 +2,7 @@ import type { Request, Response } from "express"
 import prisma from "../lib/prisma.js"
 import { Prisma, type PaymentProvider } from "../generated/prisma/client.js"
 import { getPaymentProvider } from "../lib/payments/providers.js"
+import { syncRefundsForPayment } from "../lib/payments/refunds.js"
 import { syncPayment } from "./paymentController.js"
 
 // Receives a provider's webhooks. The body arrives as raw bytes so the signature can be checked
@@ -30,6 +31,27 @@ export function handlePaymentWebhook(provider: PaymentProvider) {
 
         if (!event) {
             res.status(400).send({ message: "Unrecognised webhook event" })
+            return
+        }
+
+        // A refund event only prompts Vendly to ask the provider about that payment's open refunds.
+        // That check is safe to repeat, so these events are not recorded or deduplicated.
+        if (event.isRefundEvent) {
+            if (event.reference) {
+                try {
+                    await syncRefundsForPayment(provider, event.reference)
+                } catch (error) {
+                    console.error("Refund webhook processing failed", {
+                        provider,
+                        reference: event.reference,
+                        reason: error instanceof Error ? error.message : undefined
+                    })
+                    res.status(500).send({ message: "Sorry there is an issue on our end" })
+                    return
+                }
+            }
+
+            res.send({ message: "Event received" })
             return
         }
 

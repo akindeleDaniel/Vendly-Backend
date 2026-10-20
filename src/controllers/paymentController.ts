@@ -5,6 +5,7 @@ import prisma from "../lib/prisma.js"
 import { Prisma, type PaymentAttempt, type PaymentProvider } from "../generated/prisma/client.js"
 import { acquireCheckoutCreationLock, expireExpiredCheckouts } from "./checkoutController.js"
 import { getPaymentProvider, paymentProviderNames, paymentProviders } from "../lib/payments/providers.js"
+import { planLiabilityDeductions } from "../lib/liabilities.js"
 import { settleCheckoutPayment } from "../lib/payments/settlement.js"
 import { PaymentProviderError, type PaymentVerification } from "../lib/payments/types.js"
 
@@ -170,7 +171,10 @@ async function applyVerification(attempt: PaymentAttempt, verification: PaymentV
             status: "SUCCESS",
             verifiedAt: now,
             failureReason: null,
-            ...(verification.sellerShares ? { sellerShares: verification.sellerShares as Prisma.InputJsonValue } : {})
+            ...(verification.sellerShares ? { sellerShares: verification.sellerShares as Prisma.InputJsonValue } : {}),
+            ...(verification.vendlyShareKobo !== undefined && verification.vendlyShareKobo !== null
+                ? { vendlyShareKobo: verification.vendlyShareKobo }
+                : {})
         }
     })
 }
@@ -301,6 +305,8 @@ export async function createCheckoutPayment(req: Request, res: Response) {
                     orders: {
                         orderBy: { id: "asc" },
                         select: {
+                            id: true,
+                            sellerId: true,
                             status: true,
                             total: true,
                             seller: {
@@ -384,13 +390,25 @@ export async function createCheckoutPayment(req: Request, res: Response) {
                 )
             }
 
-            const splits = checkout.orders.map((order) => ({
-                subaccountCode: order.seller.sellerProfile!.payoutAccounts[0]!.subaccountCode!,
-                amountKobo: toKobo(order.total)
-            }))
+            // Part of a seller's order may be kept by Vendly to recover what they owe for earlier refunds.
+            // The customer still pays the same total; only how it is split changes.
+            const deductions = await planLiabilityDeductions(tx, checkout.id, checkout.orders.map((order) => ({
+                id: order.id,
+                sellerId: order.sellerId,
+                totalKobo: toKobo(order.total)
+            })))
+            const splits = checkout.orders.map((order) => {
+                const retainedKobo = deductions.get(order.id) ?? 0
+
+                return {
+                    subaccountCode: order.seller.sellerProfile!.payoutAccounts[0]!.subaccountCode!,
+                    amountKobo: toKobo(order.total) - retainedKobo,
+                    retainedKobo
+                }
+            })
             const amountKobo = toKobo(checkout.total)
 
-            if (splits.reduce((sum, split) => sum + split.amountKobo, 0) !== amountKobo) {
+            if (splits.reduce((sum, split) => sum + split.amountKobo + split.retainedKobo, 0) !== amountKobo) {
                 throw new Error(`Checkout ${checkout.id} total does not equal the sum of its orders`)
             }
 
@@ -415,6 +433,14 @@ export async function createCheckoutPayment(req: Request, res: Response) {
                 data: { expiresAt: extendedExpiry }
             })
 
+            // Remember what each order plans to give up, and clear any plan left by an earlier attempt.
+            for (const order of checkout.orders) {
+                await tx.order.update({
+                    where: { id: order.id },
+                    data: { liabilityDeduction: new Prisma.Decimal(deductions.get(order.id) ?? 0).dividedBy(100) }
+                })
+            }
+
             return {
                 kind: "new" as const,
                 attempt,
@@ -424,7 +450,7 @@ export async function createCheckoutPayment(req: Request, res: Response) {
                     amountKobo,
                     email: checkout.user.email,
                     callbackUrl: `${config.frontendUrl}/checkout/payment-return`,
-                    splits: splits.filter((split) => split.amountKobo > 0)
+                    splits: splits.filter((split) => split.amountKobo + split.retainedKobo > 0)
                 }
             }
         }, {
