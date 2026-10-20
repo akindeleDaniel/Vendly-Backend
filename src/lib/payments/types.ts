@@ -23,6 +23,14 @@ export type InitializePaymentInput = {
     splits: Array<{ subaccountCode: string; amountKobo: number }>
 }
 
+// One seller's part of a split payment as the provider reported it. feeKobo is null when the provider
+// reports only the payout, in which case the fee is the seller's order total minus the payout.
+export type SellerShare = {
+    subaccountCode: string
+    receivedKobo: number
+    feeKobo: number | null
+}
+
 // "success" and "failed" are final. "pending" means the customer may still pay.
 // "not_found" means the provider has no transaction with this reference.
 export type PaymentVerification =
@@ -34,6 +42,8 @@ export type PaymentVerification =
         amountKobo: number
         currency: string
         transactionId: string | null
+        // Null when the provider did not report the split.
+        sellerShares?: SellerShare[] | null
     }
 
 // A webhook event reduced to what Vendly needs. The payload itself is never trusted: a payment

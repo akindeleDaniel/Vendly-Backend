@@ -165,7 +165,13 @@ async function applyVerification(attempt: PaymentAttempt, verification: PaymentV
 
     await prisma.paymentAttempt.updateMany({
         where: stillPending,
-        data: { ...observed, status: "SUCCESS", verifiedAt: now, failureReason: null }
+        data: {
+            ...observed,
+            status: "SUCCESS",
+            verifiedAt: now,
+            failureReason: null,
+            ...(verification.sellerShares ? { sellerShares: verification.sellerShares as Prisma.InputJsonValue } : {})
+        }
     })
 }
 

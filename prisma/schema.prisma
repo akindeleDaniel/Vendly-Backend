@@ -231,6 +231,18 @@ model Order {
   subtotal     Decimal @db.Decimal(12, 2)
   shippingCost Decimal @db.Decimal(12, 2)
   total        Decimal @db.Decimal(12, 2)
+  // What the payment provider reported for this seller's share when the order was paid: the fee
+  // taken from it and the amount paid out to the seller. Null when the provider did not report it.
+  providerFee    Decimal? @db.Decimal(12, 2)
+  sellerReceives Decimal? @db.Decimal(12, 2)
+
+  // Fulfilment. The seller reports shipping and delivery; only the buyer's confirmation makes an order
+  // DELIVERED. deliveryReportedAt is the seller saying it was delivered (status stays SHIPPED until the
+  // buyer confirms); deliveryConfirmedAt is the buyer confirming it.
+  shippedAt           DateTime?
+  shippingNote        String?
+  deliveryReportedAt  DateTime?
+  deliveryConfirmedAt DateTime?
 
   deliveryName         String
   deliveryPhone        String
@@ -283,6 +295,9 @@ model PaymentAttempt {
   failureReason         String?
   lastCheckedAt         DateTime?
   verifiedAt            DateTime?
+  // Each subaccount's fee and payout as the provider reported them at verification, in kobo:
+  // [{ subaccountCode, feeKobo, receivedKobo }]. Copied onto the seller orders at settlement.
+  sellerShares          Json?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

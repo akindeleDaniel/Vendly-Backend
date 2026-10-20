@@ -4502,7 +4502,295 @@ test("the real adapters send each provider its own amount format and split", asy
         reference: "VND-1-abc",
         amountKobo: 3000050,
         currency: "NGN",
-        transactionId: "42"
+        transactionId: "42",
+        sellerShares: null
     })
     assert.equal(requests[2]!.url, "https://api.flutterwave.com/v3/transactions/verify_by_reference?tx_ref=VND-1-abc")
+})
+
+test("records each seller's provider fee and payout on their order when a payment settles", async () => {
+    await withPaymentCheckout("order-fees-paystack", async ({ checkoutId, fakes, request, startPayment }) => {
+        const reference = (await startPayment()).body.payment.reference as string
+        fakes.behaviors.PAYSTACK.verify = async () => ({
+            ...paystackVerification("success", reference),
+            sellerShares: [{ subaccountCode: "ACCT_test_order-fees-paystack", receivedKobo: 294500, feeKobo: 5500 }]
+        })
+
+        await request("GET", `/payments/${reference}`)
+        const [order] = await prisma.order.findMany({ where: { checkoutId } })
+        assert.equal(order?.providerFee?.toFixed(2), "55.00")
+        assert.equal(order?.sellerReceives?.toFixed(2), "2945.00")
+    })
+
+    // Flutterwave reports only the payout, so the fee is the order total minus the payout.
+    await withPaymentCheckout("order-fees-flutterwave", async ({ checkoutId, fakes, request }) => {
+        const reference = (await request("POST", `/checkout/${checkoutId}/payments`, { provider: "FLUTTERWAVE" })).body.payment.reference as string
+        fakes.behaviors.FLUTTERWAVE.verify = async () => ({
+            ...flutterwaveVerification("success", reference),
+            sellerShares: [{ subaccountCode: "RS_test_order-fees-flutterwave", receivedKobo: 295800, feeKobo: null }]
+        })
+
+        await request("GET", `/payments/${reference}`)
+        const [order] = await prisma.order.findMany({ where: { checkoutId } })
+        assert.equal(order?.providerFee?.toFixed(2), "42.00")
+        assert.equal(order?.sellerReceives?.toFixed(2), "2958.00")
+    }, { payoutProviders: bothProviders })
+})
+
+test("shows customers their paid orders only", async () => {
+    await withPaymentCheckout("order-history", async ({ fixture, checkoutId, fakes, request, startPayment }) => {
+        const beforePayment = await request("GET", "/orders")
+        assert.equal(beforePayment.status, 200)
+        assert.equal(beforePayment.body.total, 0)
+        assert.equal((await request("GET", `/orders/${checkoutId}`)).status, 404)
+
+        const reference = (await startPayment()).body.payment.reference as string
+        fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("success", reference)
+        await request("GET", `/payments/${reference}`)
+
+        const history = await request("GET", "/orders")
+        assert.equal(history.body.total, 1)
+        const [summary] = history.body.orders
+        assert.equal(summary.id, checkoutId)
+        assert.equal(summary.status, "COMPLETED")
+        assert.equal(summary.total, "3000.00")
+        assert.equal(summary.payment.reference, reference)
+        assert.equal(summary.payment.provider, "PAYSTACK")
+        assert.deepEqual(summary.sellerOrders.map((order: { status: string; itemCount: number; seller: { businessName: string } }) =>
+            [order.status, order.itemCount, order.seller.businessName]), [["PAID", 2, "order-history Shop"]])
+        assert.deepEqual(summary.sellerOrders[0].items.map((item: { title: string; quantity: number; unitPrice: string; lineTotal: string }) =>
+            [item.title, item.quantity, item.unitPrice, item.lineTotal]), [["order-history listing", 2, "1500.00", "3000.00"]])
+
+        const detail = await request("GET", `/orders/${checkoutId}`)
+        assert.equal(detail.status, 200)
+        assert.equal(detail.body.delivery.address, "1 Test Street")
+        assert.deepEqual(detail.body.sellerOrders[0].items.map((item: { title: string; quantity: number; unitPrice: string }) =>
+            [item.title, item.quantity, item.unitPrice]), [["order-history listing", 2, "1500.00"]])
+
+        const other = await fixture.addConsumer(1)
+        assert.equal((await request("GET", `/orders/${checkoutId}`, undefined, other.token)).status, 404)
+        assert.equal((await request("GET", "/orders", undefined, other.token)).body.total, 0)
+        assert.equal((await request("GET", "/orders?page=0")).status, 400)
+        assert.equal((await request("GET", "/orders", undefined, fixture.sellerToken)).status, 403)
+    })
+})
+
+test("shows sellers their paid orders with fees and the buyer's delivery details", async () => {
+    await withPaymentCheckout("seller-orders", async ({ fixture, checkoutId, fakes, request, startPayment }) => {
+        const [order] = await prisma.order.findMany({ where: { checkoutId } })
+        assert.equal((await request("GET", "/seller/orders", undefined, fixture.sellerToken)).body.total, 0)
+        assert.equal((await request("GET", `/seller/orders/${order!.id}`, undefined, fixture.sellerToken)).status, 404)
+
+        const reference = (await startPayment()).body.payment.reference as string
+        fakes.behaviors.PAYSTACK.verify = async () => ({
+            ...paystackVerification("success", reference),
+            sellerShares: [{ subaccountCode: "ACCT_test_seller-orders", receivedKobo: 294500, feeKobo: 5500 }]
+        })
+        await request("GET", `/payments/${reference}`)
+
+        const list = await request("GET", "/seller/orders", undefined, fixture.sellerToken)
+        assert.equal(list.status, 200)
+        assert.equal(list.body.total, 1)
+        const [summary] = list.body.orders
+        assert.equal(summary.id, order!.id)
+        assert.equal(summary.status, "PAID")
+        assert.equal(summary.provider, "PAYSTACK")
+        assert.equal(summary.total, "3000.00")
+        assert.equal(summary.providerFee, "55.00")
+        assert.equal(summary.sellerReceives, "2945.00")
+        assert.equal(summary.delivery.fullName, "Test Consumer")
+        assert.equal(summary.delivery.phone, "08000000000")
+        assert.ok(summary.delivery.address)
+        assert.equal(summary.itemCount, 2)
+        assert.equal(summary.items[0].quantity, 2)
+        assert.ok(summary.items[0].title)
+        assert.ok(summary.paidAt)
+
+        const detail = await request("GET", `/seller/orders/${order!.id}`, undefined, fixture.sellerToken)
+        assert.equal(detail.status, 200)
+        assert.equal(detail.body.delivery.phone, "08000000000")
+        assert.equal(detail.body.items[0].quantity, 2)
+
+        assert.equal((await request("GET", "/seller/orders?status=SHIPPED", undefined, fixture.sellerToken)).body.total, 0)
+        assert.equal((await request("GET", "/seller/orders?status=PAID", undefined, fixture.sellerToken)).body.total, 1)
+        assert.equal((await request("GET", "/seller/orders?status=PENDING_PAYMENT", undefined, fixture.sellerToken)).status, 400)
+        assert.equal((await request("GET", "/seller/orders")).status, 403)
+    })
+})
+
+test("the real adapters read each seller's payout from the provider's verification", async (t) => {
+    process.env.PAYSTACK_SECRET_KEY ||= "sk_test_integration"
+    process.env.FLUTTERWAVE_SECRET_KEY ||= "FLWSECK_TEST-integration"
+    let nextResponse: unknown = {}
+    t.mock.method(globalThis, "fetch", async () =>
+        new Response(JSON.stringify(nextResponse), { status: 200, headers: { "content-type": "application/json" } }))
+
+    nextResponse = {
+        status: true,
+        data: {
+            id: 1, reference: "VND-2-abc", status: "success", amount: 3000000, currency: "NGN",
+            split: { shares: { subaccounts: [
+                { subaccount_code: "ACCT_A", amount: 1963333, fees: 36667 },
+                { subaccount_code: "ACCT_B", amount: 981667, fees: 18333 }
+            ] } }
+        }
+    }
+    const paystack = await paystackAdapter.verifyPayment("VND-2-abc")
+    assert.ok(paystack.outcome !== "not_found")
+    assert.deepEqual(paystack.sellerShares, [
+        { subaccountCode: "ACCT_A", receivedKobo: 1963333, feeKobo: 36667 },
+        { subaccountCode: "ACCT_B", receivedKobo: 981667, feeKobo: 18333 }
+    ])
+
+    nextResponse = {
+        status: "success",
+        data: {
+            id: 2, tx_ref: "VND-2-abc", status: "successful", amount: 30000, currency: "NGN",
+            meta: { split_settlement_info: JSON.stringify({
+                RS_A: { merchant_commission: 0, subaccount_earning: 19720 },
+                total_merchant_commission: 0,
+                RS_B: { merchant_commission: 0, subaccount_earning: 9860 }
+            }) }
+        }
+    }
+    const flutterwave = await flutterwaveAdapter.verifyPayment("VND-2-abc")
+    assert.ok(flutterwave.outcome !== "not_found")
+    assert.deepEqual(flutterwave.sellerShares, [
+        { subaccountCode: "RS_A", receivedKobo: 1972000, feeKobo: null },
+        { subaccountCode: "RS_B", receivedKobo: 986000, feeKobo: null }
+    ])
+})
+
+// Pays for the fixture's checkout through the fake provider and returns the seller order's ID.
+async function payForCheckout({ checkoutId, fakes, request, startPayment }: PaymentTestContext) {
+    const reference = (await startPayment()).body.payment.reference as string
+    fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("success", reference)
+    await request("GET", `/payments/${reference}`)
+    const [order] = await prisma.order.findMany({ where: { checkoutId } })
+    assert.equal(order?.status, "PAID")
+    return order!.id
+}
+
+test("a seller can ship a paid order with a note, once, and only their own order", async () => {
+    await withPaymentCheckout("fulfil-ship", async (context) => {
+        const { fixture, checkoutId, request } = context
+        const [unpaid] = await prisma.order.findMany({ where: { checkoutId } })
+        assert.equal((await request("POST", `/seller/orders/${unpaid!.id}/ship`, {}, fixture.sellerToken)).status, 404)
+
+        const orderId = await payForCheckout(context)
+        const ship = (body: unknown = {}, token = fixture.sellerToken) => request("POST", `/seller/orders/${orderId}/ship`, body, token)
+
+        assert.equal((await ship({ note: "x".repeat(201) })).status, 400)
+        assert.equal((await ship({ note: 42 })).status, 400)
+        assert.equal((await ship({}, fixture.token)).status, 403)
+
+        const stranger = await prisma.user.create({
+            data: { name: "Other seller", email: `fulfil-ship-stranger-${randomUUID()}@example.test`, passwordHash: "integration-test-not-a-password", role: "SELLER" }
+        })
+        try {
+            const strangerToken = jwt.sign({ id: stranger.id }, process.env.JWT_SECRET!)
+            assert.equal((await ship({}, strangerToken)).status, 404)
+        } finally {
+            await prisma.user.delete({ where: { id: stranger.id } })
+        }
+
+        const shipped = await ship({ note: "  GIG Logistics, tracking 12345  " })
+        assert.equal(shipped.status, 200)
+        assert.equal(shipped.body.status, "SHIPPED")
+        assert.equal(shipped.body.shippingNote, "GIG Logistics, tracking 12345")
+        assert.ok(shipped.body.shippedAt)
+        assert.equal(shipped.body.deliveryReportedAt, null)
+
+        const again = await ship({ note: "a different note" })
+        assert.equal(again.status, 200)
+        assert.equal(again.body.shippingNote, "GIG Logistics, tracking 12345")
+        assert.equal(again.body.shippedAt, shipped.body.shippedAt)
+    })
+})
+
+test("a seller's delivered report is not final: the buyer is asked to confirm and only their confirmation delivers the order", async () => {
+    await withPaymentCheckout("fulfil-confirm", async (context) => {
+        const { fixture, checkoutId, request } = context
+        const orderId = await payForCheckout(context)
+        const confirmPath = `/orders/${checkoutId}/seller-orders/${orderId}/confirm-delivery`
+        const awaiting = async () => (await request("GET", "/orders/awaiting-confirmation")).body.count as number
+
+        assert.equal(await awaiting(), 0)
+
+        const tooEarly = await request("POST", confirmPath)
+        assert.equal(tooEarly.status, 409)
+        assert.equal(tooEarly.body.code, "ORDER_STATUS_INVALID")
+
+        await request("POST", `/seller/orders/${orderId}/ship`, {}, fixture.sellerToken)
+        const notReported = await request("POST", confirmPath)
+        assert.equal(notReported.status, 409)
+        assert.equal(notReported.body.code, "DELIVERY_NOT_REPORTED")
+
+        const reported = await request("POST", `/seller/orders/${orderId}/delivered`, {}, fixture.sellerToken)
+        assert.equal(reported.status, 200)
+        assert.equal(reported.body.status, "SHIPPED")
+        assert.ok(reported.body.deliveryReportedAt)
+        assert.equal(reported.body.deliveryConfirmedAt, null)
+
+        assert.equal(await awaiting(), 1)
+        const list = await request("GET", "/orders")
+        assert.ok(list.body.orders[0].sellerOrders[0].deliveryReportedAt)
+        assert.equal(list.body.orders[0].sellerOrders[0].status, "SHIPPED")
+
+        assert.equal((await request("POST", confirmPath, undefined, fixture.sellerToken)).status, 403)
+        const other = await fixture.addConsumer(1)
+        assert.equal((await request("POST", confirmPath, undefined, other.token)).status, 404)
+        assert.equal((await request("POST", `/orders/${checkoutId + 1000}/seller-orders/${orderId}/confirm-delivery`)).status, 404)
+        assert.equal((await prisma.order.findUniqueOrThrow({ where: { id: orderId } })).status, "SHIPPED")
+
+        const confirmed = await request("POST", confirmPath)
+        assert.equal(confirmed.status, 200)
+        assert.equal(confirmed.body.sellerOrders[0].status, "DELIVERED")
+        assert.ok(confirmed.body.sellerOrders[0].deliveryConfirmedAt)
+        assert.equal(await awaiting(), 0)
+
+        const repeated = await request("POST", confirmPath)
+        assert.equal(repeated.status, 200)
+        assert.equal(repeated.body.sellerOrders[0].deliveryConfirmedAt, confirmed.body.sellerOrders[0].deliveryConfirmedAt)
+
+        const sellerView = await request("GET", `/seller/orders/${orderId}`, undefined, fixture.sellerToken)
+        assert.equal(sellerView.body.status, "DELIVERED")
+        assert.equal((await request("GET", "/seller/orders?status=DELIVERED", undefined, fixture.sellerToken)).body.total, 1)
+        assert.equal((await request("GET", "/seller/orders?status=SHIPPED", undefined, fixture.sellerToken)).body.total, 0)
+
+        // Once delivered, the seller's requests change nothing.
+        const afterDelivered = await request("POST", `/seller/orders/${orderId}/delivered`, {}, fixture.sellerToken)
+        assert.equal(afterDelivered.body.status, "DELIVERED")
+    })
+})
+
+test("a seller can report delivery straight from paid, which also marks it shipped", async () => {
+    await withPaymentCheckout("fulfil-direct", async (context) => {
+        const { fixture, request } = context
+        const orderId = await payForCheckout(context)
+
+        const reported = await request("POST", `/seller/orders/${orderId}/delivered`, {}, fixture.sellerToken)
+        assert.equal(reported.status, 200)
+        assert.equal(reported.body.status, "SHIPPED")
+        assert.ok(reported.body.shippedAt)
+        assert.ok(reported.body.deliveryReportedAt)
+        assert.equal((await request("GET", "/seller/orders?status=SHIPPED", undefined, fixture.sellerToken)).body.total, 1)
+
+        const repeated = await request("POST", `/seller/orders/${orderId}/delivered`, {}, fixture.sellerToken)
+        assert.equal(repeated.body.deliveryReportedAt, reported.body.deliveryReportedAt)
+    })
+})
+
+test("refunded orders cannot be shipped or reported delivered", async () => {
+    await withPaymentCheckout("fulfil-refunded", async (context) => {
+        const { fixture, request } = context
+        const orderId = await payForCheckout(context)
+        await prisma.order.update({ where: { id: orderId }, data: { status: "REFUNDED" } })
+
+        for (const action of ["ship", "delivered"]) {
+            const response = await request("POST", `/seller/orders/${orderId}/${action}`, {}, fixture.sellerToken)
+            assert.equal(response.status, 409)
+            assert.equal(response.body.code, "ORDER_STATUS_INVALID")
+        }
+    })
 })

@@ -1,6 +1,7 @@
 import { Prisma } from "../../generated/prisma/client.js"
 import { acquireCheckoutCreationLock } from "../../controllers/checkoutController.js"
 import prisma from "../prisma.js"
+import type { SellerShare } from "./types.js"
 
 export type SettlementResult = "settled" | "already_settled" | "needs_review"
 
@@ -50,7 +51,7 @@ async function settleOnce(attemptId: number): Promise<SettlementResult> {
     return prisma.$transaction(async (tx) => {
         const paymentAttempt = await tx.paymentAttempt.findUniqueOrThrow({
             where: { id: attemptId },
-            select: { status: true, checkoutId: true, checkout: { select: { userId: true } } }
+            select: { status: true, provider: true, sellerShares: true, checkoutId: true, checkout: { select: { userId: true } } }
         })
 
         if (paymentAttempt.status !== "SUCCESS") {
@@ -64,7 +65,25 @@ async function settleOnce(attemptId: number): Promise<SettlementResult> {
             include: {
                 checkoutItems: { select: { listingId: true, quantity: true } },
                 inventoryReservations: { select: { listingId: true, quantity: true, status: true } },
-                orders: { select: { status: true } },
+                orders: {
+                    select: {
+                        id: true,
+                        status: true,
+                        total: true,
+                        seller: {
+                            select: {
+                                sellerProfile: {
+                                    select: {
+                                        payoutAccounts: {
+                                            where: { provider: paymentAttempt.provider },
+                                            select: { subaccountCode: true }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
                 paymentAttempts: { where: { status: "SUCCESS" }, select: { id: true } }
             }
         })
@@ -120,6 +139,25 @@ async function settleOnce(attemptId: number): Promise<SettlementResult> {
             where: { checkoutId: checkout.id, status: "PENDING_PAYMENT" },
             data: { status: "PAID" }
         })
+
+        // Record what the provider reported for each seller's share, so sellers see the real fee.
+        const shares = Array.isArray(paymentAttempt.sellerShares) ? paymentAttempt.sellerShares as SellerShare[] : []
+
+        for (const order of checkout.orders) {
+            const subaccountCode = order.seller.sellerProfile?.payoutAccounts[0]?.subaccountCode
+            const share = shares.find((candidate) => candidate.subaccountCode === subaccountCode)
+
+            if (share) {
+                const totalKobo = order.total.times(100).toNumber()
+                await tx.order.update({
+                    where: { id: order.id },
+                    data: {
+                        sellerReceives: new Prisma.Decimal(share.receivedKobo).dividedBy(100),
+                        providerFee: new Prisma.Decimal(share.feeKobo ?? totalKobo - share.receivedKobo).dividedBy(100)
+                    }
+                })
+            }
+        }
 
         // Items added to the cart after checkout stay in the cart.
         const cart = await tx.cart.findUnique({ where: { userId: checkout.userId }, select: { id: true } })

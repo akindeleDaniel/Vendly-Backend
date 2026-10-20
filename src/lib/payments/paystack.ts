@@ -1,6 +1,6 @@
 import { createHmac, timingSafeEqual } from "node:crypto"
 import { readDataString, sendProviderRequest } from "./providerRequest.js"
-import { PaymentProviderError, type PaymentProviderAdapter } from "./types.js"
+import { PaymentProviderError, type PaymentProviderAdapter, type SellerShare } from "./types.js"
 
 const baseUrl = "https://api.paystack.co"
 
@@ -12,6 +12,25 @@ function paystackRequest(path: string, options: { method?: "GET" | "POST" | "PUT
         ...options,
         isSuccess: (body) => (body as { status?: unknown }).status === true
     })
+}
+
+// Paystack reports each subaccount's payout and fee, in kobo, under data.split.shares.subaccounts.
+function readSellerShares(data: Record<string, unknown>): SellerShare[] | null {
+    const subaccounts = (data.split as { shares?: { subaccounts?: unknown } } | null | undefined)?.shares?.subaccounts
+
+    if (!Array.isArray(subaccounts)) {
+        return null
+    }
+
+    const shares = subaccounts.map((share: { subaccount_code?: unknown; amount?: unknown; fees?: unknown }) => ({
+        subaccountCode: typeof share?.subaccount_code === "string" ? share.subaccount_code : "",
+        receivedKobo: Number(share?.amount),
+        feeKobo: Number(share?.fees)
+    }))
+
+    return shares.every((share) => share.subaccountCode && Number.isSafeInteger(share.receivedKobo) && Number.isSafeInteger(share.feeKobo))
+        ? shares
+        : null
 }
 
 const successStatuses = new Set(["success"])
@@ -109,7 +128,8 @@ export const paystackAdapter: PaymentProviderAdapter = {
             reference: String(data.reference ?? ""),
             amountKobo,
             currency: String(data.currency ?? ""),
-            transactionId: data.id === undefined || data.id === null ? null : String(data.id)
+            transactionId: data.id === undefined || data.id === null ? null : String(data.id),
+            sellerShares: readSellerShares(data)
         }
     },
 

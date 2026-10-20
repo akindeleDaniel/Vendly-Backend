@@ -1,6 +1,6 @@
 import { timingSafeEqual } from "node:crypto"
 import { readDataString, sendProviderRequest } from "./providerRequest.js"
-import { PaymentProviderError, type PaymentProviderAdapter } from "./types.js"
+import { PaymentProviderError, type PaymentProviderAdapter, type SellerShare } from "./types.js"
 
 function readDataId(body: Record<string, unknown>): string {
     const id = (body.data as { id?: unknown } | undefined)?.id
@@ -27,6 +27,31 @@ function flutterwaveRequest(path: string, options: { method?: "GET" | "POST" | "
 
 function greatestCommonDivisor(a: number, b: number): number {
     return b === 0 ? a : greatestCommonDivisor(b, a % b)
+}
+
+// Flutterwave reports each subaccount's payout in naira inside data.meta.split_settlement_info, a JSON
+// string keyed by subaccount code: { "RS_…": { subaccount_earning, merchant_commission }, … }.
+// It does not report the fee separately.
+function readSellerShares(data: Record<string, unknown>): SellerShare[] | null {
+    const info = (data.meta as { split_settlement_info?: unknown } | null | undefined)?.split_settlement_info
+
+    if (typeof info !== "string") {
+        return null
+    }
+
+    try {
+        const parsed = JSON.parse(info) as Record<string, unknown>
+        const shares = Object.entries(parsed)
+            .filter(([key]) => key.startsWith("RS_"))
+            .map(([subaccountCode, value]) => ({
+                subaccountCode,
+                receivedKobo: Math.round(Number((value as { subaccount_earning?: unknown })?.subaccount_earning) * 100),
+                feeKobo: null
+            }))
+        return shares.length > 0 && shares.every((share) => Number.isSafeInteger(share.receivedKobo)) ? shares : null
+    } catch {
+        return null
+    }
 }
 
 const successStatuses = new Set(["successful"])
@@ -125,7 +150,8 @@ export const flutterwaveAdapter: PaymentProviderAdapter = {
             reference: String(data.tx_ref ?? ""),
             amountKobo: Math.round(amount * 100),
             currency: String(data.currency ?? ""),
-            transactionId: data.id === undefined || data.id === null ? null : String(data.id)
+            transactionId: data.id === undefined || data.id === null ? null : String(data.id),
+            sellerShares: readSellerShares(data)
         }
     },
 

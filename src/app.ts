@@ -7,6 +7,7 @@ import sellerRoutes from "./routes/sellerRoutes.js"
 import cartRoutes from "./routes/cartRoutes.js"
 import checkoutRoutes from "./routes/checkoutRoutes.js"
 import paymentRoutes from "./routes/paymentRoutes.js"
+import orderRoutes from "./routes/orderRoutes.js"
 import webhookRoutes from "./routes/webhookRoutes.js"
 import { ensureRequestBody, errorHandler, notFoundHandler } from "./middleware/errorHandlers.js"
 import config from "./config.js"
@@ -28,6 +29,7 @@ app.use("/seller", sellerRoutes)
 app.use("/cart", cartRoutes)
 app.use("/checkout", checkoutRoutes)
 app.use("/payments", paymentRoutes)
+app.use("/orders", orderRoutes)
 app.use(notFoundHandler)
 app.use(errorHandler)
 
