@@ -7,5 +7,3 @@ export const authCookieOptions: CookieOptions = {
     secure: config.cookieSecure,
     sameSite: config.cookieSameSite
 }
-
-export const authCookieMaxAgeMs = 60 * 60 * 1000

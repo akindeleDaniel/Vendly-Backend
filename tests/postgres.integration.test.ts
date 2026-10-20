@@ -16,6 +16,7 @@ import { payoutFeeTerms } from "../src/controllers/payoutController.js"
 import { checkStuckPayments } from "../src/lib/payments/paymentChecker.js"
 import { escalateOverdueDisputes } from "../src/lib/disputes.js"
 import { checkOpenRefunds } from "../src/lib/payments/refunds.js"
+import { purgeOldRefreshTokens } from "../src/lib/sessions.js"
 import { flutterwaveAdapter } from "../src/lib/payments/flutterwave.js"
 import { paystackAdapter } from "../src/lib/payments/paystack.js"
 import { setPaymentProvidersForTesting } from "../src/lib/payments/providers.js"
@@ -3265,20 +3266,29 @@ test("sets and clears the login cookie with the configured attributes", async ()
                 body: JSON.stringify({ email, password })
             })
             assert.equal(login.status, 200)
-            const loginCookie = login.headers.get("set-cookie") ?? ""
+            const loginCookie = login.headers.getSetCookie().find((cookie) => cookie.startsWith("token=")) ?? ""
             assert.match(loginCookie, /^token=[^;]+;/)
-            assert.match(loginCookie, /Max-Age=3600/)
+            assert.match(loginCookie, /Max-Age=900/)
             assert.match(loginCookie, /HttpOnly/)
             assert.match(loginCookie, /SameSite=Lax/)
             assert.doesNotMatch(loginCookie, /Secure/)
+            const refreshCookie = login.headers.getSetCookie().find((cookie) => cookie.startsWith("refreshToken=")) ?? ""
+            assert.match(refreshCookie, /Path=\/users/)
+            assert.match(refreshCookie, /HttpOnly/)
+            assert.match(refreshCookie, /SameSite=Lax/)
+            assert.doesNotMatch(refreshCookie, /Secure/)
 
             const logout = await fetch(`${baseUrl}/users/logout`, { method: "POST" })
             assert.equal(logout.status, 200)
-            const logoutCookie = logout.headers.get("set-cookie") ?? ""
+            const logoutCookie = logout.headers.getSetCookie().find((cookie) => cookie.startsWith("token=")) ?? ""
             assert.match(logoutCookie, /^token=;/)
             assert.match(logoutCookie, /Expires=Thu, 01 Jan 1970/)
             assert.match(logoutCookie, /HttpOnly/)
             assert.match(logoutCookie, /SameSite=Lax/)
+            // Logout clears the refresh cookie on the same path it was set on.
+            const logoutRefreshCookie = logout.headers.getSetCookie().find((cookie) => cookie.startsWith("refreshToken=;")) ?? ""
+            assert.match(logoutRefreshCookie, /Path=\/users/)
+            assert.match(logoutRefreshCookie, /Expires=Thu, 01 Jan 1970/)
         })
     } finally {
         await prisma.user.delete({ where: { id: user.id } })
@@ -6183,5 +6193,309 @@ test("the administrator's complaint queue shows what needs a decision, oldest fi
         assert.equal((await request("GET", "/admin/disputes?page=0", undefined, adminToken)).status, 400)
         assert.equal((await request("GET", "/admin/disputes/abc", undefined, adminToken)).status, 404)
         assert.equal((await request("GET", "/admin/disputes/999999", undefined, adminToken)).status, 404)
+    })
+})
+
+// ---- Sessions: short access token, rotating refresh token ----
+
+type SessionContext = {
+    userId: number
+    email: string
+    password: string
+    baseUrl: string
+}
+
+function cookiesFrom(response: Response): Record<string, { value: string; attributes: string }> {
+    const cookies: Record<string, { value: string; attributes: string }> = {}
+
+    for (const line of response.headers.getSetCookie()) {
+        const [pair = "", ...attributes] = line.split(";")
+        const separator = pair.indexOf("=")
+        cookies[pair.slice(0, separator)] = { value: pair.slice(separator + 1), attributes: attributes.join(";") }
+    }
+
+    return cookies
+}
+
+async function withSessionUser(run: (context: SessionContext) => Promise<void>) {
+    const password = "a-long-test-password"
+    const email = `session-${randomUUID()}@example.test`
+    const user = await prisma.user.create({
+        data: { name: "Session user", email, passwordHash: await bcrypt.hash(password, 4), role: "CONSUMER" }
+    })
+    const server = createServer(app)
+
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+
+    try {
+        const address = server.address()
+        assert.ok(address && typeof address === "object")
+        await run({ userId: user.id, email, password, baseUrl: `http://127.0.0.1:${address.port}` })
+    } finally {
+        await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()))
+        await prisma.user.deleteMany({ where: { id: user.id } })
+    }
+}
+
+async function loginForSession(context: SessionContext) {
+    const response = await fetch(`${context.baseUrl}/users/login`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ email: context.email, password: context.password })
+    })
+    assert.equal(response.status, 200)
+    const cookies = cookiesFrom(response)
+    const access = cookies.token?.value
+    const refresh = cookies.refreshToken?.value
+    assert.ok(access && refresh)
+    return { access, refresh, cookies }
+}
+
+function refreshSessionRequest(context: SessionContext, refreshToken: string) {
+    return fetch(`${context.baseUrl}/users/refresh`, { method: "POST", headers: { cookie: `refreshToken=${refreshToken}` } })
+}
+
+test("logging in gives a 15-minute access cookie and a 30-day refresh cookie that only the account routes receive", async () => {
+    await withSessionUser(async (context) => {
+        const { refresh, cookies } = await loginForSession(context)
+
+        assert.match(cookies.token?.attributes ?? "", /Max-Age=900\b/)
+        assert.match(cookies.token?.attributes ?? "", /HttpOnly/)
+        assert.match(cookies.refreshToken?.attributes ?? "", /Max-Age=259\d{4}\b/)
+        assert.match(cookies.refreshToken?.attributes ?? "", /Path=\/users/)
+        assert.match(cookies.refreshToken?.attributes ?? "", /HttpOnly/)
+
+        // Only a hash of the refresh token is stored.
+        const stored = await prisma.refreshToken.findMany({ where: { userId: context.userId } })
+        assert.equal(stored.length, 1)
+        assert.notEqual(stored[0]?.tokenHash, refresh)
+        assert.equal(stored[0]?.revokedAt, null)
+    })
+})
+
+test("registering also starts a session", async () => {
+    await withSessionUser(async (context) => {
+        const email = `registered-${randomUUID()}@example.test`
+        const response = await fetch(`${context.baseUrl}/users/register`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ name: "New person", email, password: "a-long-test-password", role: "CONSUMER" })
+        })
+
+        try {
+            assert.equal(response.status, 200)
+            const cookies = cookiesFrom(response)
+            assert.ok(cookies.token?.value)
+            assert.ok(cookies.refreshToken?.value)
+        } finally {
+            await prisma.cart.deleteMany({ where: { user: { email } } })
+            await prisma.user.deleteMany({ where: { email } })
+        }
+    })
+})
+
+test("a refresh token is swapped for a new pair that works, and the old one stops working", async () => {
+    await withSessionUser(async (context) => {
+        const { refresh } = await loginForSession(context)
+        const refreshed = await refreshSessionRequest(context, refresh)
+        assert.equal(refreshed.status, 200)
+        const body = await refreshed.json()
+        assert.equal(body.role, "CONSUMER")
+        assert.equal(body.isAdmin, false)
+
+        const cookies = cookiesFrom(refreshed)
+        assert.ok(cookies.token?.value && cookies.refreshToken?.value)
+        assert.notEqual(cookies.refreshToken?.value, refresh)
+
+        const check = await fetch(`${context.baseUrl}/users/check`, { headers: { cookie: `token=${cookies.token.value}` } })
+        assert.equal(check.status, 200)
+
+        // The new refresh token keeps the original expiry, so a login cannot be extended forever.
+        const tokens = await prisma.refreshToken.findMany({ where: { userId: context.userId }, orderBy: { id: "asc" } })
+        assert.equal(tokens.length, 2)
+        assert.equal(tokens[0]?.revokedReason, "ROTATED")
+        assert.equal(tokens[1]?.expiresAt.getTime(), tokens[0]?.expiresAt.getTime())
+        assert.equal(tokens[0]?.familyId, tokens[1]?.familyId)
+    })
+})
+
+test("a refresh token used twice at once is refused the second time without ending the login", async () => {
+    await withSessionUser(async (context) => {
+        const { refresh } = await loginForSession(context)
+        const first = await refreshSessionRequest(context, refresh)
+        assert.equal(first.status, 200)
+        const newRefresh = cookiesFrom(first).refreshToken?.value
+        assert.ok(newRefresh)
+
+        // The same token again, moments later: another tab lost the race.
+        const second = await refreshSessionRequest(context, refresh)
+        assert.equal(second.status, 401)
+
+        const stillWorks = await refreshSessionRequest(context, newRefresh)
+        assert.equal(stillWorks.status, 200)
+    })
+})
+
+test("an old refresh token used long after it was swapped ends every login in its family", async () => {
+    await withSessionUser(async (context) => {
+        const { refresh } = await loginForSession(context)
+        const first = await refreshSessionRequest(context, refresh)
+        const newRefresh = cookiesFrom(first).refreshToken?.value
+        assert.ok(newRefresh)
+
+        await prisma.refreshToken.updateMany({
+            where: { userId: context.userId, revokedReason: "ROTATED" },
+            data: { revokedAt: new Date(Date.now() - 60 * 1000) }
+        })
+
+        // Someone presents the swapped-out token: it can only have been copied, so the new one dies too.
+        const stolen = await refreshSessionRequest(context, refresh)
+        assert.equal(stolen.status, 401)
+        const legitimate = await refreshSessionRequest(context, newRefresh)
+        assert.equal(legitimate.status, 401)
+
+        const live = await prisma.refreshToken.count({ where: { userId: context.userId, revokedAt: null } })
+        assert.equal(live, 0)
+    })
+})
+
+test("refreshing is refused without a refresh token, for an unknown one, and for an expired one", async () => {
+    await withSessionUser(async (context) => {
+        const none = await fetch(`${context.baseUrl}/users/refresh`, { method: "POST" })
+        assert.equal(none.status, 401)
+        assert.deepEqual(await none.json(), { message: "Your session has ended. Please log in again." })
+
+        const unknown = await refreshSessionRequest(context, "not-a-real-token")
+        assert.equal(unknown.status, 401)
+
+        const { refresh } = await loginForSession(context)
+        await prisma.refreshToken.updateMany({ where: { userId: context.userId }, data: { expiresAt: new Date(Date.now() - 1000) } })
+        const expired = await refreshSessionRequest(context, refresh)
+        assert.equal(expired.status, 401)
+    })
+})
+
+test("logging out ends that device's login but not another device's", async () => {
+    await withSessionUser(async (context) => {
+        const laptop = await loginForSession(context)
+        const phone = await loginForSession(context)
+
+        const logout = await fetch(`${context.baseUrl}/users/logout`, {
+            method: "POST",
+            headers: { cookie: `refreshToken=${laptop.refresh}` }
+        })
+        assert.equal(logout.status, 200)
+        assert.equal(cookiesFrom(logout).refreshToken?.value, "")
+
+        assert.equal((await refreshSessionRequest(context, laptop.refresh)).status, 401)
+        assert.equal((await refreshSessionRequest(context, phone.refresh)).status, 200)
+    })
+})
+
+test("logging out everywhere ends every device's login and needs a login itself", async () => {
+    await withSessionUser(async (context) => {
+        const laptop = await loginForSession(context)
+        const phone = await loginForSession(context)
+
+        const anonymous = await fetch(`${context.baseUrl}/users/logout-all`, { method: "POST" })
+        assert.equal(anonymous.status, 401)
+
+        const response = await fetch(`${context.baseUrl}/users/logout-all`, {
+            method: "POST",
+            headers: { cookie: `token=${laptop.access}` }
+        })
+        assert.equal(response.status, 200)
+
+        assert.equal((await refreshSessionRequest(context, laptop.refresh)).status, 401)
+        assert.equal((await refreshSessionRequest(context, phone.refresh)).status, 401)
+    })
+})
+
+test("old expired and revoked login records are cleaned up, recent ones are kept", async () => {
+    await withSessionUser(async (context) => {
+        const longAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000)
+        const base = { userId: context.userId, familyId: randomUUID(), expiresAt: new Date(Date.now() + 60 * 1000) }
+        await prisma.refreshToken.createMany({
+            data: [
+                { ...base, tokenHash: `old-expired-${randomUUID()}`, expiresAt: longAgo },
+                { ...base, tokenHash: `old-revoked-${randomUUID()}`, revokedAt: longAgo, revokedReason: "LOGOUT" },
+                { ...base, tokenHash: `recent-revoked-${randomUUID()}`, revokedAt: new Date(), revokedReason: "LOGOUT" },
+                { ...base, tokenHash: `live-${randomUUID()}` }
+            ]
+        })
+
+        assert.ok((await purgeOldRefreshTokens()) >= 2)
+        const remaining = await prisma.refreshToken.findMany({ where: { userId: context.userId } })
+        assert.equal(remaining.length, 2)
+        assert.ok(remaining.every((token) => !token.tokenHash.startsWith("old-")))
+    })
+})
+
+function checkWithAccess(context: SessionContext, accessToken: string) {
+    return fetch(`${context.baseUrl}/users/check`, { headers: { cookie: `token=${accessToken}` } })
+}
+
+test("logging out stops that device's access token at once, not when it expires", async () => {
+    await withSessionUser(async (context) => {
+        const laptop = await loginForSession(context)
+        const phone = await loginForSession(context)
+        assert.equal((await checkWithAccess(context, laptop.access)).status, 200)
+
+        await fetch(`${context.baseUrl}/users/logout`, { method: "POST", headers: { cookie: `refreshToken=${laptop.refresh}` } })
+
+        const ended = await checkWithAccess(context, laptop.access)
+        assert.equal(ended.status, 401)
+        assert.deepEqual(await ended.json(), { message: "Your session has ended. Please log in again." })
+        assert.equal((await checkWithAccess(context, phone.access)).status, 200)
+    })
+})
+
+test("logging out everywhere stops every earlier access token at once but not a new login", async () => {
+    await withSessionUser(async (context) => {
+        const laptop = await loginForSession(context)
+        const phone = await loginForSession(context)
+        // A token from before sessions had login ids, still inside its lifetime.
+        const jwtSecret = process.env.JWT_SECRET
+        assert.ok(jwtSecret)
+        const older = jwt.sign({ id: context.userId, iat: Math.floor(Date.now() / 1000) - 30 }, jwtSecret, { expiresIn: 600 })
+        assert.equal((await checkWithAccess(context, older)).status, 200)
+
+        const response = await fetch(`${context.baseUrl}/users/logout-all`, { method: "POST", headers: { cookie: `token=${laptop.access}` } })
+        assert.equal(response.status, 200)
+
+        assert.equal((await checkWithAccess(context, laptop.access)).status, 401)
+        assert.equal((await checkWithAccess(context, phone.access)).status, 401)
+        assert.equal((await checkWithAccess(context, older)).status, 401)
+
+        const again = await loginForSession(context)
+        assert.equal((await checkWithAccess(context, again.access)).status, 200)
+    })
+})
+
+test("a copied refresh token being reused stops the whole login's access tokens at once", async () => {
+    await withSessionUser(async (context) => {
+        const first = await loginForSession(context)
+        const swapped = await refreshSessionRequest(context, first.refresh)
+        const newAccess = cookiesFrom(swapped).token?.value
+        assert.ok(newAccess)
+        assert.equal((await checkWithAccess(context, newAccess)).status, 200)
+
+        await prisma.refreshToken.updateMany({
+            where: { userId: context.userId, revokedReason: "ROTATED" },
+            data: { revokedAt: new Date(Date.now() - 60 * 1000) }
+        })
+        assert.equal((await refreshSessionRequest(context, first.refresh)).status, 401)
+
+        assert.equal((await checkWithAccess(context, newAccess)).status, 401)
+        assert.equal((await checkWithAccess(context, first.access)).status, 401)
+    })
+})
+
+test("an access token for an account that no longer exists is refused", async () => {
+    await withSessionUser(async (context) => {
+        const { access } = await loginForSession(context)
+        await prisma.user.delete({ where: { id: context.userId } })
+        assert.equal((await checkWithAccess(context, access)).status, 401)
+        // The fixture cleanup deletes by id and tolerates the account being gone already.
     })
 })

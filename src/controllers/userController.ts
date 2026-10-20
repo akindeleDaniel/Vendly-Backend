@@ -1,8 +1,7 @@
 import bcrypt from "bcrypt"
 import prisma from "../lib/prisma.js"
 import type { Request, Response } from "express"
-import jwt from "jsonwebtoken"
-import { authCookieMaxAgeMs, authCookieOptions } from "../lib/authCookie.js"
+import { clearSessionCookies, endAllSessions, endSession, refreshSession, startSession } from "../lib/sessions.js"
 
 export const createUser = async (req: Request, res: Response) => {
     const { name, email, password, role } = req.body;
@@ -47,20 +46,7 @@ export const createUser = async (req: Request, res: Response) => {
             return user;
         });
 
-        if (!process.env.JWT_SECRET) {
-            throw new Error("JWT_SECRET is not set");
-        }
-
-        const token = jwt.sign(
-            { id: newUser.id },
-            process.env.JWT_SECRET,
-            { expiresIn: "1h" }
-        );
-
-        res.cookie("token", token, {
-            ...authCookieOptions,
-            maxAge: authCookieMaxAgeMs
-        });
+        await startSession(req, res, newUser.id);
 
         res.send({ message: "Registration successful" });
 
@@ -94,24 +80,50 @@ export const loginUser = async(req: Request, res: Response) =>{
         return
     }
     
-    if (!process.env.JWT_SECRET) {
-        throw new Error("JWT_SECRET is not set");
-    }
-    const token = jwt.sign({id: existingUser.id}, process.env.JWT_SECRET, {expiresIn:"1h"})
-
-    res.cookie("token", token, {
-        ...authCookieOptions,
-        maxAge: authCookieMaxAgeMs
-    })
+    await startSession(req, res, existingUser.id)
     res.send({
         message: "Login Successful",
         role: existingUser.role
     })
 }
 
-export const logout = (_req: Request, res: Response) => {
-    res.clearCookie("token", authCookieOptions)
+export const logout = async (req: Request, res: Response) => {
+    try {
+        await endSession(req)
+    } catch (error) {
+        console.error(error)
+    }
+
+    clearSessionCookies(res)
     res.send({ message: "Logged out successfully" })
+}
+
+// Ends every login of this account, on every device.
+export const logoutEverywhere = async (req: Request, res: Response) => {
+    await endAllSessions(req.user!.id)
+    clearSessionCookies(res)
+    res.send({ message: "Logged out on every device" })
+}
+
+// Called by the frontend when the access token has expired. Swaps the refresh token for a new pair.
+export const refresh = async (req: Request, res: Response) => {
+    const userId = await refreshSession(req, res)
+
+    if (userId === null) {
+        clearSessionCookies(res)
+        res.status(401).send({ message: "Your session has ended. Please log in again." })
+        return
+    }
+
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { role: true, isAdmin: true } })
+
+    if (!user) {
+        clearSessionCookies(res)
+        res.status(401).send({ message: "Your session has ended. Please log in again." })
+        return
+    }
+
+    res.send({ message: "Session refreshed", role: user.role, isAdmin: user.isAdmin })
 }
 
 export const checkAuth = async (req: Request, res: Response) => {

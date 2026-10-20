@@ -1,6 +1,7 @@
 import { syncPayment } from "../../controllers/paymentController.js"
 import { escalateOverdueDisputes } from "../disputes.js"
 import { checkOpenRefunds } from "./refunds.js"
+import { purgeOldRefreshTokens } from "../sessions.js"
 import prisma from "../prisma.js"
 
 const checkIntervalMs = 5 * 60 * 1000
@@ -84,6 +85,12 @@ export function startPaymentChecker(): void {
             await escalateOverdueDisputes()
         } catch (error) {
             console.error("Complaint escalation failed", { reason: error instanceof Error ? error.message : undefined })
+        }
+
+        try {
+            await purgeOldRefreshTokens()
+        } catch (error) {
+            console.error("Old login cleanup failed", { reason: error instanceof Error ? error.message : undefined })
         } finally {
             running = false
         }

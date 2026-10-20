@@ -49,6 +49,9 @@ model User {
   liabilities   SellerLiability[]
   disputeMessages DisputeMessage[]
   decidedDisputes Dispute[]      @relation("DisputeDecidedBy")
+  refreshTokens RefreshToken[]
+  // Set by "log out everywhere" and password changes: access tokens issued before this stop working at once.
+  sessionsValidFrom DateTime?
 }
 
 enum Role {
@@ -538,4 +541,25 @@ model PaymentEvent {
 
   @@unique([provider, eventKey])
   @@index([reference])
+}
+
+// A login on one device. The browser holds a random secret; only its hash is stored. Each use swaps it
+// for a new one (same family, same fixed expiry). Using an old one again revokes the whole family.
+model RefreshToken {
+  id            Int       @id @default(autoincrement())
+  userId        Int
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  familyId      String
+  tokenHash     String    @unique
+  userAgent     String?
+  createdAt     DateTime  @default(now())
+  lastUsedAt    DateTime  @default(now())
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  // ROTATED, LOGOUT, LOGOUT_ALL or REUSE
+  revokedReason String?
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
 }
