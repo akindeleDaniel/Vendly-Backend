@@ -14,6 +14,7 @@ import app from "../src/app.js"
 import config, { assertRequiredEnvironment, loadConfig } from "../src/config.js"
 import { payoutFeeTerms } from "../src/controllers/payoutController.js"
 import { checkStuckPayments } from "../src/lib/payments/paymentChecker.js"
+import { escalateOverdueDisputes } from "../src/lib/disputes.js"
 import { checkOpenRefunds } from "../src/lib/payments/refunds.js"
 import { flutterwaveAdapter } from "../src/lib/payments/flutterwave.js"
 import { paystackAdapter } from "../src/lib/payments/paystack.js"
@@ -204,6 +205,8 @@ async function createCheckoutLifecycleFixture(
                 select: { id: true }
             })).map(({ id }) => id)
             if (checkoutIds.length > 0) {
+                await prisma.disputeMessage.deleteMany({ where: { dispute: { order: { checkoutId: { in: checkoutIds } } } } })
+                await prisma.dispute.deleteMany({ where: { order: { checkoutId: { in: checkoutIds } } } })
                 await prisma.liabilityRecovery.deleteMany({
                     where: {
                         OR: [
@@ -5637,5 +5640,548 @@ test("the session check reports whether the user is an administrator", async () 
         const consumer = await request("GET", "/users/check", undefined, fixture.token)
         assert.equal(consumer.body.isAdmin, false)
         assert.equal(consumer.body.role, "CONSUMER")
+    })
+})
+
+// ---- Complaints (disputes) and refund requests ----
+
+const damagedMessage = "The charger arrived with a cracked casing and does not work."
+
+function complain(context: PaymentTestContext, orderId: number, body: Record<string, unknown> = {}, token = context.fixture.token) {
+    return context.request(
+        "POST",
+        `/orders/${context.checkoutId}/seller-orders/${orderId}/disputes`,
+        { reason: "DAMAGED", message: damagedMessage, ...body },
+        token
+    )
+}
+
+async function shipPaidOrder(context: PaymentTestContext, orderId: number) {
+    const shipped = await context.request("POST", `/seller/orders/${orderId}/ship`, {}, context.fixture.sellerToken)
+    assert.equal(shipped.status, 200)
+}
+
+// A paid, shipped order, which is when a buyer can complain about the item.
+async function payAndShip(context: PaymentTestContext) {
+    const orderId = await payForCheckout(context)
+    await shipPaidOrder(context, orderId)
+    return orderId
+}
+
+async function backdatePayment(checkoutId: number, days: number) {
+    await prisma.paymentAttempt.updateMany({
+        where: { checkoutId, status: "SUCCESS" },
+        data: { verifiedAt: new Date(Date.now() - days * 24 * 60 * 60 * 1000) }
+    })
+}
+
+// A seller who has no connection to the fixture's orders.
+async function withStrangerSeller(run: (token: string) => Promise<void>) {
+    const stranger = await prisma.user.create({
+        data: { name: "Other seller", email: `dispute-stranger-${randomUUID()}@example.test`, passwordHash: "integration-test-not-a-password", role: "SELLER" }
+    })
+
+    try {
+        await run(jwt.sign({ id: stranger.id }, process.env.JWT_SECRET!))
+    } finally {
+        await prisma.user.delete({ where: { id: stranger.id } })
+    }
+}
+
+test("a buyer opens a complaint about a shipped order, and the buyer and seller both see it", async () => {
+    await withPaymentCheckout("dispute-open", async (context) => {
+        const { fixture, checkoutId, request, adminToken } = context
+        const orderId = await payAndShip(context)
+
+        const opened = await complain(context, orderId, { evidenceUrls: ["https://images.example.test/crack.jpg"] })
+        assert.equal(opened.status, 201)
+        const dispute = opened.body.dispute
+        assert.equal(dispute.status, "OPEN")
+        assert.equal(dispute.openedBy, "BUYER")
+        assert.equal(dispute.reason, "DAMAGED")
+        assert.equal(dispute.reasonLabel, "Item damaged")
+        assert.equal(dispute.requestedAmount, "3000.00")
+        assert.equal(dispute.orderId, orderId)
+        assert.equal(dispute.order.seller.businessName, "dispute-open Shop")
+        assert.deepEqual(dispute.messages.map((message: { author: string; evidenceUrls: string[] }) => [message.author, message.evidenceUrls]), [
+            ["BUYER", ["https://images.example.test/crack.jpg"]]
+        ])
+        const dueInHours = (new Date(dispute.responseDueAt).getTime() - Date.now()) / 3_600_000
+        assert.ok(dueInHours > 71.9 && dueInHours <= 72)
+        assert.equal(JSON.stringify(dispute).includes("@example.test"), false)
+
+        // One open complaint per order.
+        const again = await complain(context, orderId)
+        assert.equal(again.status, 409)
+        assert.equal(again.body.code, "DISPUTE_EXISTS")
+        assert.equal(again.body.disputeId, dispute.id)
+
+        const mine = await request("GET", "/disputes")
+        assert.equal(mine.body.total, 1)
+        assert.equal(mine.body.disputes[0].id, dispute.id)
+        assert.equal((await request("GET", "/disputes?status=RESOLVED")).body.total, 0)
+        assert.equal((await request("GET", "/disputes?status=NOPE")).status, 400)
+        assert.equal((await request("GET", `/disputes/${dispute.id}`)).body.dispute.status, "OPEN")
+
+        const sellerList = await request("GET", "/seller/disputes", undefined, fixture.sellerToken)
+        assert.equal(sellerList.body.total, 1)
+        assert.equal(sellerList.body.disputes[0].buyerName, "Test Consumer")
+        assert.equal((await request("GET", "/seller/disputes/awaiting-response", undefined, fixture.sellerToken)).body.count, 1)
+        const sellerView = await request("GET", `/seller/disputes/${dispute.id}`, undefined, fixture.sellerToken)
+        assert.equal(sellerView.status, 200)
+        assert.equal(JSON.stringify(sellerView.body).includes("@example.test"), false)
+
+        // Order pages point to the complaint.
+        const buyerOrder = await request("GET", `/orders/${checkoutId}`)
+        assert.deepEqual(buyerOrder.body.sellerOrders[0].dispute, { id: dispute.id, status: "OPEN", outcome: null, reason: "DAMAGED" })
+        const sellerOrder = await request("GET", `/seller/orders/${orderId}`, undefined, fixture.sellerToken)
+        assert.equal(sellerOrder.body.dispute.id, dispute.id)
+
+        // Not yet for an administrator to decide, but visible to them.
+        assert.equal((await request("GET", "/admin/disputes", undefined, adminToken)).body.total, 0)
+        const adminView = await request("GET", `/admin/disputes/${dispute.id}`, undefined, adminToken)
+        assert.match(adminView.body.dispute.buyer.email, /dispute-open-consumer/)
+        assert.match(adminView.body.dispute.sellerContact.email, /dispute-open-seller/)
+        assert.equal((await request("GET", "/admin/disputes?status=OPEN", undefined, adminToken)).body.total, 1)
+
+        // Only the people it concerns can see it.
+        const other = await fixture.addConsumer(1)
+        assert.equal((await request("GET", `/disputes/${dispute.id}`, undefined, other.token)).status, 404)
+        assert.equal((await request("GET", "/disputes", undefined, other.token)).body.total, 0)
+        assert.equal((await request("GET", `/disputes/${dispute.id}`, undefined, fixture.sellerToken)).status, 403)
+        assert.equal((await request("GET", "/seller/disputes", undefined, fixture.token)).status, 403)
+        await withStrangerSeller(async (strangerToken) => {
+            assert.equal((await request("GET", `/seller/disputes/${dispute.id}`, undefined, strangerToken)).status, 404)
+        })
+    })
+})
+
+test("complaints are refused when the order is not in a state that allows them", async () => {
+    await withPaymentCheckout("dispute-rules", async (context) => {
+        const { checkoutId, request } = context
+        const [unpaid] = await prisma.order.findMany({ where: { checkoutId } })
+        assert.equal((await complain(context, unpaid!.id)).status, 409)
+
+        const orderId = await payForCheckout(context)
+
+        // Not shipped yet: a damaged item is impossible, and "not received" has to wait.
+        const early = await complain(context, orderId)
+        assert.equal(early.status, 409)
+        assert.equal(early.body.code, "DISPUTE_NOT_ALLOWED")
+        const notReceivedEarly = await complain(context, orderId, { reason: "NOT_RECEIVED", message: "Nothing has arrived at all." })
+        assert.equal(notReceivedEarly.status, 409)
+        assert.match(notReceivedEarly.body.message, /7 days/)
+
+        await backdatePayment(checkoutId, 8)
+        const unshipped = await complain(context, orderId, { reason: "NOT_RECEIVED", message: "Nothing has arrived at all." })
+        assert.equal(unshipped.status, 201)
+        assert.equal((await request("POST", `/disputes/${unshipped.body.dispute.id}/withdraw`)).status, 200)
+
+        // Past the complaint period.
+        await shipPaidOrder(context, orderId)
+        await backdatePayment(checkoutId, 31)
+        const late = await complain(context, orderId)
+        assert.equal(late.status, 409)
+        assert.match(late.body.message, /30-day/)
+        await backdatePayment(checkoutId, 1)
+
+        // Once the buyer confirmed receipt, "not received" is no longer true; other complaints still are.
+        await request("POST", `/seller/orders/${orderId}/delivered`, {}, context.fixture.sellerToken)
+        const confirm = await request("POST", `/orders/${checkoutId}/seller-orders/${orderId}/confirm-delivery`)
+        assert.equal(confirm.status, 200)
+        const afterReceipt = await complain(context, orderId, { reason: "NOT_RECEIVED", message: "Nothing has arrived at all." })
+        assert.equal(afterReceipt.status, 409)
+        assert.match(afterReceipt.body.message, /confirmed/)
+        assert.equal((await complain(context, orderId)).status, 201)
+    })
+
+    await withPaymentCheckout("dispute-rules-refunded", async (context) => {
+        const orderId = await payAndShip(context)
+        await prisma.order.update({ where: { id: orderId }, data: { status: "REFUNDED" } })
+        assert.equal((await complain(context, orderId)).status, 409)
+    })
+})
+
+test("complaint requests are validated, and the amount cannot exceed what is left to refund", async () => {
+    await withPaymentCheckout("dispute-validate", async (context) => {
+        const { checkoutId, request } = context
+        const orderId = await payAndShip(context)
+        const path = `/orders/${checkoutId}/seller-orders/${orderId}/disputes`
+        const bad: Array<[Record<string, unknown>, number]> = [
+            [{ reason: "NOPE" }, 400],
+            [{ reason: "SELLER_REFUND_OFFER" }, 400],
+            [{ reason: undefined }, 400],
+            [{ message: "Too short" }, 400],
+            [{ message: "x".repeat(2001) }, 400],
+            [{ message: undefined }, 400],
+            [{ evidenceUrls: ["http://insecure.example.test/a.jpg"] }, 400],
+            [{ evidenceUrls: ["not a link"] }, 400],
+            [{ evidenceUrls: "https://images.example.test/a.jpg" }, 400],
+            [{ evidenceUrls: Array.from({ length: 6 }, (_, index) => `https://images.example.test/${index}.jpg`) }, 400],
+            [{ amount: "12.345" }, 400],
+            [{ amount: -1 }, 400],
+            [{ amount: 9000 }, 400]
+        ]
+
+        for (const [body, status] of bad) {
+            const response = await request("POST", path, { reason: "DAMAGED", message: damagedMessage, ...body })
+            assert.equal(response.status, status, JSON.stringify(body))
+        }
+
+        const tooMuch = await complain(context, orderId, { amount: 9000 })
+        assert.equal(tooMuch.body.code, "DISPUTE_AMOUNT_INVALID")
+        assert.equal(tooMuch.body.maximum, "3000.00")
+        assert.equal((await request("POST", `/orders/${checkoutId + 1000}/seller-orders/${orderId}/disputes`, { reason: "DAMAGED", message: damagedMessage })).status, 404)
+        assert.equal((await request("POST", `/orders/${checkoutId}/seller-orders/999999/disputes`, { reason: "DAMAGED", message: damagedMessage })).status, 404)
+        assert.equal(await prisma.dispute.count({ where: { orderId } }), 0)
+
+        const partial = await complain(context, orderId, { amount: "1250.50" })
+        assert.equal(partial.status, 201)
+        assert.equal(partial.body.dispute.requestedAmount, "1250.50")
+    })
+})
+
+test("a seller agrees to a refund or disagrees, and either way an administrator decides", async () => {
+    await withPaymentCheckout("dispute-respond", async (context) => {
+        const { fixture, request, adminToken } = context
+        const orderId = await payAndShip(context)
+        const opened = await complain(context, orderId)
+        const id = opened.body.dispute.id as number
+        const respond = (body: Record<string, unknown>, token = fixture.sellerToken) =>
+            request("POST", `/seller/disputes/${id}/respond`, body, token)
+
+        assert.equal((await respond({ action: "MAYBE", message: "I will think about it." })).status, 400)
+        assert.equal((await respond({ action: "AGREE_TO_REFUND", message: "Too short" })).status, 400)
+        assert.equal((await respond({ action: "AGREE_TO_REFUND", message: "I agree to refund." }, fixture.token)).status, 403)
+        await withStrangerSeller(async (strangerToken) => {
+            assert.equal((await respond({ action: "AGREE_TO_REFUND", message: "I agree to refund." }, strangerToken)).status, 404)
+        })
+        assert.equal((await prisma.dispute.findUniqueOrThrow({ where: { id } })).status, "OPEN")
+
+        const agreed = await respond({ action: "AGREE_TO_REFUND", message: "I am sorry about that, please refund the buyer." })
+        assert.equal(agreed.status, 200)
+        assert.equal(agreed.body.dispute.status, "SELLER_AGREED")
+        assert.ok(agreed.body.dispute.sellerRespondedAt)
+        assert.deepEqual(agreed.body.dispute.messages.map((message: { author: string }) => message.author), ["BUYER", "SELLER"])
+        assert.equal((await request("GET", "/seller/disputes/awaiting-response", undefined, fixture.sellerToken)).body.count, 0)
+
+        const repeated = await respond({ action: "DISAGREE", message: "Actually, I do not agree." })
+        assert.equal(repeated.status, 409)
+        assert.equal(repeated.body.code, "DISPUTE_NOT_OPEN")
+
+        const queue = await request("GET", "/admin/disputes", undefined, adminToken)
+        assert.deepEqual(queue.body.disputes.map((item: { id: number }) => item.id), [id])
+    })
+
+    await withPaymentCheckout("dispute-disagree", async (context) => {
+        const { fixture, request, adminToken } = context
+        const orderId = await payAndShip(context)
+        const id = (await complain(context, orderId)).body.dispute.id as number
+
+        const disagreed = await request("POST", `/seller/disputes/${id}/respond`, {
+            action: "DISAGREE",
+            message: "The item was packed carefully and photographed before dispatch.",
+            evidenceUrls: ["https://images.example.test/packed.jpg"]
+        }, fixture.sellerToken)
+        assert.equal(disagreed.body.dispute.status, "UNDER_REVIEW")
+        assert.ok(disagreed.body.dispute.escalatedAt)
+        assert.equal((await request("GET", "/admin/disputes", undefined, adminToken)).body.total, 1)
+    })
+})
+
+test("the buyer, seller and administrator share one thread, which closes with the complaint", async () => {
+    await withPaymentCheckout("dispute-thread", async (context) => {
+        const { fixture, request, adminToken } = context
+        const orderId = await payAndShip(context)
+        const id = (await complain(context, orderId)).body.dispute.id as number
+        const post = (path: string, token: string, message = "Here is some more detail for you.", extra: Record<string, unknown> = {}) =>
+            request("POST", path, { message, ...extra }, token)
+
+        assert.equal((await post(`/disputes/${id}/messages`, fixture.token, "Here is the second photo.", { evidenceUrls: ["https://images.example.test/two.jpg"] })).status, 201)
+        assert.equal((await post(`/seller/disputes/${id}/messages`, fixture.sellerToken)).status, 201)
+        assert.equal((await post(`/admin/disputes/${id}/messages`, adminToken, "Please send the order packaging photo.")).status, 201)
+        const thread = await request("GET", `/disputes/${id}`)
+        assert.deepEqual(thread.body.dispute.messages.map((message: { author: string }) => message.author), ["BUYER", "BUYER", "SELLER", "ADMIN"])
+
+        assert.equal((await post(`/disputes/${id}/messages`, fixture.token, "short")).status, 400)
+        assert.equal((await post(`/disputes/${id}/messages`, fixture.token, undefined, { evidenceUrls: ["ftp://nope.example.test/a"] })).status, 400)
+        assert.equal((await post(`/disputes/${id}/messages`, fixture.sellerToken)).status, 403)
+        assert.equal((await post(`/admin/disputes/${id}/messages`, fixture.token)).status, 403)
+        const other = await fixture.addConsumer(1)
+        assert.equal((await post(`/disputes/${id}/messages`, other.token)).status, 404)
+        await withStrangerSeller(async (strangerToken) => {
+            assert.equal((await post(`/seller/disputes/${id}/messages`, strangerToken)).status, 404)
+        })
+
+        // A thread has a size limit.
+        const existing = await prisma.disputeMessage.count({ where: { disputeId: id } })
+        await prisma.disputeMessage.createMany({
+            data: Array.from({ length: 50 - existing }, () => ({ disputeId: id, author: "SYSTEM" as const, body: "Filler message for the limit test." }))
+        })
+        const full = await post(`/disputes/${id}/messages`, fixture.token)
+        assert.equal(full.status, 409)
+        assert.equal(full.body.code, "DISPUTE_MESSAGE_LIMIT")
+    })
+})
+
+test("a buyer can withdraw a complaint and open a new one, but not take back someone else's", async () => {
+    await withPaymentCheckout("dispute-withdraw", async (context) => {
+        const { fixture, request } = context
+        const orderId = await payAndShip(context)
+        const id = (await complain(context, orderId)).body.dispute.id as number
+
+        assert.equal((await request("POST", `/seller/disputes/${id}/withdraw`, {}, fixture.sellerToken)).status, 404)
+        const withdrawn = await request("POST", `/disputes/${id}/withdraw`)
+        assert.equal(withdrawn.status, 200)
+        assert.equal(withdrawn.body.dispute.status, "WITHDRAWN")
+        assert.equal(withdrawn.body.dispute.messages.at(-1).author, "SYSTEM")
+
+        const closed = await request("POST", `/disputes/${id}/messages`, { message: "Can I still write here?" })
+        assert.equal(closed.status, 409)
+        assert.equal(closed.body.code, "DISPUTE_CLOSED")
+        assert.equal((await request("POST", `/disputes/${id}/withdraw`)).status, 409)
+
+        const fresh = await complain(context, orderId, { message: "On reflection the item really is faulty." })
+        assert.equal(fresh.status, 201)
+        const order = await request("GET", `/orders/${context.checkoutId}`)
+        assert.equal(order.body.sellerOrders[0].dispute.id, fresh.body.dispute.id)
+    })
+})
+
+test("a seller can offer a refund without the buyer asking, and take the offer back", async () => {
+    await withPaymentCheckout("dispute-offer", async (context) => {
+        const { fixture, request, adminToken } = context
+        const orderId = await payForCheckout(context)
+        const offer = (body: Record<string, unknown>, token = fixture.sellerToken) =>
+            request("POST", `/seller/orders/${orderId}/refund-offer`, body, token)
+
+        assert.equal((await offer({ message: "Too short" })).status, 400)
+        assert.equal((await offer({ message: "I cannot supply this item any more.", amount: 9000 })).status, 400)
+        assert.equal((await offer({ message: "I cannot supply this item any more." }, fixture.token)).status, 403)
+        await withStrangerSeller(async (strangerToken) => {
+            assert.equal((await offer({ message: "I cannot supply this item any more." }, strangerToken)).status, 404)
+        })
+
+        // The order has not even shipped, which is fine for an offer.
+        const offered = await offer({ message: "I cannot supply this item any more.", amount: "1000" })
+        assert.equal(offered.status, 201)
+        const dispute = offered.body.dispute
+        assert.equal(dispute.openedBy, "SELLER")
+        assert.equal(dispute.reason, "SELLER_REFUND_OFFER")
+        assert.equal(dispute.status, "SELLER_AGREED")
+        assert.equal(dispute.requestedAmount, "1000.00")
+        assert.equal((await offer({ message: "I cannot supply this item any more." })).body.code, "DISPUTE_EXISTS")
+
+        const buyerView = await request("GET", `/disputes/${dispute.id}`)
+        assert.equal(buyerView.status, 200)
+        assert.equal((await request("GET", "/admin/disputes", undefined, adminToken)).body.total, 1)
+        assert.equal((await request("POST", `/disputes/${dispute.id}/withdraw`)).status, 404)
+
+        const withdrawn = await request("POST", `/seller/disputes/${dispute.id}/withdraw`, {}, fixture.sellerToken)
+        assert.equal(withdrawn.body.dispute.status, "WITHDRAWN")
+        assert.equal(withdrawn.body.dispute.messages.at(-1).body, "The seller withdrew this refund offer.")
+    })
+})
+
+test("complaints the seller has not answered in time are passed to an administrator", async () => {
+    await withPaymentCheckout("dispute-overdue", async (context) => {
+        const { request, adminToken } = context
+        const orderId = await payAndShip(context)
+        const id = (await complain(context, orderId)).body.dispute.id as number
+
+        assert.equal(await escalateOverdueDisputes(), 0)
+        await prisma.dispute.update({ where: { id }, data: { responseDueAt: new Date(Date.now() - 1000) } })
+        assert.equal(await escalateOverdueDisputes(), 1)
+
+        const escalated = await prisma.dispute.findUniqueOrThrow({ where: { id }, include: { messages: true } })
+        assert.equal(escalated.status, "UNDER_REVIEW")
+        assert.ok(escalated.escalatedAt)
+        assert.equal(escalated.messages.at(-1)?.author, "SYSTEM")
+        assert.match(escalated.messages.at(-1)?.body ?? "", /did not answer in time/)
+        assert.equal(await escalateOverdueDisputes(), 0)
+        assert.equal((await request("GET", "/admin/disputes", undefined, adminToken)).body.total, 1)
+    })
+
+    // A complaint the seller already answered is left as it is.
+    await withPaymentCheckout("dispute-overdue-answered", async (context) => {
+        const orderId = await payAndShip(context)
+        const id = (await complain(context, orderId)).body.dispute.id as number
+        await context.request("POST", `/seller/disputes/${id}/respond`, { action: "AGREE_TO_REFUND", message: "Please refund the buyer." }, context.fixture.sellerToken)
+        await prisma.dispute.update({ where: { id }, data: { responseDueAt: new Date(Date.now() - 1000) } })
+        assert.equal(await escalateOverdueDisputes(), 0)
+        assert.equal((await prisma.dispute.findUniqueOrThrow({ where: { id } })).status, "SELLER_AGREED")
+    })
+})
+
+test("an administrator approves a complaint by refunding the order, which closes it", async () => {
+    await withPaymentCheckout("dispute-approve", async (context) => {
+        const { fixture, checkoutId, request, adminToken, fakes } = context
+        const orderId = await payAndShip(context)
+        const id = (await complain(context, orderId)).body.dispute.id as number
+        await request("POST", `/seller/disputes/${id}/respond`, { action: "DISAGREE", message: "The item was fine when it left me." }, fixture.sellerToken)
+
+        const approve = (body: Record<string, unknown>, token = adminToken) => request("POST", `/admin/disputes/${id}/approve`, body, token)
+        assert.equal((await approve({ note: "Approved after review." }, fixture.token)).status, 403)
+        assert.equal((await approve({})).status, 400)
+        assert.equal((await approve({ note: "Short" })).status, 400)
+        assert.equal((await approve({ note: "Approved after review.", amount: "abc" })).status, 400)
+        assert.equal((await approve({ note: "Approved after review.", restock: "yes" })).status, 400)
+        assert.equal((await request("POST", "/admin/disputes/999999/approve", { note: "Approved after review." }, adminToken)).status, 404)
+        assert.equal(fakes.calls.createRefund.length, 0)
+
+        const approved = await approve({ note: "Photos show the damage, so the buyer is refunded.", customerNote: "Sorry about the damaged item" })
+        assert.equal(approved.status, 201)
+        assert.equal(approved.body.refund.amount, "3000.00")
+        assert.equal(approved.body.refund.status, "PROCESSING")
+        const dispute = approved.body.dispute
+        assert.equal(dispute.status, "RESOLVED")
+        assert.equal(dispute.outcome, "REFUNDED")
+        assert.equal(dispute.approvedAmount, "3000.00")
+        assert.deepEqual(dispute.messages.map((message: { author: string }) => message.author), ["BUYER", "SELLER", "SYSTEM", "ADMIN"])
+        assert.match(dispute.messages[2].body, /approved a refund of ₦3000\.00/)
+
+        const refund = await prisma.refund.findUniqueOrThrow({ where: { reference: approved.body.refund.reference } })
+        assert.equal(refund.disputeId, id)
+        assert.equal(refund.reason, `Complaint ${id}: Item damaged`)
+        assert.equal(await prisma.sellerLiability.count({ where: { refundId: refund.id } }), 1)
+
+        const buyerView = await request("GET", `/disputes/${id}`)
+        assert.deepEqual(buyerView.body.dispute.refunds.map((item: { status: string; note: string }) => [item.status, item.note]), [["PROCESSING", "Sorry about the damaged item"]])
+        assert.equal(JSON.stringify(buyerView.body).includes("Complaint "), false)
+        const sellerView = await request("GET", `/seller/disputes/${id}`, undefined, fixture.sellerToken)
+        assert.equal(sellerView.body.dispute.refunds[0].reason, `Complaint ${id}: Item damaged`)
+        assert.equal((await request("GET", `/orders/${checkoutId}`)).body.sellerOrders[0].dispute.outcome, "REFUNDED")
+
+        assert.equal((await approve({ note: "Approving it a second time." })).status, 409)
+        assert.equal((await request("POST", `/disputes/${id}/messages`, { message: "Thank you for the refund." })).status, 409)
+    })
+
+    await withPaymentCheckout("dispute-approve-partial", async (context) => {
+        const { fixture, request, adminToken } = context
+        const orderId = await payAndShip(context)
+        const id = (await complain(context, orderId)).body.dispute.id as number
+        await request("POST", `/seller/disputes/${id}/respond`, { action: "AGREE_TO_REFUND", message: "Please refund the buyer." }, fixture.sellerToken)
+
+        const approved = await request("POST", `/admin/disputes/${id}/approve`, { note: "A partial refund is fair here.", amount: 1000, chargeSeller: false }, adminToken)
+        assert.equal(approved.status, 201)
+        assert.equal(approved.body.refund.amount, "1000.00")
+        assert.equal(approved.body.dispute.approvedAmount, "1000.00")
+        assert.equal(await prisma.sellerLiability.count({ where: { sellerId: fixture.sellerId } }), 0)
+    })
+})
+
+test("a complaint stays open when the refund cannot be started, and closes once the refund is found", async (t) => {
+    t.mock.method(console, "error", () => {})
+
+    await withPaymentCheckout("dispute-refund-fails", async (context) => {
+        const { checkoutId, request, adminToken, fakes } = context
+        const orderId = await payAndShip(context)
+        const id = (await complain(context, orderId)).body.dispute.id as number
+        const approve = () => request("POST", `/admin/disputes/${id}/approve`, { note: "Approved after review of the photos." }, adminToken)
+
+        fakes.behaviors.PAYSTACK.createRefund = async () => {
+            throw new PaymentProviderError("rejected", "Paystack rejected the request", "HTTP 400: Invalid transaction")
+        }
+        const rejected = await approve()
+        assert.equal(rejected.status, 502)
+        assert.equal(rejected.body.code, "REFUND_PROVIDER_REJECTED")
+        assert.equal((await prisma.dispute.findUniqueOrThrow({ where: { id } })).status, "OPEN")
+
+        // The outcome is unknown: the refund exists and is tied to the complaint, but nothing is closed.
+        fakes.behaviors.PAYSTACK.createRefund = async () => {
+            throw new PaymentProviderError("unavailable", "Paystack could not be reached", "TimeoutError")
+        }
+        const unknown = await approve()
+        assert.equal(unknown.status, 502)
+        assert.equal(unknown.body.code, "REFUND_PROVIDER_UNAVAILABLE")
+        const pending = await prisma.refund.findUniqueOrThrow({ where: { reference: unknown.body.refundReference } })
+        assert.equal(pending.disputeId, id)
+        assert.equal((await prisma.dispute.findUniqueOrThrow({ where: { id } })).status, "OPEN")
+
+        const found = fakeProviderRefund({ amountKobo: 300000 })
+        fakes.behaviors.PAYSTACK.findRefunds = async () => [found]
+        await request("POST", `/admin/refunds/${pending.id}/sync`, undefined, adminToken)
+        const closed = await prisma.dispute.findUniqueOrThrow({ where: { id } })
+        assert.equal(closed.status, "RESOLVED")
+        assert.equal(closed.outcome, "REFUNDED")
+        assert.equal(closed.approvedAmount?.toFixed(2), "3000.00")
+        assert.equal((await request("GET", `/orders/${checkoutId}`)).body.sellerOrders[0].dispute.status, "RESOLVED")
+    })
+
+    await withPaymentCheckout("dispute-refund-balance", async (context) => {
+        const { request, adminToken, fakes } = context
+        const orderId = await payAndShip(context)
+        const id = (await complain(context, orderId)).body.dispute.id as number
+        fakes.behaviors.PAYSTACK.balance = async () => 100000
+
+        const warned = await request("POST", `/admin/disputes/${id}/approve`, { note: "Approved after review of the photos." }, adminToken)
+        assert.equal(warned.status, 409)
+        assert.equal(warned.body.code, "REFUND_BALANCE_LOW")
+        assert.equal((await prisma.dispute.findUniqueOrThrow({ where: { id } })).status, "OPEN")
+
+        const confirmed = await request("POST", `/admin/disputes/${id}/approve`, { note: "Approved after review of the photos.", acknowledgeLowBalance: true }, adminToken)
+        assert.equal(confirmed.status, 201)
+    })
+})
+
+test("a refund an administrator issues directly also closes the order's open complaint", async () => {
+    await withPaymentCheckout("dispute-direct-refund", async (context) => {
+        const { request } = context
+        const orderId = await payAndShip(context)
+        const id = (await complain(context, orderId)).body.dispute.id as number
+
+        const refund = await refundOrder(context, orderId, { amount: 1500 })
+        assert.equal(refund.status, 201)
+        const closed = await prisma.dispute.findUniqueOrThrow({ where: { id } })
+        assert.equal(closed.status, "RESOLVED")
+        assert.equal(closed.outcome, "REFUNDED")
+        assert.equal(closed.approvedAmount?.toFixed(2), "1500.00")
+        assert.equal((await request("GET", `/disputes/${id}`)).body.dispute.status, "RESOLVED")
+    })
+})
+
+test("an administrator can reject a complaint with a note both sides read, and it cannot be re-opened", async () => {
+    await withPaymentCheckout("dispute-reject", async (context) => {
+        const { fixture, request, adminToken } = context
+        const orderId = await payAndShip(context)
+        const id = (await complain(context, orderId)).body.dispute.id as number
+        const reject = (body: Record<string, unknown>, token = adminToken) => request("POST", `/admin/disputes/${id}/reject`, body, token)
+
+        assert.equal((await reject({ note: "No evidence of damage was provided." }, fixture.token)).status, 403)
+        assert.equal((await reject({})).status, 400)
+        assert.equal((await reject({ note: "Short" })).status, 400)
+        assert.equal((await request("POST", "/admin/disputes/999999/reject", { note: "No evidence of damage was provided." }, adminToken)).status, 404)
+
+        const rejected = await reject({ note: "No evidence of damage was provided, so this complaint is rejected." })
+        assert.equal(rejected.status, 200)
+        assert.equal(rejected.body.dispute.status, "RESOLVED")
+        assert.equal(rejected.body.dispute.outcome, "REJECTED")
+        assert.equal(rejected.body.dispute.decisionNote, "No evidence of damage was provided, so this complaint is rejected.")
+        assert.equal(rejected.body.dispute.messages.at(-1).author, "ADMIN")
+        assert.equal((await request("GET", `/disputes/${id}`)).body.dispute.decisionNote, rejected.body.dispute.decisionNote)
+        assert.equal((await reject({ note: "Rejecting a closed complaint again." })).status, 409)
+        assert.equal(await prisma.refund.count({ where: { orderId } }), 0)
+
+        const reopened = await complain(context, orderId)
+        assert.equal(reopened.status, 409)
+        assert.equal(reopened.body.code, "DISPUTE_ALREADY_DECIDED")
+        // The seller can still choose to offer a refund later.
+        const offer = await request("POST", `/seller/orders/${orderId}/refund-offer`, { message: "On reflection, I will refund this order." }, fixture.sellerToken)
+        assert.equal(offer.status, 201)
+    })
+})
+
+test("the administrator's complaint queue shows what needs a decision, oldest filters on request", async () => {
+    await withPaymentCheckout("dispute-queue", async (context) => {
+        const { request, adminToken } = context
+        const orderId = await payAndShip(context)
+        await complain(context, orderId)
+
+        assert.equal((await request("GET", "/admin/disputes", undefined, adminToken)).body.total, 0)
+        assert.equal((await request("GET", "/admin/disputes?status=OPEN", undefined, adminToken)).body.total, 1)
+        assert.equal((await request("GET", "/admin/disputes?status=NOPE", undefined, adminToken)).status, 400)
+        assert.equal((await request("GET", "/admin/disputes?page=0", undefined, adminToken)).status, 400)
+        assert.equal((await request("GET", "/admin/disputes/abc", undefined, adminToken)).status, 404)
+        assert.equal((await request("GET", "/admin/disputes/999999", undefined, adminToken)).status, 404)
     })
 })

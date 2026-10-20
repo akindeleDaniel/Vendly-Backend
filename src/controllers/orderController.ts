@@ -114,6 +114,18 @@ function toSellerRefund(refund: { reference: string; amount: Prisma.Decimal; sta
     }
 }
 
+// The latest complaint about an order that has not been withdrawn, so order pages can link to it.
+const latestDisputeSelect = {
+    where: { status: { not: "WITHDRAWN" as const } },
+    orderBy: { id: "desc" as const },
+    take: 1,
+    select: { id: true, status: true, outcome: true, reason: true }
+}
+
+function toLatestDispute(disputes: Array<{ id: number; status: string; outcome: string | null; reason: string }>) {
+    return disputes[0] ?? null
+}
+
 const sellerNameSelect = { select: { sellerProfile: { select: { businessName: true, slug: true } } } }
 
 function toPaymentSummary(payments: Array<{ reference: string; provider: string; verifiedAt: Date | null }>) {
@@ -155,6 +167,7 @@ export const listMyOrders = async (req: Request, res: Response) => {
                         deliveryConfirmedAt: true,
                         refundedAmount: true,
                         refunds: customerRefundSelect,
+                        disputes: latestDisputeSelect,
                         seller: sellerNameSelect,
                         orderItems: orderItemSelect
                     }
@@ -182,6 +195,7 @@ export const listMyOrders = async (req: Request, res: Response) => {
                 items: order.orderItems.map(toItemResponse),
                 refundedAmount: money(order.refundedAmount),
                 refunds: order.refunds.map(toCustomerRefund),
+                dispute: toLatestDispute(order.disputes),
                 ...toFulfilmentResponse(order)
             }))
         }))
@@ -196,7 +210,7 @@ function findMyOrder(checkoutId: number, userId: number) {
             paymentAttempts: successfulPaymentSelect,
             orders: {
                 orderBy: { id: "asc" },
-                include: { seller: sellerNameSelect, orderItems: orderItemSelect, refunds: customerRefundSelect }
+                include: { seller: sellerNameSelect, orderItems: orderItemSelect, refunds: customerRefundSelect, disputes: latestDisputeSelect }
             }
         }
     })
@@ -227,6 +241,7 @@ function toMyOrderResponse(checkout: NonNullable<Awaited<ReturnType<typeof findM
             items: order.orderItems.map(toItemResponse),
             refundedAmount: money(order.refundedAmount),
             refunds: order.refunds.map(toCustomerRefund),
+            dispute: toLatestDispute(order.disputes),
             ...toFulfilmentResponse(order)
         }))
     }
@@ -339,7 +354,8 @@ export const listSellerOrders = async (req: Request, res: Response) => {
             include: {
                 checkout: { select: { paymentAttempts: successfulPaymentSelect } },
                 orderItems: orderItemSelect,
-                refunds: sellerRefundSelect
+                refunds: sellerRefundSelect,
+                disputes: latestDisputeSelect
             }
         })
     ])
@@ -363,6 +379,7 @@ export const listSellerOrders = async (req: Request, res: Response) => {
             liabilityDeduction: money(order.liabilityDeduction),
             refundedAmount: money(order.refundedAmount),
             refunds: order.refunds.map(toSellerRefund),
+            dispute: toLatestDispute(order.disputes),
             ...toFulfilmentResponse(order)
         }))
     })
@@ -375,7 +392,8 @@ function findSellerOrder(id: number, sellerId: number) {
         include: {
             checkout: { select: { paymentAttempts: successfulPaymentSelect } },
             orderItems: orderItemSelect,
-            refunds: sellerRefundSelect
+            refunds: sellerRefundSelect,
+            disputes: latestDisputeSelect
         }
     })
 }
@@ -399,6 +417,7 @@ function toSellerOrderResponse(order: NonNullable<Awaited<ReturnType<typeof find
         liabilityDeduction: money(order.liabilityDeduction),
         refundedAmount: money(order.refundedAmount),
         refunds: order.refunds.map(toSellerRefund),
+        dispute: toLatestDispute(order.disputes),
         ...toFulfilmentResponse(order)
     }
 }

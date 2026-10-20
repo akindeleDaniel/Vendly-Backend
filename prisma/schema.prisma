@@ -47,6 +47,8 @@ model User {
   orders        Order[]
   refundsRequested Refund[]
   liabilities   SellerLiability[]
+  disputeMessages DisputeMessage[]
+  decidedDisputes Dispute[]      @relation("DisputeDecidedBy")
 }
 
 enum Role {
@@ -268,6 +270,7 @@ model Order {
   orderItems OrderItem[]
   refunds    Refund[]
   liabilityRecoveries LiabilityRecovery[]
+  disputes   Dispute[]
 
   @@index([sellerId])
   @@index([checkoutId])
@@ -323,6 +326,85 @@ model PaymentAttempt {
   @@index([checkoutId])
 }
 
+enum DisputeReason {
+  NOT_RECEIVED
+  NOT_AS_DESCRIBED
+  DAMAGED
+  WRONG_ITEM
+  OTHER
+  SELLER_REFUND_OFFER
+}
+
+enum DisputeStatus {
+  OPEN
+  SELLER_AGREED
+  UNDER_REVIEW
+  RESOLVED
+  WITHDRAWN
+}
+
+enum DisputeOutcome {
+  REFUNDED
+  REJECTED
+}
+
+// Who opened a complaint or wrote a message. SYSTEM is Vendly's own notes ("passed to Vendly for a decision").
+enum DisputeParty {
+  BUYER
+  SELLER
+  ADMIN
+  SYSTEM
+}
+
+// A buyer's complaint about one seller order, or a refund a seller offers. The buyer and seller write
+// to one shared thread; only an administrator decides, and an approved complaint becomes a refund.
+//   OPEN: waiting for the seller (who has until responseDueAt)
+//   SELLER_AGREED: the seller agrees to the refund; waiting for an administrator to approve it
+//   UNDER_REVIEW: the seller disagreed or did not answer in time; waiting for an administrator
+//   RESOLVED: refunded or rejected     WITHDRAWN: taken back by whoever opened it
+model Dispute {
+  id                Int            @id @default(autoincrement())
+  orderId           Int
+  openedBy          DisputeParty
+  reason            DisputeReason
+  requestedAmount   Decimal        @db.Decimal(12, 2)
+  status            DisputeStatus  @default(OPEN)
+  outcome           DisputeOutcome?
+  approvedAmount    Decimal?       @db.Decimal(12, 2)
+  decisionNote      String?
+  decidedById       Int?
+  responseDueAt     DateTime
+  sellerRespondedAt DateTime?
+  escalatedAt       DateTime?
+  resolvedAt        DateTime?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  order     Order            @relation(fields: [orderId], references: [id])
+  decidedBy User?            @relation("DisputeDecidedBy", fields: [decidedById], references: [id])
+  messages  DisputeMessage[]
+  refunds   Refund[]
+
+  @@index([orderId])
+  @@index([status, responseDueAt])
+}
+
+model DisputeMessage {
+  id           Int          @id @default(autoincrement())
+  disputeId    Int
+  author       DisputeParty
+  authorId     Int?
+  body         String
+  // Links to photos or documents the sender uploaded, as a JSON list of https addresses.
+  evidenceUrls Json         @default("[]")
+  createdAt    DateTime     @default(now())
+
+  dispute    Dispute @relation(fields: [disputeId], references: [id])
+  authorUser User?   @relation(fields: [authorId], references: [id])
+
+  @@index([disputeId])
+}
+
 enum RefundStatus {
   PENDING
   PROCESSING
@@ -357,6 +439,8 @@ model Refund {
   expectedAt       DateTime?
   failureReason    String?
   requestedById    Int
+  // The complaint this refund settles, when it came from one.
+  disputeId        Int?
   restockedAt      DateTime?
   lastCheckedAt    DateTime?
   completedAt      DateTime?
@@ -366,12 +450,14 @@ model Refund {
   order          Order?          @relation(fields: [orderId], references: [id])
   paymentAttempt PaymentAttempt  @relation(fields: [paymentAttemptId], references: [id])
   requestedBy    User            @relation(fields: [requestedById], references: [id])
+  dispute        Dispute?        @relation(fields: [disputeId], references: [id])
   liability      SellerLiability?
 
   @@unique([provider, providerRefundId])
   @@index([orderId])
   @@index([paymentAttemptId])
   @@index([status])
+  @@index([disputeId])
 }
 
 enum LiabilityStatus {

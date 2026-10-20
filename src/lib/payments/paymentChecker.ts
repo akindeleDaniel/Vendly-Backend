@@ -1,4 +1,5 @@
 import { syncPayment } from "../../controllers/paymentController.js"
+import { escalateOverdueDisputes } from "../disputes.js"
 import { checkOpenRefunds } from "./refunds.js"
 import prisma from "../prisma.js"
 
@@ -77,6 +78,12 @@ export function startPaymentChecker(): void {
             await checkOpenRefunds()
         } catch (error) {
             console.error("Refund checker failed", { reason: error instanceof Error ? error.message : undefined })
+        }
+
+        try {
+            await escalateOverdueDisputes()
+        } catch (error) {
+            console.error("Complaint escalation failed", { reason: error instanceof Error ? error.message : undefined })
         } finally {
             running = false
         }

@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto"
 import prisma from "../prisma.js"
 import { Prisma, type PaymentAttempt, type Order, type Refund, type RefundStatus } from "../../generated/prisma/client.js"
+import { activeDisputeStatuses } from "../disputes.js"
 import { getPaymentProvider } from "./providers.js"
 import { PaymentProviderError, type ProviderRefund } from "./types.js"
 
@@ -52,6 +53,8 @@ export type IssueRefundInput = {
     // Null charges the seller (an order refund). A payment refund never charges a seller.
     chargeSeller: boolean | null
     acknowledgeLowBalance: boolean
+    // The complaint this refund settles, when it comes from one.
+    disputeId?: number | null
 }
 
 function toKobo(amount: Prisma.Decimal): number {
@@ -238,7 +241,8 @@ export async function issueRefund(input: IssueRefundInput): Promise<Refund> {
                     customerNote: input.customerNote,
                     restock: plan.restock,
                     chargeSeller: plan.chargeSeller,
-                    requestedById: input.adminId
+                    requestedById: input.adminId,
+                    disputeId: input.disputeId ?? null
                 }
             })
         }, { isolationLevel: Prisma.TransactionIsolationLevel.Serializable })
@@ -338,10 +342,54 @@ async function applyProviderRefund(refundId: number, providerRefund: ProviderRef
             })
         }
 
+        await resolveDisputesForRefund(tx, refund, now)
+
         if (status === "SUCCEEDED") {
             await completeRefund(tx, refund)
         }
     })
+}
+
+// A refund the provider has accepted settles the complaint it was for, and any other open complaint
+// about the same order. A refund that fails leaves the complaint open so it can be approved again.
+async function resolveDisputesForRefund(tx: Prisma.TransactionClient, refund: Refund, now: Date): Promise<void> {
+    const matching: Prisma.DisputeWhereInput[] = []
+
+    if (refund.disputeId) {
+        matching.push({ id: refund.disputeId })
+    }
+
+    if (refund.orderId) {
+        matching.push({ orderId: refund.orderId })
+    }
+
+    if (matching.length === 0) {
+        return
+    }
+
+    const open = await tx.dispute.findMany({
+        where: { status: { in: activeDisputeStatuses }, OR: matching },
+        select: { id: true }
+    })
+
+    for (const { id } of open) {
+        const moved = await tx.dispute.updateMany({
+            where: { id, status: { in: activeDisputeStatuses } },
+            data: {
+                status: "RESOLVED",
+                outcome: "REFUNDED",
+                approvedAmount: refund.amount,
+                decidedById: refund.requestedById,
+                resolvedAt: now
+            }
+        })
+
+        if (moved.count === 1) {
+            await tx.disputeMessage.create({
+                data: { disputeId: id, author: "SYSTEM", body: `Vendly approved a refund of ₦${refund.amount.toFixed(2)}.` }
+            })
+        }
+    }
 }
 
 async function voidLiability(tx: Prisma.TransactionClient, refundId: number): Promise<void> {
