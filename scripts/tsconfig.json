@@ -1,0 +1,11 @@
+{
+  // The root tsconfig.json only covers src/, so editors treat these scripts as outside the project and
+  // load no Node types for them. This config adds them, with the same strict settings, for editors and
+  // `npx tsc -p scripts --noEmit`. It does not change how the app is built or how the scripts run.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "noEmit": true
+  },
+  "include": ["./**/*", "../src/**/*"]
+}
