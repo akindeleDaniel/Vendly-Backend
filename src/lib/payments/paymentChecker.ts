@@ -58,45 +58,46 @@ export async function checkStuckPayments(now = new Date()): Promise<number> {
     return checked
 }
 
-// Runs the checker every 5 minutes inside the server process. Runs never overlap, and the timer
-// does not keep the process alive on shutdown.
-export function startPaymentChecker(): void {
-    let running = false
+// Runs the checker every 5 minutes inside the server process. Runs never overlap, and the timer does not keep
+// the process alive on shutdown. The returned function stops the timer and waits for a run in progress to finish.
+export function startPaymentChecker(): () => Promise<void> {
+    let currentRun: Promise<void> | null = null
 
-    const timer = setInterval(async () => {
-        if (running) {
+    const timer = setInterval(() => {
+        if (currentRun) {
             return
         }
 
-        running = true
-
-        try {
-            await checkStuckPayments()
-        } catch (error) {
-            console.error("Stuck payment checker failed", { reason: error instanceof Error ? error.message : undefined })
-        }
-
-        try {
-            await checkOpenRefunds()
-        } catch (error) {
-            console.error("Refund checker failed", { reason: error instanceof Error ? error.message : undefined })
-        }
-
-        try {
-            await escalateOverdueDisputes()
-        } catch (error) {
-            console.error("Complaint escalation failed", { reason: error instanceof Error ? error.message : undefined })
-        }
-
-        try {
-            await purgeOldRefreshTokens()
-            await purgeStaleAccountRecords()
-        } catch (error) {
-            console.error("Old login cleanup failed", { reason: error instanceof Error ? error.message : undefined })
-        } finally {
-            running = false
-        }
+        currentRun = runBackgroundChecks().finally(() => {
+            currentRun = null
+        })
     }, checkIntervalMs)
 
     timer.unref()
+
+    return async () => {
+        clearInterval(timer)
+        await currentRun
+    }
+}
+
+async function runBackgroundChecks(): Promise<void> {
+    const checks: Array<[string, () => Promise<unknown>]> = [
+        ["Stuck payment checker failed", () => checkStuckPayments()],
+        ["Refund checker failed", () => checkOpenRefunds()],
+        ["Complaint escalation failed", () => escalateOverdueDisputes()],
+        ["Old login cleanup failed", async () => {
+            await purgeOldRefreshTokens()
+            await purgeStaleAccountRecords()
+        }]
+    ]
+
+    // One failing check must not stop the others.
+    for (const [failureMessage, run] of checks) {
+        try {
+            await run()
+        } catch (error) {
+            console.error(failureMessage, { reason: error instanceof Error ? error.message : undefined })
+        }
+    }
 }

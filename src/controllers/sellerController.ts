@@ -7,6 +7,7 @@ import { geocodeLocation } from "../lib/geocoding.js"
 import { haversineDistance } from "../lib/distance.js"
 import { getDrivingRouteDistances, getRouteCandidateLimit } from "../lib/routeMatrix.js"
 import { getCanonicalCategory } from "../lib/categories.js"
+import { isHttpsUrl, maximumBusinessNameLength } from "../lib/inputRules.js"
 
 function hasValidCoordinates<T extends { latitude: number | null; longitude: number | null }>(
     shop: T
@@ -55,8 +56,18 @@ export const createSeller = async(req: Request, res: Response) => {
         return
     }
 
+    if (businessName.trim().length > maximumBusinessNameLength) {
+        res.status(400).send({ message: `Business name must be ${maximumBusinessNameLength} characters or fewer` })
+        return
+    }
+
     if (!isNonBlankString(logoUrl)) {
         res.status(400).send({ message: "Logo URL must be a non-empty string" })
+        return
+    }
+
+    if (!isHttpsUrl(logoUrl)) {
+        res.status(400).send({ message: "Logo URL must be an https link" })
         return
     }
 
@@ -174,8 +185,18 @@ export const updateSeller = async(req: Request, res: Response) => {
         return
     }
 
+    if (typeof businessName === "string" && businessName.trim().length > maximumBusinessNameLength) {
+        res.status(400).send({ message: `Business name must be ${maximumBusinessNameLength} characters or fewer` })
+        return
+    }
+
     if (logoUrl !== undefined && !isNonBlankString(logoUrl)) {
         res.status(400).send({ message: "Logo URL must be a non-empty string" })
+        return
+    }
+
+    if (logoUrl !== undefined && !isHttpsUrl(logoUrl)) {
+        res.status(400).send({ message: "Logo URL must be an https link" })
         return
     }
 

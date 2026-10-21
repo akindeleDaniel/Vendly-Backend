@@ -12,6 +12,7 @@ import {
     withdrawSellerOffer
 } from "../controllers/disputeController.js"
 import { authMiddleware } from "../middleware/authMiddleware.js"
+import { complaintLimiter, messageLimiter } from "../middleware/rateLimits.js"
 import { requireRole } from "../middleware/requireRole.js"
 
 const router = Router()
@@ -30,13 +31,13 @@ router.get("/orders", authMiddleware, requireRole("SELLER"), listSellerOrders)
 router.get("/orders/:id", authMiddleware, requireRole("SELLER"), getSellerOrder)
 router.post("/orders/:id/ship", authMiddleware, requireRole("SELLER"), shipSellerOrder)
 router.post("/orders/:id/delivered", authMiddleware, requireRole("SELLER"), reportSellerOrderDelivered)
-router.post("/orders/:id/refund-offer", authMiddleware, requireRole("SELLER"), offerRefund)
+router.post("/orders/:id/refund-offer", authMiddleware, requireRole("SELLER"), complaintLimiter, offerRefund)
 router.get("/disputes", authMiddleware, requireRole("SELLER"), listSellerDisputes)
 // Must come before "/disputes/:id", which would otherwise treat "awaiting-response" as a complaint ID.
 router.get("/disputes/awaiting-response", authMiddleware, requireRole("SELLER"), countSellerDisputesAwaitingResponse)
 router.get("/disputes/:id", authMiddleware, requireRole("SELLER"), getSellerDispute)
 router.post("/disputes/:id/respond", authMiddleware, requireRole("SELLER"), respondToMyDispute)
-router.post("/disputes/:id/messages", authMiddleware, requireRole("SELLER"), postSellerMessage)
+router.post("/disputes/:id/messages", authMiddleware, requireRole("SELLER"), messageLimiter, postSellerMessage)
 router.post("/disputes/:id/withdraw", authMiddleware, requireRole("SELLER"), withdrawSellerOffer)
 router.get("/shops", getCategoryShops)
 router.get("/shop/:slug", getPublicShop)

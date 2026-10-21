@@ -22,6 +22,9 @@ import { assertEmailEnvironment, loadEmailConfig } from "../src/lib/email/config
 import { otpDailyLimit } from "../src/lib/otp.js"
 import { purgeStaleAccountRecords } from "../src/lib/accountCleanup.js"
 import { setGoogleVerifierForTesting, type GoogleIdentity } from "../src/lib/google.js"
+import { setRateLimitingForTesting } from "../src/middleware/rateLimits.js"
+import { isHttpsUrl, priceProblem } from "../src/lib/inputRules.js"
+import { startPaymentChecker } from "../src/lib/payments/paymentChecker.js"
 import { flutterwaveAdapter } from "../src/lib/payments/flutterwave.js"
 import { paystackAdapter } from "../src/lib/payments/paystack.js"
 import { setPaymentProvidersForTesting } from "../src/lib/payments/providers.js"
@@ -39,6 +42,9 @@ import {
 import bcrypt from "bcrypt"
 
 let prisma: PrismaClient
+
+// Most tests make hundreds of requests from one address; the tests of the limits switch limiting on for themselves.
+setRateLimitingForTesting(false)
 
 const sentEmails: OutgoingEmail[] = []
 setEmailSenderForTesting(async (email) => { sentEmails.push(email) })
@@ -3221,7 +3227,8 @@ test("uses local-development defaults when deployment settings are not configure
         port: 3000,
         frontendUrl: "http://localhost:5173",
         cookieSameSite: "lax",
-        cookieSecure: false
+        cookieSecure: false,
+        trustProxy: false
     })
     assert.equal(loadConfig({ NODE_ENV: "production" }).cookieSecure, true)
 })
@@ -3235,7 +3242,8 @@ test("reads valid deployment settings from the environment", () => {
         port: 8080,
         frontendUrl: "https://vendly.example",
         cookieSameSite: "strict",
-        cookieSecure: false
+        cookieSecure: false,
+        trustProxy: false
     })
     assert.deepEqual(loadConfig({ COOKIE_SAME_SITE: "none" }).cookieSecure, true)
 })
@@ -7361,4 +7369,260 @@ test("a seller with no password cannot change their bank account until they set 
         assert.equal(response.status, 403)
         assert.equal((await response.json() as { code: string }).code, "PAYOUT_PASSWORD_REQUIRED")
     })
+})
+
+// ---- Hardening: headers, origin check, health, rate limits, input limits, startup checks ----
+
+test("responses carry security headers and do not announce the framework", async () => {
+    await withAppServer(async (baseUrl) => {
+        const response = await fetch(`${baseUrl}/listings/abc`)
+        assert.equal(response.headers.get("x-powered-by"), null)
+        assert.equal(response.headers.get("x-content-type-options"), "nosniff")
+        assert.match(response.headers.get("strict-transport-security") ?? "", /max-age=/)
+        assert.equal(response.headers.get("x-frame-options"), "SAMEORIGIN")
+        assert.equal(response.headers.get("cross-origin-resource-policy"), "cross-origin")
+    })
+})
+
+test("health checks answer without logging in, and say whether the database is reachable", async () => {
+    await withAppServer(async (baseUrl) => {
+        const alive = await fetch(`${baseUrl}/health`)
+        assert.equal(alive.status, 200)
+        assert.deepEqual(await alive.json(), { status: "ok" })
+
+        const ready = await fetch(`${baseUrl}/health/ready`)
+        assert.equal(ready.status, 200)
+        assert.deepEqual(await ready.json(), { status: "ready" })
+    })
+})
+
+test("changes asked for by another website are refused, even without a body, while our own frontend and tools pass", async () => {
+    await withSessionUser(async (context) => {
+        const { access } = await loginForSession(context)
+        const cookie = `token=${access}`
+        const attempt = (origin?: string) => fetch(`${context.baseUrl}/users/logout-all`, {
+            method: "POST",
+            headers: { cookie, ...(origin ? { origin } : {}) }
+        })
+
+        const evil = await attempt("https://evil.example")
+        assert.equal(evil.status, 403)
+        assert.deepEqual(await evil.json(), { message: "This request is not allowed from that website" })
+        assert.equal((await attempt("null")).status, 403)
+        // Nothing happened: the login is still live.
+        assert.equal((await checkWithAccess(context, access)).status, 200)
+
+        // Reading is never blocked, and requests from our own frontend or with no Origin (tools, servers) go through.
+        const read = await fetch(`${context.baseUrl}/users/check`, { headers: { cookie, origin: "https://evil.example" } })
+        assert.equal(read.status, 200)
+        assert.equal((await attempt(config.frontendUrl)).status, 200)
+    })
+})
+
+test("payment webhooks are not blocked by the origin check or the rate limit", async () => {
+    setRateLimitingForTesting(true)
+
+    try {
+        await withAppServer(async (baseUrl) => {
+            for (let request = 0; request < 3; request++) {
+                const response = await fetch(`${baseUrl}/payments/webhooks/paystack`, {
+                    method: "POST",
+                    headers: { origin: "https://evil.example", "content-type": "application/json" },
+                    body: "{}"
+                })
+                // Refused for its missing signature, not for where it came from or how often.
+                assert.equal(response.status, 401)
+            }
+        })
+    } finally {
+        setRateLimitingForTesting(false)
+    }
+})
+
+test("a wrong-password flood on one account is slowed down, other accounts are not affected, and the answer is JSON", async () => {
+    setRateLimitingForTesting(true)
+
+    try {
+        await withSessionUser(async (context) => {
+            const attempt = (email: string) => postJson(context.baseUrl, "/users/login", { email, password: "definitely-not-it" })
+            const statuses: number[] = []
+
+            for (let request = 0; request < 12; request++) {
+                statuses.push((await attempt(context.email)).status)
+            }
+
+            assert.deepEqual(statuses, [...Array(10).fill(400), 429, 429])
+
+            const blocked = await attempt(context.email.toUpperCase())
+            assert.equal(blocked.status, 429)
+            assert.deepEqual(await blocked.json(), { message: "Too many attempts. Please wait a few minutes and try again." })
+            assert.ok(blocked.headers.get("retry-after"))
+
+            // A different account from the same address still gets through to the password check.
+            assert.equal((await attempt(`someone-else-${randomUUID()}@example.test`)).status, 400)
+        })
+    } finally {
+        setRateLimitingForTesting(false)
+    }
+})
+
+test("asking for emails is limited per account, and sign-ups per address", async () => {
+    setRateLimitingForTesting(true)
+
+    try {
+        await withAppServer(async (baseUrl) => {
+            const email = `flood-${randomUUID()}@example.test`
+            const statuses: number[] = []
+
+            for (let request = 0; request < 7; request++) {
+                statuses.push((await postJson(baseUrl, "/users/forgot-password", { email })).status)
+            }
+
+            assert.deepEqual(statuses, [200, 200, 200, 200, 200, 429, 429])
+        })
+    } finally {
+        setRateLimitingForTesting(false)
+    }
+})
+
+test("writing in complaint threads is limited per user", async () => {
+    setRateLimitingForTesting(true)
+
+    try {
+        await withSessionUser(async (context) => {
+            const { access } = await loginForSession(context)
+            const statuses: number[] = []
+
+            for (let request = 0; request < 32; request++) {
+                const response = await postJson(context.baseUrl, "/disputes/1/messages", { message: "This is a long enough message." }, `token=${access}`)
+                statuses.push(response.status)
+            }
+
+            // The first 30 reach the handler (no such complaint: 404); the rest are stopped before it.
+            assert.equal(statuses.slice(0, 30).every((status) => status === 404), true, statuses.join(","))
+            assert.deepEqual(statuses.slice(30), [429, 429])
+        })
+    } finally {
+        setRateLimitingForTesting(false)
+    }
+})
+
+test("prices, text and image links on listings and shops are checked", async () => {
+    assert.equal(priceProblem(1500), null)
+    assert.equal(priceProblem("19.99"), null)
+    assert.equal(priceProblem(0.01), null)
+    assert.equal(priceProblem(100_000_000), null)
+    for (const bad of [0, -5, "abc", NaN, Infinity, null, undefined, {}, "1e21", 100_000_001, 19.999, "0.001"]) {
+        assert.ok(priceProblem(bad), `${String(bad)} should be refused`)
+    }
+
+    for (const good of ["https://res.cloudinary.com/demo/image/upload/a.png", "https://example.test/logo.png"]) {
+        assert.equal(isHttpsUrl(good), true, good)
+    }
+    for (const bad of ["http://example.test/a.png", "javascript:alert(1)", "data:image/png;base64,AAAA", "https://localhost/a.png", "https://user:pw@example.test/a.png", "not a url", "", `https://example.test/${"a".repeat(2100)}`, 5, null]) {
+        assert.equal(isHttpsUrl(bad), false, String(bad).slice(0, 40))
+    }
+})
+
+test("creating and editing a listing refuses oversized text, non-https images and odd prices", async () => {
+    const fixture = await createCheckoutLifecycleFixture("listing-limits", 5, 1)
+
+    try {
+        const post = (body: Record<string, unknown>, method = "POST", path = "/listings") => fetch(`${fixture.baseUrl}${path}`, {
+            method,
+            headers: { "content-type": "application/json", cookie: `token=${fixture.sellerToken}` },
+            body: JSON.stringify(body)
+        })
+        const valid = { title: "Charger", description: "A fast charger", price: 2500, category: "Electronics", imageUrl: "https://example.test/charger.png", stockQuantity: 3 }
+        const refused = async (changes: Record<string, unknown>, message: RegExp) => {
+            const response = await post({ ...valid, ...changes })
+            assert.equal(response.status, 400, JSON.stringify(changes).slice(0, 60))
+            assert.match((await response.json() as { message: string }).message, message)
+        }
+
+        await refused({ title: "t".repeat(121) }, /120 characters/)
+        await refused({ description: "d".repeat(5001) }, /5000 characters/)
+        await refused({ title: { x: 1 } }, /Title must be text/)
+        await refused({ imageUrl: "http://example.test/charger.png" }, /https link/)
+        await refused({ imageUrl: "javascript:alert(1)" }, /https link/)
+        await refused({ price: 19.999 }, /two decimal places/)
+        await refused({ price: 100_000_001 }, /cannot be more than/)
+        await refused({ price: "abc" }, /greater than 0/)
+        await refused({ stockQuantity: 1_000_001 }, /cannot be more than/)
+        await refused({ stockQuantity: 2.5 }, /whole number/)
+
+        const created = await post(valid)
+        assert.equal(created.status, 201)
+        const listing = await created.json() as { id: number }
+
+        const edit = (body: Record<string, unknown>) => post(body, "PATCH", `/listings/${listing.id}`)
+        assert.equal((await edit({ imageUrl: "http://example.test/x.png" })).status, 400)
+        assert.equal((await edit({ price: 12.345 })).status, 400)
+        assert.equal((await edit({ title: "t".repeat(121) })).status, 400)
+        assert.equal((await edit({ price: 3000.5, imageUrl: "https://example.test/new.png" })).status, 200)
+
+        await prisma.listing.delete({ where: { id: listing.id } })
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("shop names and logos are checked", async () => {
+    const identity = newGoogleIdentity("shop")
+
+    await withGoogleServer([identity.email], async (baseUrl) => {
+        const created = await postJson(baseUrl, "/users/google", { credential: googleToken(identity), role: "SELLER" })
+        const cookie = `token=${cookiesFrom(created).token?.value}`
+        const shop = { businessName: "Good Shop", state: "Lagos", lga: "Ikeja", logoUrl: "https://example.test/logo.png", shippingPolicy: "FREE" }
+        const send = (body: Record<string, unknown>) => postJson(baseUrl, "/seller/profile", body, cookie)
+
+        const longName = await send({ ...shop, businessName: "n".repeat(81) })
+        assert.equal(longName.status, 400)
+        assert.match((await longName.json() as { message: string }).message, /80 characters/)
+        const badLogo = await send({ ...shop, logoUrl: "http://example.test/logo.png" })
+        assert.equal(badLogo.status, 400)
+        assert.match((await badLogo.json() as { message: string }).message, /https link/)
+        assert.equal(await prisma.sellerProfile.count({ where: { user: { email: identity.email } } }), 0)
+
+        assert.equal((await send(shop)).status, 201)
+    })
+})
+
+test("production refuses to start without the payment secrets, a deliberate proxy setting and a long signing secret", () => {
+    const base = {
+        DATABASE_URL: "postgresql://localhost/vendly",
+        JWT_SECRET: "x".repeat(32),
+        NODE_ENV: "production",
+        PAYSTACK_SECRET_KEY: "k",
+        FLUTTERWAVE_SECRET_KEY: "k",
+        FLUTTERWAVE_WEBHOOK_SECRET: "k",
+        TRUST_PROXY: "1"
+    }
+
+    assert.doesNotThrow(() => assertRequiredEnvironment(base))
+    assert.throws(
+        () => assertRequiredEnvironment({ ...base, PAYSTACK_SECRET_KEY: "", FLUTTERWAVE_WEBHOOK_SECRET: " ", TRUST_PROXY: undefined }),
+        /required in production: PAYSTACK_SECRET_KEY, FLUTTERWAVE_WEBHOOK_SECRET, TRUST_PROXY/
+    )
+    assert.throws(() => assertRequiredEnvironment({ ...base, JWT_SECRET: "short" }), /JWT_SECRET must be at least 32 characters in production/)
+    // Outside production none of this is demanded.
+    assert.doesNotThrow(() => assertRequiredEnvironment({ DATABASE_URL: "postgresql://localhost/vendly", JWT_SECRET: "short" }))
+})
+
+test("the number of proxies in front of the server is read as a count, never as true", () => {
+    assert.equal(loadConfig({ TRUST_PROXY: "1" }).trustProxy, 1)
+    assert.equal(loadConfig({ TRUST_PROXY: "2" }).trustProxy, 2)
+    assert.equal(loadConfig({ TRUST_PROXY: "0" }).trustProxy, false)
+    assert.equal(loadConfig({}).trustProxy, false)
+
+    for (const bad of ["true", "yes", "-1", "1.5", "10.0.0.1"]) {
+        assert.throws(() => loadConfig({ TRUST_PROXY: bad }), /TRUST_PROXY must be the number of proxies/)
+    }
+})
+
+test("the background checker can be stopped and waits for a run in progress", async () => {
+    const stop = startPaymentChecker()
+    await stop()
+    // Stopping twice, or when nothing is running, is harmless.
+    await stop()
 })

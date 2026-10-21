@@ -20,6 +20,7 @@ import {
 } from "../controllers/adminDisputeController.js"
 import { authMiddleware } from "../middleware/authMiddleware.js"
 import { requireAdmin } from "../middleware/requireAdmin.js"
+import { messageLimiter } from "../middleware/rateLimits.js"
 
 const router = Router()
 
@@ -38,7 +39,7 @@ router.post("/liabilities/:id/manual-recovery", recordManualRecovery)
 router.post("/liabilities/:id/write-off", writeOffLiability)
 router.get("/disputes", listAdminDisputes)
 router.get("/disputes/:id", getAdminDispute)
-router.post("/disputes/:id/messages", postAdminDisputeMessage)
+router.post("/disputes/:id/messages", messageLimiter, postAdminDisputeMessage)
 router.post("/disputes/:id/approve", approveDispute)
 router.post("/disputes/:id/reject", rejectAdminDispute)
 

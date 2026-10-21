@@ -4,6 +4,13 @@ import shuffleArray from "../lib/shuffle.js"
 import { Prisma } from "../generated/prisma/client.js"
 import { categories, getCanonicalCategory } from "../lib/categories.js"
 import { heldReservationConditions } from "../lib/inventoryReservations.js"
+import {
+    isHttpsUrl,
+    maximumListingDescriptionLength,
+    maximumListingTitleLength,
+    maximumStockQuantity,
+    priceProblem
+} from "../lib/inputRules.js"
 
 class ReservedStockConflict extends Error {
     constructor(readonly reservedQuantity: number) {
@@ -11,9 +18,41 @@ class ReservedStockConflict extends Error {
     }
 }
 
-function isInvalidPrice(price: unknown){
-    const amount = Number(price)
-    return isNaN(amount) || amount <= 0
+// The text fields that were given must be text of a sensible size, and the image must be an https link.
+function listingTextProblem(fields: { title?: unknown; description?: unknown; category?: unknown; imageUrl?: unknown }): string | null {
+    const { title, description, category, imageUrl } = fields
+
+    for (const [name, value] of [["Title", title], ["Description", description], ["Category", category], ["Image URL", imageUrl]] as const) {
+        if (value !== undefined && typeof value !== "string") {
+            return `${name} must be text`
+        }
+    }
+
+    if (typeof title === "string" && title.trim().length > maximumListingTitleLength) {
+        return `Title must be ${maximumListingTitleLength} characters or fewer`
+    }
+
+    if (typeof description === "string" && description.trim().length > maximumListingDescriptionLength) {
+        return `Description must be ${maximumListingDescriptionLength} characters or fewer`
+    }
+
+    if (imageUrl !== undefined && !isHttpsUrl(imageUrl)) {
+        return "Image URL must be an https link"
+    }
+
+    return null
+}
+
+function stockProblem(stockQuantity: unknown): string | null {
+    if (!Number.isInteger(stockQuantity) || (stockQuantity as number) < 0) {
+        return "Stock quantity must be a whole number greater than or equal to 0"
+    }
+
+    if ((stockQuantity as number) > maximumStockQuantity) {
+        return `Stock quantity cannot be more than ${maximumStockQuantity.toLocaleString("en-NG")}`
+    }
+
+    return null
 }
 
 
@@ -107,8 +146,17 @@ export const createListing = async(req: Request, res:Response) =>{
         return
     }
 
-    if(isInvalidPrice(price)){
-        res.status(400).send({message:"Price must be a number greater than 0"})
+    const textProblem = listingTextProblem({ title, description, category, imageUrl })
+
+    if (textProblem) {
+        res.status(400).send({message: textProblem})
+        return
+    }
+
+    const priceError = priceProblem(price)
+
+    if(priceError){
+        res.status(400).send({message: priceError})
         return
     }
 
@@ -117,10 +165,10 @@ export const createListing = async(req: Request, res:Response) =>{
         return
     }
 
-    if (!Number.isInteger(stockQuantity) || stockQuantity < 0) {
-        res.status(400).send({
-            message: "Stock quantity must be a whole number greater than or equal to 0"
-        });
+    const stockError = stockProblem(stockQuantity)
+
+    if (stockError) {
+        res.status(400).send({ message: stockError });
         return;
     }
 
@@ -172,18 +220,27 @@ export const updateListing = async(req:Request, res:Response) =>{
         return
     }
 
+    const textProblem = listingTextProblem({ title, description, category, imageUrl })
+
+    if (textProblem) {
+        res.status(400).send({message: textProblem})
+        return
+    }
+
     if (price !== undefined) {
-        if (isInvalidPrice(price)) {
-            res.status(400).send({message:"Price must be a number greater than 0"})
+        const priceError = priceProblem(price)
+
+        if (priceError) {
+            res.status(400).send({message: priceError})
             return
         }
     }
 
     if (stockQuantity !== undefined) {
-        if (!Number.isInteger(stockQuantity) || stockQuantity < 0) {
-            res.status(400).send({
-                message: "Stock quantity must be a whole number greater than or equal to 0"
-            });
+        const stockError = stockProblem(stockQuantity)
+
+        if (stockError) {
+            res.status(400).send({ message: stockError });
             return;
         }
     }

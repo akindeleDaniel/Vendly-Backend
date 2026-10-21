@@ -5,6 +5,9 @@ export type AppConfig = {
     frontendUrl: string
     cookieSameSite: CookieSameSite
     cookieSecure: boolean
+    // How many proxies (a load balancer, the host's router) sit in front of the server. Tells Express which
+    // address in X-Forwarded-For is the real visitor, which rate limiting depends on. False for none.
+    trustProxy: number | false
 }
 
 const cookieSameSiteValues: CookieSameSite[] = ["lax", "strict", "none"]
@@ -46,10 +49,17 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
         throw new Error("COOKIE_SAME_SITE must be lax, strict or none")
     }
 
+    const trustProxyValue = env.TRUST_PROXY?.trim() || "0"
+
+    if (!/^\d+$/.test(trustProxyValue)) {
+        throw new Error("TRUST_PROXY must be the number of proxies in front of the server (0 for none, usually 1 on a host), not true or an address")
+    }
+
     return {
         port,
         frontendUrl: frontendUrl.origin,
         cookieSameSite,
+        trustProxy: Number(trustProxyValue) || false,
         // Browsers reject SameSite=None cookies that are not Secure.
         cookieSecure: env.NODE_ENV === "production" || cookieSameSite === "none"
     }
@@ -61,6 +71,22 @@ export function assertRequiredEnvironment(env: NodeJS.ProcessEnv): void {
 
     if (missing.length > 0) {
         throw new Error(`Missing required environment variables: ${missing.join(", ")}`)
+    }
+
+    if (env.NODE_ENV === "production") {
+        // Without the provider secrets the server would start and then quietly refuse every payment webhook.
+        // TRUST_PROXY must be a deliberate choice (0 if there is no proxy), because a wrong value makes rate
+        // limiting treat every visitor as one person.
+        const missingInProduction = ["PAYSTACK_SECRET_KEY", "FLUTTERWAVE_SECRET_KEY", "FLUTTERWAVE_WEBHOOK_SECRET", "TRUST_PROXY"]
+            .filter((name) => !env[name]?.trim())
+
+        if (missingInProduction.length > 0) {
+            throw new Error(`Missing environment variables required in production: ${missingInProduction.join(", ")}`)
+        }
+
+        if ((env.JWT_SECRET ?? "").trim().length < 32) {
+            throw new Error("JWT_SECRET must be at least 32 characters in production")
+        }
     }
 }
 

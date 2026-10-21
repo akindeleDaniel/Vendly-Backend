@@ -13,15 +13,27 @@ import disputeRoutes from "./routes/disputeRoutes.js"
 import webhookRoutes from "./routes/webhookRoutes.js"
 import { ensureRequestBody, errorHandler, notFoundHandler } from "./middleware/errorHandlers.js"
 import config from "./config.js"
+import helmet from "helmet"
+import healthRoutes from "./routes/healthRoutes.js"
+import { generalLimiter } from "./middleware/rateLimits.js"
+import { requireTrustedOrigin } from "./middleware/sameOrigin.js"
 
 const app = express()
 
+app.set("trust proxy", config.trustProxy)
+// Security headers (no sniffing, no framing, no referrer leaks, and the X-Powered-By banner removed). This is
+// a JSON API read by a page on another origin, so its responses must be readable cross-origin.
+app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }))
+app.use("/health", healthRoutes)
 app.use(cors({
     origin: config.frontendUrl,
     credentials:true
 }))
 // Mounted before the JSON parser: webhooks need the raw request body to check signatures.
 app.use("/payments/webhooks", webhookRoutes)
+app.use(generalLimiter)
+// Refuses changes asked for by another website using a visitor's cookies.
+app.use(requireTrustedOrigin)
 app.use(express.json())
 app.use(ensureRequestBody)
 app.use(cookieParser())
