@@ -107,6 +107,13 @@ model SellerProfile {
   // How a shop that sells food takes orders: now, only as pre-orders (the buyer asks for a time and the seller
   // approves it), or both. Every other shop is NOW.
   foodOrderType         FoodOrderType         @default(NOW)
+  // Standing: complaints the seller lost count as strikes (2 in 90 days is a warning, 4 blocks new orders).
+  // A blocked shop is hidden and cannot be bought from; orders already placed carry on. Lifting a block starts
+  // the count again from strikesResetAt.
+  blockedAt             DateTime?
+  blockReason           String?
+  strikeWarnedAt        DateTime?
+  strikesResetAt        DateTime?
 }
 
 enum FoodOrderType {
@@ -427,6 +434,8 @@ model Dispute {
   decidedById       Int?
   responseDueAt     DateTime
   sellerRespondedAt DateTime?
+  // Set when the seller agreed to the refund. A refund the seller agreed to is not a strike against them.
+  sellerAgreedAt    DateTime?
   escalatedAt       DateTime?
   resolvedAt        DateTime?
   // When the buyer and the seller last opened the complaint; messages by others after this are "new" to them.

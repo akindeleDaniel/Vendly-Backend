@@ -78,7 +78,11 @@ export const getAllListings = async (req:Request, res:Response) =>{
 
     const page = pageValue
     // Listings the seller took off sale are not shown to shoppers.
-    const filters:Prisma.ListingWhereInput /* a type that prisma created to fit this variable properly  it can be gotten from the erro description if it shows an error*/= { archivedAt: null }
+    const filters:Prisma.ListingWhereInput /* a type that prisma created to fit this variable properly  it can be gotten from the erro description if it shows an error*/= {
+        archivedAt: null,
+        // A blocked shop is hidden from shoppers.
+        user: { sellerProfile: { is: { blockedAt: null } } }
+    }
 
     if (category !== undefined) {
         const canonicalCategory = getCanonicalCategory(category)
@@ -154,14 +158,15 @@ export const getListingById  = async (req:Request, res:Response) =>{
                     sellerProfile:{
                         select:{
                             slug:true,
-                            businessName:true
+                            businessName:true,
+                            blockedAt:true
                         }
                     }
                 }
             }
         }
     })
-    if(!specificData || specificData.archivedAt){
+    if(!specificData || specificData.archivedAt || specificData.user.sellerProfile?.blockedAt){
         res.status(404).send({message:"Listing not found"})
         return
     }

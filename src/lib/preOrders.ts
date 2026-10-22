@@ -94,9 +94,10 @@ export async function requestPreOrder(input: { buyerId: number; sellerSlug: stri
         throw new PreOrderRequestError(400, `Choose a time within the next ${maximumLeadDays} days`, "PREORDER_TIME_INVALID")
     }
 
-    const profile = await prisma.sellerProfile.findUnique({ where: { slug: input.sellerSlug }, select: { userId: true, foodOrderType: true } })
+    const profile = await prisma.sellerProfile.findUnique({ where: { slug: input.sellerSlug }, select: { userId: true, foodOrderType: true, blockedAt: true } })
 
-    if (!profile) {
+    // A blocked shop is hidden, so it looks the same as one that does not exist.
+    if (!profile || profile.blockedAt) {
         throw new PreOrderRequestError(404, "Store not found")
     }
 
@@ -186,6 +187,10 @@ export async function answerPreOrder(input: { id: number; sellerId: number; acti
     }
 
     const approve = input.action === "APPROVE"
+
+    if (approve && (await prisma.sellerProfile.count({ where: { userId: input.sellerId, blockedAt: { not: null } } })) > 0) {
+        throw new PreOrderRequestError(409, "Your shop is blocked from new orders, so you cannot approve pre-orders. You can still decline.", "PREORDER_NOT_AVAILABLE")
+    }
 
     if (approve && request.readyAt.getTime() < now.getTime() + approveMinimumNoticeHours * hourMs) {
         throw new PreOrderRequestError(409, "The time asked for is too close or has passed. Decline, and the buyer can ask for a later time.", "PREORDER_TIME_INVALID")

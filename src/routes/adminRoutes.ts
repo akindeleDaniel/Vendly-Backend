@@ -20,6 +20,7 @@ import {
     reopenAdminDispute
 } from "../controllers/adminDisputeController.js"
 import { getAdminOrder, getAdminSummary, getAdminUser, listAdminOrders, listAdminUsers } from "../controllers/adminLookupController.js"
+import { getAdminSellerStanding, setSellerBlocked } from "../controllers/sellerStandingController.js"
 import { authMiddleware } from "../middleware/authMiddleware.js"
 import { requireAdmin } from "../middleware/requireAdmin.js"
 import { listAdminReviews, setReviewHidden } from "../controllers/reviewController.js"
@@ -35,6 +36,9 @@ router.get("/orders", listAdminOrders)
 router.get("/orders/:id", getAdminOrder)
 router.get("/users", listAdminUsers)
 router.get("/users/:id", getAdminUser)
+router.get("/sellers/:userId/standing", getAdminSellerStanding)
+router.post("/sellers/:userId/block", setSellerBlocked(true))
+router.post("/sellers/:userId/unblock", setSellerBlocked(false))
 router.post("/orders/:id/refunds", issueOrderRefund)
 router.get("/refunds", listRefunds)
 router.get("/refunds/:id", getRefund)

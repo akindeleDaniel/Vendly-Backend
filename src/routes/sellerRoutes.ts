@@ -13,6 +13,7 @@ import {
     withdrawSellerOffer
 } from "../controllers/disputeController.js"
 import { getMyEarnings } from "../controllers/sellerEarningsController.js"
+import { getMyStanding } from "../controllers/sellerStandingController.js"
 import { authMiddleware } from "../middleware/authMiddleware.js"
 import { approvePreOrder, countPreOrdersAwaitingAnswer, declinePreOrder, getSellerPreOrder, listSellerPreOrders } from "../controllers/preOrderController.js"
 import { listMyReviews, listShopReviews, reportReview } from "../controllers/reviewController.js"
@@ -32,6 +33,7 @@ router.put("/payout/accounts", authMiddleware, requireRole("SELLER"), changePayo
 router.post("/payout/terms", authMiddleware, requireRole("SELLER"), acceptPayoutTerms)
 router.get("/liabilities", authMiddleware, requireRole("SELLER"), getMyLiabilities)
 router.get("/earnings", authMiddleware, requireRole("SELLER"), getMyEarnings)
+router.get("/standing", authMiddleware, requireRole("SELLER"), getMyStanding)
 router.get("/orders", authMiddleware, requireRole("SELLER"), listSellerOrders)
 router.get("/orders/:id", authMiddleware, requireRole("SELLER"), getSellerOrder)
 router.post("/orders/:id/ship", authMiddleware, requireRole("SELLER"), shipSellerOrder)

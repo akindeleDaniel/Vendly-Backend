@@ -5,6 +5,7 @@ import { activeDisputeStatuses } from "../disputes.js"
 import { getPaymentProvider } from "./providers.js"
 import { PaymentProviderError, type ProviderRefund } from "./types.js"
 import { notifyRefundProgress, notifySellerCharged, queueNotification } from "../notifications.js"
+import { reviewSellerStanding } from "../sellerStanding.js"
 
 // Statuses of an order that has been paid and not fully refunded.
 const refundableOrderStatuses: string[] = ["PAID", "SHIPPED", "DELIVERED"]
@@ -304,6 +305,7 @@ async function applyProviderRefund(refundId: number, providerRefund: ProviderRef
     // What changed, so the people involved are told once, after it is saved, and not on every later check.
     let progressedTo = null as "PROCESSING" | "SUCCEEDED" | "FAILED" | "NEEDS_ATTENTION" | null
     let sellerCharged = false as boolean
+    let reviewSeller = null as number | null
 
     await prisma.$transaction(async (tx) => {
         const refund = await tx.refund.findUniqueOrThrow({
@@ -351,12 +353,20 @@ async function applyProviderRefund(refundId: number, providerRefund: ProviderRef
             sellerCharged = created.count === 1
         }
 
-        await resolveDisputesForRefund(tx, refund, now)
+        if ((await resolveDisputesForRefund(tx, refund, now)) > 0 && refund.order) {
+            reviewSeller = refund.order.sellerId
+        }
 
         if (status === "SUCCEEDED") {
             await completeRefund(tx, refund)
         }
     })
+
+    if (reviewSeller !== null) {
+        // A lost complaint is a strike: warn or block the shop if it has reached the limit.
+        const sellerId = reviewSeller
+        queueNotification("seller standing", () => reviewSellerStanding(sellerId))
+    }
 
     if (progressedTo) {
         const reached = progressedTo
@@ -370,7 +380,7 @@ async function applyProviderRefund(refundId: number, providerRefund: ProviderRef
 
 // A refund the provider has accepted settles the complaint it was for, and any other open complaint
 // about the same order. A refund that fails leaves the complaint open so it can be approved again.
-async function resolveDisputesForRefund(tx: Prisma.TransactionClient, refund: Refund, now: Date): Promise<void> {
+async function resolveDisputesForRefund(tx: Prisma.TransactionClient, refund: Refund, now: Date): Promise<number> {
     const matching: Prisma.DisputeWhereInput[] = []
 
     if (refund.disputeId) {
@@ -382,9 +392,10 @@ async function resolveDisputesForRefund(tx: Prisma.TransactionClient, refund: Re
     }
 
     if (matching.length === 0) {
-        return
+        return 0
     }
 
+    let resolved = 0
     const open = await tx.dispute.findMany({
         where: { status: { in: activeDisputeStatuses }, OR: matching },
         select: { id: true }
@@ -403,11 +414,14 @@ async function resolveDisputesForRefund(tx: Prisma.TransactionClient, refund: Re
         })
 
         if (moved.count === 1) {
+            resolved += 1
             await tx.disputeMessage.create({
                 data: { disputeId: id, author: "SYSTEM", body: `Vendly approved a refund of ₦${refund.amount.toFixed(2)}.` }
             })
         }
     }
+
+    return resolved
 }
 
 async function voidLiability(tx: Prisma.TransactionClient, refundId: number): Promise<void> {

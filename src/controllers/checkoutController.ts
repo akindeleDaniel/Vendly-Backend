@@ -23,7 +23,8 @@ const checkoutListingSelect = {
                     slug: true,
                     shippingPolicy: true,
                     shippingCost: true,
-                    foodOrderType: true
+                    foodOrderType: true,
+                    blockedAt: true
                 }
             }
         }
@@ -270,7 +271,7 @@ function priceCheckoutItems(
             )
         }
 
-        if (!sellerProfile) {
+        if (!sellerProfile || sellerProfile.blockedAt) {
             throw new CheckoutRequestError(
                 409,
                 `Listing ${cartItem.listingId} does not have an available seller storefront`,

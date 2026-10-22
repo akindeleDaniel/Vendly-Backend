@@ -29,6 +29,7 @@ import { waitForNotifications } from "../src/lib/notifications.js"
 import { recalculateRating } from "../src/lib/reviews.js"
 import { expirePreOrders } from "../src/lib/preOrders.js"
 import { remindAndCloseDeliveries } from "../src/lib/deliveryClosing.js"
+import { reviewSellerStanding } from "../src/lib/sellerStanding.js"
 import { flutterwaveAdapter } from "../src/lib/payments/flutterwave.js"
 import { paystackAdapter } from "../src/lib/payments/paystack.js"
 import { setPaymentProvidersForTesting } from "../src/lib/payments/providers.js"
@@ -9212,5 +9213,106 @@ test("an administrator can reopen a rejected complaint, but not one that ended i
         const refunded = await reopen({ note: "Trying to reopen a refunded one." })
         assert.equal(refunded.status, 409)
         assert.equal(refunded.body.code, "DISPUTE_NOT_REOPENABLE")
+    })
+})
+
+// ---- Seller standing ----
+
+test("lost complaints are strikes: a warning at 2, a block at 4, and an administrator can lift it", async () => {
+    await withPaymentCheckout("seller-standing", async (context) => {
+        const { fixture, request, adminToken, baseUrl } = context
+        const { seller } = await addressesOf(fixture)
+        const orderId = await payAndShip(context)
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId }, select: { slug: true } })
+        const standing = async () => (await request("GET", "/seller/standing", undefined, fixture.sellerToken)).body.standing
+        const strike = (data: Record<string, unknown> = {}) => prisma.dispute.create({
+            data: {
+                orderId,
+                openedBy: "BUYER",
+                reason: "OTHER",
+                requestedAmount: 1000,
+                status: "RESOLVED",
+                outcome: "REFUNDED",
+                responseDueAt: new Date(),
+                resolvedAt: new Date(),
+                ...data
+            }
+        })
+
+        // A real complaint that Vendly approves is the first strike. One strike is not a warning.
+        const id = (await complain(context, orderId)).body.dispute.id as number
+        assert.equal((await request("POST", `/admin/disputes/${id}/approve`, { note: "Approved after review of the photos." }, adminToken)).status, 201)
+        await waitForNotifications()
+        let now = await standing()
+        assert.deepEqual([now.strikes, now.warnAt, now.blockAt, now.windowDays, now.warned, now.blocked], [1, 2, 4, 90, false, false])
+        assert.equal(now.recent[0].disputeId, id)
+        assert.equal(emailsTo(seller).some((mail) => /warning about complaints/.test(mail.subject)), false)
+
+        // A refund the seller agreed to, and one older than 90 days, are not strikes.
+        await strike({ sellerAgreedAt: new Date() })
+        await strike({ resolvedAt: new Date(Date.now() - 100 * 24 * 60 * 60 * 1000) })
+        await strike({ outcome: "REJECTED" })
+        await strike({ openedBy: "SELLER", reason: "SELLER_REFUND_OFFER" })
+        assert.equal((await standing()).strikes, 1)
+
+        // The second strike warns the seller, once.
+        await strike()
+        await reviewSellerStanding(fixture.sellerId)
+        await reviewSellerStanding(fixture.sellerId)
+        await waitForNotifications()
+        now = await standing()
+        assert.deepEqual([now.strikes, now.warned, now.blocked], [2, true, false])
+        assert.equal(emailsTo(seller).filter((mail) => /warning about complaints/.test(mail.subject)).length, 1)
+        assert.equal((await fetch(`${baseUrl}/listings/${fixture.listingId}`)).status, 200)
+
+        // The fourth strike blocks the shop. The shop is hidden and cannot be bought from.
+        await strike()
+        await reviewSellerStanding(fixture.sellerId)
+        assert.equal((await standing()).blocked, false)
+        await strike()
+        await reviewSellerStanding(fixture.sellerId)
+        await waitForNotifications()
+        now = await standing()
+        assert.deepEqual([now.strikes, now.blocked], [4, true])
+        assert.match(now.blockReason, /^Automatic: 4 lost complaints in 90 days$/)
+        assert.equal(emailsTo(seller).some((mail) => /blocked from new orders/.test(mail.subject)), true)
+
+        const shopper = await fixture.addConsumer(1)
+        assert.equal((await fetch(`${baseUrl}/listings/${fixture.listingId}`)).status, 404)
+        const title = (await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId }, select: { title: true } })).title
+        const listed = await (await fetch(`${baseUrl}/listings?search=${encodeURIComponent(title)}`)).json() as { listings: Array<{ id: number }> }
+        assert.equal(listed.listings.some((listing) => listing.id === fixture.listingId), false)
+        assert.equal((await fetch(`${baseUrl}/seller/shop/${profile.slug}`)).status, 404)
+        assert.equal((await request("POST", "/cart/items", { listingId: fixture.listingId, quantity: 1 }, shopper.token)).status, 404)
+
+        // Orders already placed carry on: the seller can still see their orders and complaints.
+        assert.equal((await request("GET", "/seller/orders", undefined, fixture.sellerToken)).status, 200)
+        assert.equal((await request("GET", "/seller/disputes", undefined, fixture.sellerToken)).status, 200)
+
+        // Only administrators see or change a standing, and a block by hand needs a note.
+        const adminView = await request("GET", `/admin/sellers/${fixture.sellerId}/standing`, undefined, adminToken)
+        assert.equal(adminView.body.standing.blocked, true)
+        assert.equal((await request("GET", `/admin/sellers/${fixture.sellerId}/standing`, undefined, fixture.token)).status, 403)
+        assert.equal((await request("GET", "/seller/standing", undefined, fixture.token)).status, 403)
+        assert.equal((await request("GET", "/admin/sellers/999999/standing", undefined, adminToken)).status, 404)
+        assert.equal((await request("POST", `/admin/sellers/${fixture.sellerId}/block`, { note: "short" }, adminToken)).status, 400)
+        const twice = await request("POST", `/admin/sellers/${fixture.sellerId}/block`, { note: "Blocking this one again." }, adminToken)
+        assert.equal(twice.status, 409)
+
+        // Lifting the block makes the shop visible again and starts the count from zero.
+        const lifted = await request("POST", `/admin/sellers/${fixture.sellerId}/unblock`, {}, adminToken)
+        assert.equal(lifted.status, 200)
+        assert.deepEqual([lifted.body.standing.strikes, lifted.body.standing.warned, lifted.body.standing.blocked], [0, false, false])
+        await waitForNotifications()
+        assert.equal(emailsTo(seller).some((mail) => /can take orders again/.test(mail.subject)), true)
+        assert.equal((await fetch(`${baseUrl}/listings/${fixture.listingId}`)).status, 200)
+        assert.equal((await request("POST", "/cart/items", { listingId: fixture.listingId, quantity: 1 }, shopper.token)).status, 200)
+        assert.equal((await request("POST", `/admin/sellers/${fixture.sellerId}/unblock`, {}, adminToken)).status, 409)
+
+        // An administrator can also block a shop by hand, with a reason the seller can read.
+        const manual = await request("POST", `/admin/sellers/${fixture.sellerId}/block`, { note: "Selling items that are not allowed." }, adminToken)
+        assert.equal(manual.status, 200)
+        assert.equal(manual.body.standing.blockReason, "Selling items that are not allowed.")
+        assert.equal((await fetch(`${baseUrl}/listings/${fixture.listingId}`)).status, 404)
     })
 })

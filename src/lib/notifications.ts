@@ -517,3 +517,55 @@ export async function notifyPreOrderUpdate(requestId: number, event: PreOrderEve
         ], buyerLink)])
     }
 }
+
+// ---- seller standing ----
+
+async function sellerContact(sellerId: number): Promise<{ email: string } | null> {
+    return prisma.user.findUnique({ where: { id: sellerId }, select: { email: true } })
+}
+
+export async function notifySellerWarned(sellerId: number, strikes: number): Promise<void> {
+    const seller = await sellerContact(sellerId)
+
+    if (!seller) {
+        return
+    }
+
+    await sendAll([
+        mail(seller.email, "A warning about complaints against your shop", [
+            `${strikes} complaints against your shop ended in a refund in the last 90 days, and you did not agree to them.`,
+            "If this reaches 4, new orders from your shop will be blocked and your shop will be hidden until Vendly reviews it.",
+            "Answer complaints on time and look at what buyers say, so fewer of them end in a refund."
+        ], { label: "See your complaints", path: "/seller/disputes" })
+    ])
+}
+
+export async function notifySellerBlocked(sellerId: number): Promise<void> {
+    const seller = await sellerContact(sellerId)
+
+    if (!seller) {
+        return
+    }
+
+    await sendAll([
+        mail(seller.email, "Your shop is blocked from new orders", [
+            "Your shop is hidden and cannot take new orders. Orders already placed carry on as normal, and you should still ship them and answer any complaints.",
+            "Contact Vendly if you think this is a mistake. Vendly can lift the block after reviewing it."
+        ], { label: "See your standing", path: "/seller/standing" })
+    ])
+}
+
+export async function notifySellerUnblocked(sellerId: number): Promise<void> {
+    const seller = await sellerContact(sellerId)
+
+    if (!seller) {
+        return
+    }
+
+    await sendAll([
+        mail(seller.email, "Your shop can take orders again", [
+            "Vendly lifted the block on your shop. It is visible again and can take new orders.",
+            "Your count of lost complaints starts again from today."
+        ], { label: "See your standing", path: "/seller/standing" })
+    ])
+}

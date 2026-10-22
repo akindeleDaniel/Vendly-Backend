@@ -305,7 +305,7 @@ export async function respondToDispute(input: {
         const moved = await tx.dispute.updateMany({
             where: { id: dispute.id, status: "OPEN" },
             data: input.action === "AGREE_TO_REFUND"
-                ? { status: "SELLER_AGREED", sellerRespondedAt: now }
+                ? { status: "SELLER_AGREED", sellerRespondedAt: now, sellerAgreedAt: now }
                 : { status: "UNDER_REVIEW", sellerRespondedAt: now, escalatedAt: now }
         })
 

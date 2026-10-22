@@ -353,14 +353,18 @@ export const getPublicShop = async (req: Request, res: Response) => {
                 shippingCost:true,
                 foodOrderType:true,
                 ratingCount:true,
-                ratingSum:true
+                ratingSum:true,
+                blockedAt:true
             }
         })
 
-        if(!profile){
+        // A blocked shop is hidden.
+        if(!profile || profile.blockedAt){
             res.status(404).send({message:"Store not found"})
             return
         }
+
+        const { blockedAt: _blockedAt, ...profileFields } = profile
 
         const listings = await prisma.listing.findMany({
             where:{
@@ -374,7 +378,7 @@ export const getPublicShop = async (req: Request, res: Response) => {
         })
 
         res.send({
-            profile: withShopRating(profile),
+            profile: withShopRating(profileFields),
             listings: listings.map(withImages)
         })
     }catch(error){
@@ -445,6 +449,7 @@ export const getCategoryShops = async (req: Request, res: Response) => {
             where: searchTerm
                 ? {
                     AND: [
+                        { blockedAt: null },
                         {
                             user: {
                                 listings: {
@@ -475,6 +480,7 @@ export const getCategoryShops = async (req: Request, res: Response) => {
                     ]
                 }
                 : {
+                    blockedAt: null,
                     user: {
                         listings: {
                             some: {
