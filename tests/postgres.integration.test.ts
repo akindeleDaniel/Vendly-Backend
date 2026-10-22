@@ -5707,6 +5707,9 @@ test("the session check reports whether the user is an administrator", async () 
         const consumer = await request("GET", "/users/check", undefined, fixture.token)
         assert.equal(consumer.body.isAdmin, false)
         assert.equal(consumer.body.role, "CONSUMER")
+
+        const consumerName = (await prisma.user.findUniqueOrThrow({ where: { id: fixture.consumerId }, select: { name: true } })).name
+        assert.equal(consumer.body.name, consumerName)
     })
 })
 

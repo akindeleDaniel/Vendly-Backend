@@ -228,6 +228,7 @@ export const checkAuth = async (req: Request, res: Response) => {
         const user = await prisma.user.findUnique({
             where: { id: userId },
             select: {
+                name: true,
                 role: true,
                 isAdmin: true,
                 passwordHash: true
@@ -243,6 +244,7 @@ export const checkAuth = async (req: Request, res: Response) => {
 
         res.send({
             message: "Authenticated",
+            name: user.name,
             role: user.role,
             // Lets the frontend show the administrator screens. The server still checks it on every admin request.
             isAdmin: user.isAdmin,
