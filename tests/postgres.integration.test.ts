@@ -9528,3 +9528,159 @@ test("an option is paid, shipped, reviewed and refunded like any listing, and it
         assert.equal((await prisma.listing.findUniqueOrThrow({ where: { id: product.id } })).stockQuantity, 0)
     })
 })
+
+// ---- Administrator team and platform figures ----
+
+test("super administrators manage the administrator team with their password, and everything is in the audit log", async () => {
+    await withPaymentCheckout("admin-team", async (context) => {
+        const { fixture, request, adminToken } = context
+        const superId = (jwt.decode(adminToken) as { id: number }).id
+        await prisma.user.update({ where: { id: superId }, data: { passwordHash: await bcrypt.hash(goodPassword, 4), isSuperAdmin: true, emailVerifiedAt: new Date() } })
+        const { buyer: targetEmail } = await addressesOf(fixture)
+        await prisma.user.update({ where: { id: fixture.consumerId }, data: { emailVerifiedAt: new Date() } })
+        const targetToken = fixture.token
+        const team = () => request("GET", "/admin/team", undefined, adminToken)
+
+        // Only super administrators reach the team, the audit log and the platform figures.
+        for (const path of ["/admin/team", "/admin/audit-log", "/admin/platform"]) {
+            assert.equal((await request("GET", path, undefined, targetToken)).status, 403, path)
+            assert.equal((await request("GET", path, undefined, fixture.sellerToken)).status, 403, path)
+            assert.equal((await request("GET", path, undefined, adminToken)).status, 200, path)
+        }
+        assert.equal((await request("GET", "/users/check", undefined, adminToken)).body.isSuperAdmin, true)
+        assert.equal((await request("GET", "/users/check", undefined, targetToken)).body.isSuperAdmin, false)
+        assert.equal((await team()).body.team.some((person: { id: number; isSuperAdmin: boolean }) => person.id === superId && person.isSuperAdmin), true)
+
+        // Adding an administrator needs the actor's own password and an account that exists and is confirmed.
+        const add = (body: Record<string, unknown>, token = adminToken) => request("POST", "/admin/team", body, token)
+        assert.equal((await add({ email: targetEmail })).status, 400)
+        assert.equal((await add({ email: targetEmail, password: "wrong-password-here" })).status, 403)
+        assert.equal((await add({ password: goodPassword })).status, 400)
+        assert.equal((await add({ email: targetEmail, password: goodPassword, superAdmin: "yes" })).status, 400)
+        assert.equal((await add({ email: "nobody-here@example.test", password: goodPassword })).status, 404)
+        assert.equal((await add({ email: targetEmail, password: goodPassword }, targetToken)).status, 403)
+        const unconfirmed = await prisma.user.create({ data: { name: "New person", email: `unconfirmed-${randomUUID()}@example.test`, passwordHash: "integration-test-not-a-password", role: "CONSUMER" } })
+
+        try {
+            assert.equal((await add({ email: unconfirmed.email, password: goodPassword })).status, 409)
+        } finally {
+            await prisma.user.delete({ where: { id: unconfirmed.id } })
+        }
+
+        const added = await add({ email: targetEmail.toUpperCase(), password: goodPassword })
+        assert.equal(added.status, 201)
+        assert.equal(added.body.team.find((person: { id: number }) => person.id === fixture.consumerId).isSuperAdmin, false)
+        assert.equal((await add({ email: targetEmail, password: goodPassword })).status, 409)
+        // A new administrator reaches the administrator screens but not the super administrator ones.
+        assert.equal((await request("GET", "/admin/summary", undefined, targetToken)).status, 200)
+        assert.equal((await request("GET", "/admin/team", undefined, targetToken)).status, 403)
+
+        // Super level can be given and taken away; the last super administrator cannot be removed.
+        const makeSuper = (value: unknown, password: unknown = goodPassword, id = fixture.consumerId, token = adminToken) => request("POST", `/admin/team/${id}/super`, { value, password }, token)
+        assert.equal((await makeSuper("yes")).status, 400)
+        assert.equal((await makeSuper(true, "wrong-password-here")).status, 403)
+        assert.equal((await makeSuper(false)).status, 409)
+        assert.equal((await makeSuper(true, goodPassword, 999999)).status, 404)
+        assert.equal((await makeSuper(true)).body.team.find((person: { id: number }) => person.id === fixture.consumerId).isSuperAdmin, true)
+        assert.equal((await makeSuper(true)).status, 409)
+        assert.equal((await request("GET", "/admin/team", undefined, targetToken)).status, 200)
+        assert.equal((await makeSuper(false, goodPassword, fixture.consumerId, targetToken)).status, 403)
+        assert.equal((await makeSuper(false)).status, 200)
+        const lastSuper = await makeSuper(false, goodPassword, superId)
+        assert.equal(lastSuper.status, 409)
+        assert.equal(lastSuper.body.code, "LAST_SUPER_ADMIN")
+        const revokeSelf = await request("POST", `/admin/team/${superId}/revoke`, { password: goodPassword }, adminToken)
+        assert.equal(revokeSelf.status, 409)
+        assert.equal(revokeSelf.body.code, "LAST_SUPER_ADMIN")
+
+        // Removing an administrator takes effect at once.
+        const revoke = (password: unknown, id: number | string = fixture.consumerId) => request("POST", `/admin/team/${id}/revoke`, { password }, adminToken)
+        assert.equal((await revoke(undefined)).status, 400)
+        assert.equal((await revoke("wrong-password-here")).status, 403)
+        assert.equal((await revoke(goodPassword, "abc")).status, 404)
+        assert.equal((await revoke(goodPassword, fixture.sellerId)).status, 404)
+        const revoked = await revoke(goodPassword)
+        assert.equal(revoked.status, 200)
+        assert.equal(revoked.body.team.some((person: { id: number }) => person.id === fixture.consumerId), false)
+        assert.equal((await request("GET", "/admin/summary", undefined, targetToken)).status, 403)
+        assert.equal((await revoke(goodPassword)).status, 404)
+
+        // The two people involved are told.
+        await waitForNotifications()
+        const subjects = subjectsTo(targetEmail)
+        for (const subject of ["You are now a Vendly administrator", "You are now a Vendly super administrator", "Your super administrator access was removed", "Your administrator access was removed"]) {
+            assert.ok(subjects.includes(subject), subject)
+        }
+
+        // A seller block is in the log too. Newest first, with who did it and to whom.
+        assert.equal((await request("POST", `/admin/sellers/${fixture.sellerId}/block`, { note: "Selling items that are not allowed." }, adminToken)).status, 200)
+        const log = (await request("GET", "/admin/audit-log", undefined, adminToken)).body
+        assert.deepEqual([log.page, log.pageSize], [1, 50])
+        const mine = (log.entries as Array<{ action: string; actor: { id: number }; target: { id: number; email: string } | null; detail: string | null }>).filter((entry) => entry.actor.id === superId)
+        assert.deepEqual(mine.slice(0, 5).map((entry) => entry.action), ["SELLER_BLOCKED", "ADMIN_REVOKED", "SUPER_ADMIN_REMOVED", "SUPER_ADMIN_GRANTED", "ADMIN_GRANTED"])
+        assert.equal(mine[0]!.target!.id, fixture.sellerId)
+        assert.equal(mine[0]!.detail, "Selling items that are not allowed.")
+        assert.equal(mine[1]!.target!.email, targetEmail)
+        assert.equal((await request("GET", "/admin/audit-log?page=0", undefined, adminToken)).status, 400)
+
+        // An administrator whose account has no password (made with Google) must set one before managing the team.
+        await prisma.user.update({ where: { id: superId }, data: { passwordHash: null } })
+        const noPassword = await add({ email: targetEmail, password: goodPassword })
+        assert.equal(noPassword.status, 403)
+        assert.equal(noPassword.body.code, "ADMIN_PASSWORD_REQUIRED")
+    })
+})
+
+test("the platform figures show people, sales, refunds, complaints and what needs attention", async () => {
+    await withPaymentCheckout("admin-platform", async (context) => {
+        const { fixture, request, adminToken, checkoutId } = context
+        const superId = (jwt.decode(adminToken) as { id: number }).id
+        await prisma.user.update({ where: { id: superId }, data: { isSuperAdmin: true } })
+        const summary = async () => (await request("GET", "/admin/platform", undefined, adminToken)).body
+        const before = await summary()
+
+        assert.ok(before.users.total >= 3)
+        assert.equal(before.users.total, before.users.buyers + before.users.sellers)
+        assert.ok(before.users.admins >= 1 && before.users.joinedLast7Days >= 3 && before.users.joinedLast30Days >= before.users.joinedLast7Days)
+        assert.ok(before.shops.total >= 1 && before.shops.listingsOnSale >= 1)
+        for (const period of ["allTime", "last30Days", "last7Days", "today"]) {
+            const sales = before.sales[period]
+            assert.match(sales.paid, /^\d+\.\d{2}$/)
+            assert.equal(Number(sales.net).toFixed(2), (Number(sales.paid) - Number(sales.refunded)).toFixed(2), period)
+        }
+        assert.ok(Array.isArray(before.topSellersLast30Days) && before.topSellersLast30Days.length <= 5)
+
+        // A paid order raises the paid orders and the sales; a complaint raises the ones waiting for the seller.
+        const orderId = await payAndShip(context)
+        const complaint = await complain(context, orderId)
+        assert.equal(complaint.status, 201)
+        const after = await summary()
+        assert.equal(after.orders.paid, before.orders.paid + 1)
+        assert.equal(after.orders.shipped, before.orders.shipped + 1)
+        assert.equal(Number(after.sales.allTime.paid) - Number(before.sales.allTime.paid), 3000)
+        assert.equal(after.sales.today.payments, before.sales.today.payments + 1)
+        assert.equal(after.complaints.awaitingSeller, before.complaints.awaitingSeller + 1)
+        assert.equal(after.shops.blocked, before.shops.blocked)
+        const top = (after.topSellersLast30Days as Array<{ sellerId: number; orders: number; sales: string }>).find((seller) => seller.sellerId === fixture.sellerId)
+        assert.ok(top && top.orders >= 1 && Number(top.sales) >= 3000)
+
+        // An overdue seller answer is counted separately.
+        await prisma.dispute.update({ where: { id: complaint.body.dispute.id }, data: { responseDueAt: new Date(Date.now() - 1000) } })
+        assert.equal((await summary()).complaints.overdueSellerResponse, before.complaints.overdueSellerResponse + 1)
+
+        // A refund shows as money in progress, then as refunded.
+        const issued = await refundOrder(context, orderId)
+        assert.equal(issued.status, 201)
+        const progress = await summary()
+        assert.equal(progress.refunds.processing, before.refunds.processing + 1)
+        assert.equal(Number(progress.refunds.amountInProgress) - Number(before.refunds.amountInProgress), 3000)
+        providerReports(context, issued.body.refund, 300000, "succeeded", "processed")
+        await request("POST", `/admin/refunds/${issued.body.refund.id}/sync`, undefined, adminToken)
+        const refunded = await summary()
+        assert.equal(Number(refunded.sales.allTime.refunded) - Number(before.sales.allTime.refunded), 3000)
+        assert.equal(refunded.orders.refunded, before.orders.refunded + 1)
+        assert.equal(refunded.sellerDebts.open, before.sellerDebts.open + 1)
+        assert.equal(Number(refunded.sellerDebts.amountStillOwed) - Number(before.sellerDebts.amountStillOwed), 3000)
+        assert.equal(checkoutId > 0, true)
+    })
+})

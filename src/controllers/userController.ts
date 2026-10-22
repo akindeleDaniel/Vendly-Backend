@@ -203,7 +203,7 @@ export const refresh = async (req: Request, res: Response) => {
         return
     }
 
-    const user = await prisma.user.findUnique({ where: { id: userId }, select: { role: true, isAdmin: true } })
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { role: true, isAdmin: true, isSuperAdmin: true } })
 
     if (!user) {
         clearSessionCookies(res)
@@ -211,7 +211,7 @@ export const refresh = async (req: Request, res: Response) => {
         return
     }
 
-    res.send({ message: "Session refreshed", role: user.role, isAdmin: user.isAdmin })
+    res.send({ message: "Session refreshed", role: user.role, isAdmin: user.isAdmin, isSuperAdmin: user.isSuperAdmin })
 }
 
 export const checkAuth = async (req: Request, res: Response) => {
@@ -231,6 +231,7 @@ export const checkAuth = async (req: Request, res: Response) => {
                 name: true,
                 role: true,
                 isAdmin: true,
+                isSuperAdmin: true,
                 passwordHash: true
             }
         });
@@ -248,6 +249,8 @@ export const checkAuth = async (req: Request, res: Response) => {
             role: user.role,
             // Lets the frontend show the administrator screens. The server still checks it on every admin request.
             isAdmin: user.isAdmin,
+            // Lets the frontend show the team, audit log and platform screens (super administrators only).
+            isSuperAdmin: user.isSuperAdmin,
             // False for an account created with Google that has not set a password yet.
             hasPassword: user.passwordHash !== null
         });

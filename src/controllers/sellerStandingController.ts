@@ -1,5 +1,6 @@
 import type { Request, Response } from "express"
 import { maximumMessageLength, minimumMessageLength, parseMessageBody } from "../lib/disputes.js"
+import { logAdminAction } from "../lib/adminTeam.js"
 import { blockSeller, getSellerStanding, SellerStandingError, unblockSeller } from "../lib/sellerStanding.js"
 
 function parseUserId(value: unknown): number | null {
@@ -62,6 +63,8 @@ export const setSellerBlocked = (blocked: boolean) => async (req: Request, res: 
         } else {
             await unblockSeller(sellerId)
         }
+
+        await logAdminAction(req.user!.id, blocked ? "SELLER_BLOCKED" : "SELLER_UNBLOCKED", sellerId, blocked ? note! : undefined)
 
         res.send({ standing: await getSellerStanding(sellerId) })
     } catch (error) {

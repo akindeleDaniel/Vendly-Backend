@@ -63,6 +63,9 @@ model User {
   googleId      String?        @unique
   // Administrators can issue refunds. Only scripts/makeAdmin.ts sets this; registration never does.
   isAdmin       Boolean        @default(false)
+  // Super administrators manage the administrator team, see the audit log and the platform figures. Only
+  // scripts/makeAdmin.ts --super creates the first one; a super administrator is always also an administrator.
+  isSuperAdmin  Boolean        @default(false)
   listings      Listing[]
   role          Role
   sellerProfile SellerProfile?
@@ -783,4 +786,17 @@ model PreOrderRequest {
   @@index([buyerId, status])
   @@index([sellerId, status])
   @@index([status, respondBy])
+}
+
+// What administrators did to accounts, kept even if an account is later deleted (so the people are plain ids, not
+// relations). Only super administrators can read it.
+model AdminAuditLog {
+  id           Int      @id @default(autoincrement())
+  actorId      Int
+  action       String
+  targetUserId Int?
+  detail       String?
+  createdAt    DateTime @default(now())
+
+  @@index([createdAt])
 }

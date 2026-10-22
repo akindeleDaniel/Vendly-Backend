@@ -569,3 +569,22 @@ export async function notifySellerUnblocked(sellerId: number): Promise<void> {
         ], { label: "See your standing", path: "/seller/standing" })
     ])
 }
+
+// ---- administrators ----
+
+export async function notifyAdminChange(userId: number, change: "GRANTED" | "REVOKED" | "SUPER_GRANTED" | "SUPER_REMOVED"): Promise<void> {
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { email: true } })
+
+    if (!user) {
+        return
+    }
+
+    const text: Record<typeof change, [string, string[]]> = {
+        GRANTED: ["You are now a Vendly administrator", ["A Vendly super administrator gave you administrator access.", "You will be asked for an emailed code each time you sign in."]],
+        SUPER_GRANTED: ["You are now a Vendly super administrator", ["A Vendly super administrator gave you super administrator access, so you can manage the team and see the platform figures."]],
+        SUPER_REMOVED: ["Your super administrator access was removed", ["You are still an administrator, but you can no longer manage the team or see the platform figures."]],
+        REVOKED: ["Your administrator access was removed", ["You no longer have administrator access to Vendly. If you think this is a mistake, speak to a super administrator."]]
+    }
+
+    await sendAll([mail(user.email, text[change][0], text[change][1])])
+}

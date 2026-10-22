@@ -21,10 +21,13 @@ import {
 } from "../controllers/adminDisputeController.js"
 import { getAdminOrder, getAdminSummary, getAdminUser, listAdminOrders, listAdminUsers } from "../controllers/adminLookupController.js"
 import { getAdminSellerStanding, setSellerBlocked } from "../controllers/sellerStandingController.js"
+import { addAdmin, changeSuperAdmin, getAuditLog, getTeam, removeAdmin } from "../controllers/adminTeamController.js"
+import { getPlatformSummary } from "../controllers/platformController.js"
+import { requireSuperAdmin } from "../middleware/requireSuperAdmin.js"
 import { authMiddleware } from "../middleware/authMiddleware.js"
 import { requireAdmin } from "../middleware/requireAdmin.js"
 import { listAdminReviews, setReviewHidden } from "../controllers/reviewController.js"
-import { messageLimiter } from "../middleware/rateLimits.js"
+import { messageLimiter, teamLimiter } from "../middleware/rateLimits.js"
 
 const router = Router()
 
@@ -58,5 +61,13 @@ router.post("/disputes/:id/messages", messageLimiter, postAdminDisputeMessage)
 router.post("/disputes/:id/approve", approveDispute)
 router.post("/disputes/:id/reject", rejectAdminDispute)
 router.post("/disputes/:id/reopen", reopenAdminDispute)
+
+// Super administrators only: the platform figures, the administrator team and the audit log.
+router.get("/platform", requireSuperAdmin, getPlatformSummary)
+router.get("/team", requireSuperAdmin, getTeam)
+router.post("/team", requireSuperAdmin, teamLimiter, addAdmin)
+router.post("/team/:userId/revoke", requireSuperAdmin, teamLimiter, removeAdmin)
+router.post("/team/:userId/super", requireSuperAdmin, teamLimiter, changeSuperAdmin)
+router.get("/audit-log", requireSuperAdmin, getAuditLog)
 
 export default router

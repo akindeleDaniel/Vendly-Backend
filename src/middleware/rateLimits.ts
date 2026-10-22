@@ -71,3 +71,6 @@ export const reviewLimiter = limiter(60 * minute, 20, userKey("review"))
 
 // Asking for pre-orders, per user.
 export const preOrderLimiter = limiter(60 * minute, 15, userKey("pre-order"))
+
+// Changing who the administrators are asks for a password each time, so it is limited like password changes.
+export const teamLimiter = limiter(60 * minute, 20, userKey("team"))
