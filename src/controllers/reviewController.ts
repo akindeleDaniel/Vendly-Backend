@@ -236,14 +236,15 @@ export const listListingReviews = async (req: Request, res: Response) => {
         return
     }
 
-    const listing = listingId === null ? null : await prisma.listing.findUnique({ where: { id: listingId }, select: { id: true, archivedAt: true } })
+    const listing = listingId === null ? null : await prisma.listing.findUnique({ where: { id: listingId }, select: { id: true, archivedAt: true, parentId: true } })
 
     if (!listing || listing.archivedAt) {
         res.status(404).send({ message: "Listing not found" })
         return
     }
 
-    res.send(await listPublicReviews("product", listing.id, page))
+    // A choice of a product shows the product's reviews.
+    res.send(await listPublicReviews("product", listing.parentId ?? listing.id, page))
 }
 
 export const listShopReviews = async (req: Request, res: Response) => {

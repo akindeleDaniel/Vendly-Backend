@@ -9,6 +9,7 @@ import { getDrivingRouteDistances, getRouteCandidateLimit } from "../lib/routeMa
 import { getCanonicalCategory } from "../lib/categories.js"
 import { isHttpsUrl, maximumBusinessNameLength } from "../lib/inputRules.js"
 import { imagesInclude, withImages } from "../lib/listingImages.js"
+import { loadChoices, withOptionSummary } from "../lib/listingOptions.js"
 import { averageRating } from "../lib/reviews.js"
 
 function hasValidCoordinates<T extends { latitude: number | null; longitude: number | null }>(
@@ -370,6 +371,8 @@ export const getPublicShop = async (req: Request, res: Response) => {
             where:{
                 userId: profile.userId,
                 archivedAt: null,
+                // The choices of a product are shown on the product, not as listings of their own.
+                parentId: null,
                 ...(searchTerm
                     ? { title: { contains: searchTerm, mode: "insensitive" as const } }
                     : {})
@@ -377,9 +380,11 @@ export const getPublicShop = async (req: Request, res: Response) => {
             include: { images: imagesInclude }
         })
 
+        const choices = await loadChoices(listings.map((listing) => listing.id))
+
         res.send({
             profile: withShopRating(profileFields),
-            listings: listings.map(withImages)
+            listings: listings.map((listing) => withOptionSummary(withImages(listing), choices.get(listing.id)))
         })
     }catch(error){
         res.status(500).send({message:"Sorry there is an issue on our end"})

@@ -91,6 +91,14 @@ export type NewReviewInput = {
     products: Array<{ listingId: number; rating: number; comment?: string }>
 }
 
+// A product's reviews belong to the product, not to the option that was bought: a review of "Hoodie, Blue / M" is a review
+// of the hoodie.
+type BoughtItem = { listingId: number; listing: { parentId: number | null } }
+
+function reviewSubject(item: BoughtItem): number {
+    return item.listing.parentId ?? item.listingId
+}
+
 // Loads one of the buyer's orders, or throws 404.
 async function loadBuyerOrder(checkoutId: number, orderId: number, buyerId: number) {
     const order = await prisma.order.findFirst({
@@ -98,7 +106,7 @@ async function loadBuyerOrder(checkoutId: number, orderId: number, buyerId: numb
         select: {
             id: true,
             status: true,
-            orderItems: { select: { listingId: true, title: true } },
+            orderItems: { select: { listingId: true, title: true, listing: { select: { parentId: true, parent: { select: { title: true } } } } } },
             seller: { select: { sellerProfile: { select: { id: true } } } }
         }
     })
@@ -117,9 +125,15 @@ export async function createOrderReviews(input: NewReviewInput) {
         throw new ReviewRequestError(409, "You can review an order once it has been delivered", "REVIEW_NOT_ALLOWED")
     }
 
-    const boughtListingIds = new Set(order.orderItems.map((item) => item.listingId))
+    // Either the id of the option that was bought or the id of its product can be given.
+    const subjectOf = new Map<number, number>()
 
-    if (input.products.some((product) => !boughtListingIds.has(product.listingId))) {
+    for (const item of order.orderItems) {
+        subjectOf.set(item.listingId, reviewSubject(item))
+        subjectOf.set(reviewSubject(item), reviewSubject(item))
+    }
+
+    if (input.products.some((product) => !subjectOf.has(product.listingId))) {
         throw new ReviewRequestError(400, "You can only review products from this order")
     }
 
@@ -134,10 +148,11 @@ export async function createOrderReviews(input: NewReviewInput) {
             const products = []
 
             for (const product of input.products) {
+                const subject = subjectOf.get(product.listingId)!
                 products.push(await tx.productReview.create({
-                    data: { listingId: product.listingId, buyerId: input.buyerId, orderId: order.id, rating: product.rating, comment: product.comment ?? null }
+                    data: { listingId: subject, buyerId: input.buyerId, orderId: order.id, rating: product.rating, comment: product.comment ?? null }
                 }))
-                await recalculateRating(tx, "product", product.listingId)
+                await recalculateRating(tx, "product", subject)
             }
 
             let shop = null
@@ -164,7 +179,7 @@ export async function createOrderReviews(input: NewReviewInput) {
 export async function getOrderReviewState(checkoutId: number, orderId: number, buyerId: number) {
     const order = await loadBuyerOrder(checkoutId, orderId, buyerId)
     const [productReviews, shopReview] = await Promise.all([
-        prisma.productReview.findMany({ where: { buyerId, listingId: { in: order.orderItems.map((item) => item.listingId) } } }),
+        prisma.productReview.findMany({ where: { buyerId, listingId: { in: order.orderItems.map(reviewSubject) } } }),
         order.seller.sellerProfile
             ? prisma.shopReview.findUnique({ where: { buyerId_sellerProfileId: { buyerId, sellerProfileId: order.seller.sellerProfile.id } } })
             : Promise.resolve(null)
@@ -182,10 +197,13 @@ export async function getOrderReviewState(checkoutId: number, orderId: number, b
     return {
         canReview: order.status === "DELIVERED",
         shop: shopReview ? shown(shopReview) : null,
-        products: order.orderItems.map((item) => {
-            const review = productReviews.find((candidate) => candidate.listingId === item.listingId)
-            return { listingId: item.listingId, title: item.title, review: review ? shown(review) : null }
-        })
+        // One entry per product, even when several of its options were bought.
+        products: order.orderItems
+            .filter((item, index, items) => items.findIndex((other) => reviewSubject(other) === reviewSubject(item)) === index)
+            .map((item) => {
+                const review = productReviews.find((candidate) => candidate.listingId === reviewSubject(item))
+                return { listingId: reviewSubject(item), title: item.listing.parent?.title ?? item.title, review: review ? shown(review) : null }
+            })
     }
 }
 

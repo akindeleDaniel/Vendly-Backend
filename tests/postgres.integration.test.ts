@@ -249,7 +249,7 @@ async function createCheckoutLifecycleFixture(
             await prisma.preOrderRequest.updateMany({ where: { sellerId: seller.id }, data: {} })
             await prisma.order.updateMany({ where: { preOrderRequest: { sellerId: seller.id } }, data: { preOrderRequestId: null } })
             await prisma.preOrderRequest.deleteMany({ where: { sellerId: seller.id } })
-            await prisma.productReview.deleteMany({ where: { listingId: listing.id } })
+            await prisma.productReview.deleteMany({ where: { listing: { userId: seller.id } } })
             await prisma.shopReview.deleteMany({ where: { sellerProfile: { userId: seller.id } } })
             const checkoutIds = (await prisma.checkout.findMany({
                 where: { userId: { in: consumerIds } },
@@ -278,7 +278,8 @@ async function createCheckoutLifecycleFixture(
             }
             await prisma.cartItem.deleteMany({ where: { cart: { userId: { in: consumerIds } } } })
             await prisma.cart.deleteMany({ where: { userId: { in: consumerIds } } })
-            await prisma.listing.delete({ where: { id: listing.id } })
+            // Every listing of the seller, including the choices of products that have options.
+            await prisma.listing.deleteMany({ where: { userId: seller.id } })
             await prisma.sellerProfile.deleteMany({ where: { userId: seller.id } })
             await prisma.user.deleteMany({ where: { id: { in: [...consumerIds, seller.id] } } })
         }
@@ -9314,5 +9315,216 @@ test("lost complaints are strikes: a warning at 2, a block at 4, and an administ
         assert.equal(manual.status, 200)
         assert.equal(manual.body.standing.blockReason, "Selling items that are not allowed.")
         assert.equal((await fetch(`${baseUrl}/listings/${fixture.listingId}`)).status, 404)
+    })
+})
+
+// ---- Product options (colour, size) ----
+
+// A title no other run has used, so searches find only this run's products.
+const hoodieTitle = `Oversized Hoodie ${randomUUID().slice(0, 8)}`
+const hoodie = {
+    title: hoodieTitle,
+    description: "A soft cotton hoodie for every day",
+    price: 20000,
+    category: "Electronics",
+    imageUrls: ["https://img.example.test/hoodie.jpg"]
+}
+
+test("a product can have options with their own price and stock, and shoppers buy them through the cart", async () => {
+    await withPaymentCheckout("listing-options", async (context) => {
+        const { fixture, request } = context
+        const seller = fixture.sellerToken
+        const slug = (await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })).slug
+        const create = (options: unknown, extra: Record<string, unknown> = {}) => request("POST", "/listings", { ...hoodie, options, ...extra }, seller)
+
+        // Bad options are refused with a reason.
+        const blue = { label: "Blue", price: 22000, imageUrl: "https://img.example.test/blue.jpg", sizes: [{ label: "M", stockQuantity: 3 }, { label: "L", stockQuantity: 2 }] }
+        const red = { label: "Red", stockQuantity: 4 }
+        for (const [options, message] of [
+            [[blue, { ...red, label: "blue" }], /listed twice/],
+            [[{ ...blue, stockQuantity: 1 }], /has sizes/],
+            [[{ label: "Green" }], /Stock quantity/],
+            [[{ label: "Green", stockQuantity: -1 }], /Stock quantity/],
+            [[{ label: "Green", stockQuantity: 1, price: 0 }], /Option "Green"/],
+            [[{ label: "Green", stockQuantity: 1, imageUrl: "http://not-https.example.test/a.jpg" }], /https/],
+            [[{ label: "Blue", sizes: [{ label: "M" }] }], /Option "Blue", size "M"/],
+            [[{ label: "Blue", sizes: [{ label: "M", stockQuantity: 1 }, { label: "m", stockQuantity: 1 }] }], /listed twice/],
+            [[{ label: " ", stockQuantity: 1 }], /needs a name/],
+            [Array.from({ length: 21 }, (_, index) => ({ label: `Colour ${index}`, stockQuantity: 1 })), /at most 20/],
+            ["Blue", /must be a list/]
+        ] as const) {
+            const refused = await create(options)
+            assert.equal(refused.status, 400, JSON.stringify(options).slice(0, 80))
+            assert.match(refused.body.message, message)
+        }
+        assert.equal((await request("POST", "/listings", { ...hoodie, options: [red] }, fixture.token)).status, 403)
+
+        // A product with options needs no stock of its own. It shows its lowest price and its total stock.
+        const created = await create([blue, red])
+        assert.equal(created.status, 201)
+        const product = created.body
+        assert.equal(product.hasOptions, true)
+        assert.equal(product.hasPriceRange, true)
+        assert.equal(product.price, 20000)
+        assert.equal(product.stockQuantity, 9)
+        assert.equal(product.options.length, 2)
+        assert.deepEqual(product.options[0].sizes.map((size: { label: string; stockQuantity: number }) => [size.label, size.stockQuantity]), [["M", 3], ["L", 2]])
+        assert.deepEqual([product.options[0].label, product.options[0].price, product.options[0].listingId, product.options[0].stockQuantity], ["Blue", 22000, null, null])
+        assert.deepEqual([product.options[1].label, product.options[1].price, product.options[1].stockQuantity, product.options[1].sizes.length], ["Red", 20000, 4, 0])
+        assert.equal(product.options[1].imageUrl, "https://img.example.test/hoodie.jpg")
+        const productId = product.id as number
+        const blueM = product.options[0].sizes[0].listingId as number
+        const redId = product.options[1].listingId as number
+
+        // The choices are listings of their own underneath, titled after the product.
+        const choices = await prisma.listing.findMany({ where: { parentId: productId }, orderBy: { position: "asc" } })
+        assert.deepEqual(choices.map((choice) => choice.title), [`${hoodieTitle} — Blue / M`, `${hoodieTitle} — Blue / L`, `${hoodieTitle} — Red`])
+        assert.equal((await prisma.listing.findUniqueOrThrow({ where: { id: productId } })).stockQuantity, 0)
+
+        // Shoppers only see the product: in the list, the shop and the seller's own list.
+        const found = (await request("GET", `/listings?search=${encodeURIComponent(hoodieTitle)}`)).body.listings as Array<{ id: number; hasOptions: boolean; price: number }>
+        assert.deepEqual(found.map((listing) => [listing.id, listing.hasOptions, listing.price]), [[productId, true, 20000]])
+        const shop = (await request("GET", `/seller/shop/${slug}`)).body.listings as Array<{ id: number; title: string }>
+        assert.deepEqual(shop.filter((listing) => listing.title === hoodieTitle).map((listing) => listing.id), [productId])
+        const mine = (await request("GET", "/listings/Mylisting", undefined, seller)).body as Array<{ id: number; title: string; options: unknown[] }>
+        assert.deepEqual(mine.filter((listing) => listing.title === hoodieTitle).map((listing) => [listing.id, listing.options.length]), [[productId, 2]])
+        assert.equal((await request("GET", `/listings/${productId}`)).body.selectedListingId, null)
+        const viaChoice = (await request("GET", `/listings/${blueM}`)).body
+        assert.deepEqual([viaChoice.id, viaChoice.selectedListingId, viaChoice.hasOptions], [productId, blueM, true])
+        // An ordinary listing is unchanged.
+        const plain = (await request("GET", `/listings/${fixture.listingId}`)).body
+        assert.deepEqual([plain.hasOptions, plain.hasPriceRange, plain.options], [false, false, []])
+
+        // The product itself cannot be bought; one of its choices can, like any listing.
+        const shopper = (await fixture.addConsumer(1)).token
+        const refusedProduct = await request("POST", "/cart/items", { listingId: productId, quantity: 1 }, shopper)
+        assert.equal(refusedProduct.status, 409)
+        assert.match(refusedProduct.body.message, /Choose an option/)
+        assert.equal((await request("POST", "/cart/items", { listingId: blueM, quantity: 1 }, shopper)).status, 201)
+        assert.equal((await request("POST", "/cart/items", { listingId: blueM, quantity: 3 }, shopper)).status, 409)
+        const cart = await request("GET", "/cart", undefined, shopper)
+        assert.ok(JSON.stringify(cart.body).includes(`${hoodieTitle} — Blue / M`))
+        assert.match(JSON.stringify(cart.body), /22000/)
+
+        // What can be changed where.
+        const patch = (id: number, body: unknown) => request("PATCH" as "GET", `/listings/${id}`, body, seller)
+        for (const body of [{ price: 1000 }, { stockQuantity: 5 }]) {
+            const refused = await patch(productId, body)
+            assert.equal(refused.status, 400)
+            assert.equal(refused.body.code, "LISTING_HAS_OPTIONS")
+        }
+        for (const body of [{ title: "Other" }, { description: "Other text here" }, { category: "Electronics" }, { imageUrls: ["https://img.example.test/x.jpg"] }]) {
+            const refused = await patch(blueM, body)
+            assert.equal(refused.status, 400)
+            assert.equal(refused.body.code, "LISTING_IS_OPTION")
+        }
+        assert.equal((await patch(blueM, { stockQuantity: 10, price: 23000 })).status, 200)
+        assert.deepEqual((await request("GET", `/listings/${productId}`)).body.options[0].sizes.map((size: { stockQuantity: number }) => size.stockQuantity), [10, 2])
+        assert.equal((await request("DELETE" as "GET", `/listings/${blueM}`, undefined, seller)).body.code, "LISTING_IS_OPTION")
+        assert.equal((await request("POST", `/listings/${blueM}/archive`, {}, seller)).body.code, "LISTING_IS_OPTION")
+        assert.equal((await request("POST", `/listings/${blueM}/unarchive`, {}, seller)).body.code, "LISTING_IS_OPTION")
+
+        // Renaming the product renames its choices, and its photo follows the choices that have none of their own.
+        const renamedTitle = `Cotton ${hoodieTitle.slice(-8)}`
+        const renamed = await patch(productId, { title: renamedTitle, imageUrls: ["https://img.example.test/new.jpg"] })
+        assert.equal(renamed.status, 200)
+        assert.deepEqual((await prisma.listing.findMany({ where: { parentId: productId }, orderBy: { position: "asc" } })).map((choice) => [choice.title, choice.imageUrl]), [
+            [`${renamedTitle} — Blue / M`, "https://img.example.test/blue.jpg"],
+            [`${renamedTitle} — Blue / L`, "https://img.example.test/blue.jpg"],
+            [`${renamedTitle} — Red`, "https://img.example.test/new.jpg"]
+        ])
+
+        // Replacing the options: same names are updated in place, new ones added, missing ones removed.
+        const put = (body: unknown, token = seller) => request("PUT" as "GET", `/listings/${productId}/options`, body, token)
+        const replaced = await put({ options: [{ ...blue, sizes: [{ label: "M", stockQuantity: 7 }, { label: "L", stockQuantity: 2 }] }, { label: "Green", stockQuantity: 6 }] })
+        assert.equal(replaced.status, 200)
+        assert.deepEqual(replaced.body.options.map((option: { label: string }) => option.label), ["Blue", "Green"])
+        assert.equal(replaced.body.options[0].sizes[0].listingId, blueM)
+        assert.equal(replaced.body.options[0].sizes[0].stockQuantity, 7)
+        assert.equal(await prisma.listing.count({ where: { id: redId } }), 0)
+        assert.equal(replaced.body.stockQuantity, 15)
+        // The shopper's cart still holds Blue / M, which was kept.
+        assert.match(JSON.stringify((await request("GET", "/cart", undefined, shopper)).body), /Blue \/ M/)
+        assert.equal((await put({ options: [] })).status, 400)
+        assert.equal((await put({ options: [blue] }, fixture.token)).status, 403)
+        await withStrangerSeller(async (stranger) => {
+            assert.equal((await put({ options: [blue] }, stranger)).status, 403)
+        })
+        assert.equal((await request("PUT" as "GET", `/listings/${blueM}/options`, { options: [blue] }, seller)).body.code, "LISTING_IS_OPTION")
+        assert.equal((await request("PUT" as "GET", "/listings/999999/options", { options: [blue] }, seller)).status, 404)
+
+        // A choice that an order or checkout has used is hidden, not deleted, when it is removed. (The fixture's own
+        // listing stands in for a choice that has history.)
+        await prisma.listing.update({ where: { id: fixture.listingId }, data: { parentId: productId, optionLabel: "Fixture", sizeLabel: null } })
+        const withoutFixture = await put({ options: [{ ...blue, sizes: [{ label: "M", stockQuantity: 7 }, { label: "L", stockQuantity: 2 }] }, { label: "Green", stockQuantity: 6 }] })
+        assert.equal(withoutFixture.status, 200)
+        const hidden = await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })
+        assert.notEqual(hidden.archivedAt, null)
+
+        // Taking the product off sale takes its choices with it, and putting it back restores only those.
+        assert.equal((await request("POST", `/listings/${productId}/archive`, {}, seller)).status, 200)
+        assert.equal((await request("GET", `/listings/${productId}`)).status, 404)
+        assert.equal((await request("GET", `/listings/${blueM}`)).status, 404)
+        assert.equal((await request("POST", "/cart/items", { listingId: blueM, quantity: 1 }, shopper)).status, 404)
+        assert.equal(await prisma.cartItem.count({ where: { listingId: blueM } }), 0)
+        assert.equal((await request("POST", `/listings/${productId}/unarchive`, {}, seller)).status, 200)
+        assert.equal((await request("GET", `/listings/${blueM}`)).status, 200)
+        assert.equal((await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })).archivedAt !== null, true)
+        assert.equal((await request("GET", `/listings/${productId}`)).body.options.length, 2)
+
+        // A product whose choices have history cannot be deleted; one without history can, with its choices.
+        const stuck = await request("DELETE" as "GET", `/listings/${productId}`, undefined, seller)
+        assert.equal(stuck.status, 409)
+        assert.equal(stuck.body.code, "LISTING_HAS_HISTORY")
+        assert.equal(await prisma.listing.count({ where: { parentId: productId } }) > 0, true)
+        const spare = (await create([red])).body
+        assert.equal((await request("DELETE" as "GET", `/listings/${spare.id}`, undefined, seller)).status, 200)
+        assert.equal(await prisma.listing.count({ where: { OR: [{ id: spare.id }, { parentId: spare.id }] } }), 0)
+
+        // Taking every option away turns it back into an ordinary listing, which then needs its own stock.
+        const flat = (await create([red])).body
+        const flatPut = (body: unknown) => request("PUT" as "GET", `/listings/${flat.id}/options`, body, seller)
+        assert.equal((await flatPut({ options: [] })).status, 400)
+        const back = await flatPut({ options: [], stockQuantity: 12, price: 18000 })
+        assert.equal(back.status, 200)
+        assert.deepEqual([back.body.hasOptions, back.body.price, back.body.stockQuantity, back.body.options], [false, 18000, 12, []])
+        assert.equal((await request("POST", "/cart/items", { listingId: flat.id, quantity: 2 }, shopper)).status, 201)
+    })
+})
+
+test("an option is paid, shipped, reviewed and refunded like any listing, and its reviews belong to the product", async () => {
+    await withPaymentCheckout("listing-options-order", async (context) => {
+        const { fixture, request, checkoutId, adminToken } = context
+        const product = (await request("POST", "/listings", { ...hoodie, options: [{ label: "Blue", stockQuantity: 5 }] }, fixture.sellerToken)).body
+        // The fixture's listing, which the checkout already holds, is made a choice of the product.
+        await prisma.listing.update({ where: { id: fixture.listingId }, data: { parentId: product.id, optionLabel: "Fixture", sizeLabel: null } })
+        const before = (await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })).stockQuantity
+        const orderId = await payShipDeliverConfirm(context)
+
+        // Stock came off the choice, not the product.
+        assert.equal((await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })).stockQuantity, before - 2)
+        assert.equal((await prisma.listing.findUniqueOrThrow({ where: { id: product.id } })).stockQuantity, 0)
+
+        // Reviews are asked for per product, even though an option was bought, and either id is accepted.
+        const state = (await request("GET", `/orders/${checkoutId}/seller-orders/${orderId}/reviews`)).body
+        assert.deepEqual(state.products.map((item: { listingId: number; title: string }) => [item.listingId, item.title]), [[product.id, hoodieTitle]])
+        const created = await request("POST", `/orders/${checkoutId}/seller-orders/${orderId}/reviews`, { products: [{ listingId: fixture.listingId, rating: 4, comment: "Fits well" }] })
+        assert.equal(created.status, 201)
+        assert.equal(created.body.products[0].listingId, product.id)
+        const again = await request("POST", `/orders/${checkoutId}/seller-orders/${orderId}/reviews`, { products: [{ listingId: product.id, rating: 5 }] })
+        assert.equal(again.status, 409)
+        const page = (await request("GET", `/listings/${product.id}`)).body
+        assert.deepEqual([page.ratingCount, page.ratingAverage], [1, 4])
+        assert.equal((await request("GET", `/listings/${fixture.listingId}/reviews`)).body.reviews.length, 1)
+        const viaOrder = (await request("GET", `/orders/${checkoutId}/seller-orders/${orderId}/reviews`)).body
+        assert.equal(viaOrder.products[0].review.rating, 4)
+
+        // A refund puts the stock back on the choice.
+        const issued = await refundOrder(context, orderId, { restock: true })
+        assert.equal(issued.status, 201)
+        providerReports(context, issued.body.refund, 300000, "succeeded", "processed")
+        await request("POST", `/admin/refunds/${issued.body.refund.id}/sync`, undefined, adminToken)
+        assert.equal((await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })).stockQuantity, before)
+        assert.equal((await prisma.listing.findUniqueOrThrow({ where: { id: product.id } })).stockQuantity, 0)
     })
 })

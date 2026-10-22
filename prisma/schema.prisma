@@ -31,6 +31,16 @@ model Listing {
   ratingCount   Int      @default(0)
   ratingSum     Int      @default(0)
   reviews       ProductReview[]
+  // Options (for example colour, then size). The product the shopper sees is the main listing. Each thing that can be
+  // bought is a hidden listing of its own that points back to it with parentId: "Blue" (no sizes), or "Blue" / "M".
+  // Carts, checkouts, stock, orders and refunds therefore work on these exactly as on any listing. The main listing
+  // of a product with options is never bought itself.
+  parentId      Int?
+  optionLabel   String?
+  sizeLabel     String?
+  position      Int      @default(0)
+  parent        Listing?  @relation("ListingOptions", fields: [parentId], references: [id], onDelete: NoAction)
+  options       Listing[] @relation("ListingOptions")
 
   user                  User                   @relation(fields: [userId], references: [id])
   cartItems             CartItem[]
@@ -40,6 +50,7 @@ model Listing {
 
   @@index([userId])
   @@index([category])
+  @@index([parentId])
 }
 
 model User {

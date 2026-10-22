@@ -174,12 +174,22 @@ export async function addToCart(req: Request, res: Response) {
         const result = await prisma.$transaction(async (tx) => {
             const listing = await tx.listing.findUnique({
                 where: { id: listingId },
-                select: { stockQuantity: true, archivedAt: true, user: { select: { sellerProfile: { select: { blockedAt: true } } } } }
+                select: {
+                    stockQuantity: true,
+                    archivedAt: true,
+                    user: { select: { sellerProfile: { select: { blockedAt: true } } } },
+                    options: { where: { archivedAt: null }, select: { id: true }, take: 1 }
+                }
             });
 
             // A listing the seller took off sale, or one from a blocked shop, cannot be bought.
             if (!listing || listing.archivedAt || listing.user.sellerProfile?.blockedAt) {
                 throw new CartRequestError(404, "This Listing was not found");
+            }
+
+            // A product with options is bought through one of its options, never itself.
+            if (listing.options.length > 0) {
+                throw new CartRequestError(409, "Choose an option for this product");
             }
 
             const cart = await tx.cart.findUnique({
