@@ -24,12 +24,22 @@ model Listing {
   imageUrl      String
   createdAt     DateTime @default(now())
   userId        Int
+  // Set when the seller takes the listing off sale without deleting it (it may be in order history).
+  archivedAt    DateTime?
+  images        ListingImage[]
+  // Star totals over the reviews that are not hidden; the average is ratingSum / ratingCount.
+  ratingCount   Int      @default(0)
+  ratingSum     Int      @default(0)
+  reviews       ProductReview[]
 
   user                  User                   @relation(fields: [userId], references: [id])
   cartItems             CartItem[]
   checkoutItems         CheckoutItem[]
   orderItems            OrderItem[]
   inventoryReservations InventoryReservation[]
+
+  @@index([userId])
+  @@index([category])
 }
 
 model User {
@@ -60,6 +70,10 @@ model User {
   createdAt     DateTime       @default(now())
   emailOtps     EmailOtp[]
   trustedDevices TrustedDevice[]
+  productReviews ProductReview[]
+  shopReviews    ShopReview[]
+  preOrdersAsked PreOrderRequest[] @relation("PreOrderBuyer")
+  preOrdersAnswered PreOrderRequest[] @relation("PreOrderSeller")
 }
 
 enum Role {
@@ -87,6 +101,18 @@ model SellerProfile {
   payoutTermsVersion    String?
   payoutTermsAcceptedAt DateTime?
   payoutAccounts        SellerPayoutAccount[]
+  ratingCount           Int                   @default(0)
+  ratingSum             Int                   @default(0)
+  reviews               ShopReview[]
+  // How a shop that sells food takes orders: now, only as pre-orders (the buyer asks for a time and the seller
+  // approves it), or both. Every other shop is NOW.
+  foodOrderType         FoodOrderType         @default(NOW)
+}
+
+enum FoodOrderType {
+  NOW
+  PRE_ORDER
+  BOTH
 }
 
 enum PayoutAccountStatus {
@@ -265,6 +291,17 @@ model Order {
   shippingNote        String?
   deliveryReportedAt  DateTime?
   deliveryConfirmedAt DateTime?
+  // The buyer is reminded 4 days after the seller reports delivery; at 7 days, with no answer and no open
+  // complaint, the order is closed as delivered automatically. That is not the buyer's confirmation.
+  deliveryReminderSentAt DateTime?
+  deliveryAutoClosedAt   DateTime?
+
+  // NOW, or PRE_ORDER: the buyer asked for it on readyAt and the seller approved. For a pre-order the complaint
+  // periods count from readyAt (if later than payment) instead of from payment.
+  fulfilmentType   FulfilmentType @default(NOW)
+  readyAt          DateTime?
+  preOrderRequestId Int?
+  preOrderRequest  PreOrderRequest? @relation(fields: [preOrderRequestId], references: [id])
 
   deliveryName         String
   deliveryPhone        String
@@ -282,9 +319,13 @@ model Order {
   refunds    Refund[]
   liabilityRecoveries LiabilityRecovery[]
   disputes   Dispute[]
+  productReviews ProductReview[]
+  shopReviews    ShopReview[]
 
-  @@index([sellerId])
+  @@index([sellerId, status])
+  @@index([preOrderRequestId])
   @@index([checkoutId])
+  @@index([status])
 }
 
 model OrderItem {
@@ -388,6 +429,11 @@ model Dispute {
   sellerRespondedAt DateTime?
   escalatedAt       DateTime?
   resolvedAt        DateTime?
+  // When the buyer and the seller last opened the complaint; messages by others after this are "new" to them.
+  buyerReadAt        DateTime?
+  sellerReadAt       DateTime?
+  // Set when the buyer appealed Vendly's rejection. A rejection can be appealed once; the second decision is final.
+  appealedAt         DateTime?
   createdAt         DateTime       @default(now())
   updatedAt         DateTime       @updatedAt
 
@@ -609,4 +655,112 @@ model TrustedDevice {
   revokedAt  DateTime?
 
   @@index([userId])
+}
+
+// One photo of a listing. position 0 is the first, which cards show (and Listing.imageUrl repeats).
+model ListingImage {
+  id        Int      @id @default(autoincrement())
+  listingId Int
+  listing   Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  url       String
+  position  Int
+  createdAt DateTime @default(now())
+
+  @@unique([listingId, position])
+}
+
+// A buyer's review of a product they received: 1 to 5 stars and an optional comment. One per buyer per product.
+// A hidden review (hiddenAt set by an administrator) is not shown and does not count in the rating.
+model ProductReview {
+  id           Int       @id @default(autoincrement())
+  listingId    Int
+  listing      Listing   @relation(fields: [listingId], references: [id])
+  buyerId      Int
+  buyer        User      @relation(fields: [buyerId], references: [id])
+  // The delivered order that made this buyer able to review.
+  orderId      Int
+  order        Order     @relation(fields: [orderId], references: [id])
+  rating       Int
+  comment      String?
+  hiddenAt     DateTime?
+  hiddenReason String?
+  hiddenById   Int?
+  // The seller can report a review that breaks the rules; an administrator decides whether to hide it.
+  reportedAt   DateTime?
+  reportReason String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@unique([buyerId, listingId])
+  @@index([listingId, hiddenAt, createdAt])
+  @@index([orderId])
+}
+
+// The same for a shop: one per buyer per shop.
+model ShopReview {
+  id              Int           @id @default(autoincrement())
+  sellerProfileId Int
+  sellerProfile   SellerProfile @relation(fields: [sellerProfileId], references: [id])
+  buyerId         Int
+  buyer           User          @relation(fields: [buyerId], references: [id])
+  orderId         Int
+  order           Order         @relation(fields: [orderId], references: [id])
+  rating          Int
+  comment         String?
+  hiddenAt        DateTime?
+  hiddenReason    String?
+  hiddenById      Int?
+  reportedAt      DateTime?
+  reportReason    String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@unique([buyerId, sellerProfileId])
+  @@index([sellerProfileId, hiddenAt, createdAt])
+  @@index([orderId])
+}
+
+enum FulfilmentType {
+  NOW
+  PRE_ORDER
+}
+
+enum PreOrderStatus {
+  REQUESTED
+  APPROVED
+  DECLINED
+  EXPIRED
+  CANCELLED
+  USED
+}
+
+// A buyer asking a food shop to have their cart ready at a time of their choosing. The seller approves or
+// declines; an approved request lets the buyer pay for exactly those items, and the paid order carries the
+// ready time. Nothing is charged until the buyer pays after approval.
+model PreOrderRequest {
+  id         Int            @id @default(autoincrement())
+  buyerId    Int
+  buyer      User           @relation("PreOrderBuyer", fields: [buyerId], references: [id])
+  sellerId   Int
+  seller     User           @relation("PreOrderSeller", fields: [sellerId], references: [id])
+  readyAt    DateTime
+  // A message from the buyer to the seller (for example what it is for).
+  note       String?
+  status     PreOrderStatus @default(REQUESTED)
+  // The cart lines this request is for, as they were when it was asked: [{ listingId, quantity, unitPrice }].
+  items      Json
+  sellerNote String?
+  // The seller must answer by this time or the request lapses.
+  respondBy  DateTime
+  decidedAt  DateTime?
+  // After approval, the buyer must pay by this time.
+  payBy      DateTime?
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  orders Order[]
+
+  @@index([buyerId, status])
+  @@index([sellerId, status])
+  @@index([status, respondBy])
 }
