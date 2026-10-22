@@ -2,6 +2,8 @@ import { syncPayment } from "../../controllers/paymentController.js"
 import { escalateOverdueDisputes } from "../disputes.js"
 import { checkOpenRefunds } from "./refunds.js"
 import { purgeStaleAccountRecords } from "../accountCleanup.js"
+import { remindAndCloseDeliveries } from "../deliveryClosing.js"
+import { expirePreOrders } from "../preOrders.js"
 import { purgeOldRefreshTokens } from "../sessions.js"
 import prisma from "../prisma.js"
 
@@ -86,6 +88,8 @@ async function runBackgroundChecks(): Promise<void> {
         ["Stuck payment checker failed", () => checkStuckPayments()],
         ["Refund checker failed", () => checkOpenRefunds()],
         ["Complaint escalation failed", () => escalateOverdueDisputes()],
+        ["Delivery reminders failed", () => remindAndCloseDeliveries()],
+        ["Pre-order expiry failed", () => expirePreOrders()],
         ["Old login cleanup failed", async () => {
             await purgeOldRefreshTokens()
             await purgeStaleAccountRecords()

@@ -4,6 +4,7 @@ import { Prisma, type PaymentAttempt, type Order, type Refund, type RefundStatus
 import { activeDisputeStatuses } from "../disputes.js"
 import { getPaymentProvider } from "./providers.js"
 import { PaymentProviderError, type ProviderRefund } from "./types.js"
+import { notifyRefundProgress, notifySellerCharged, queueNotification } from "../notifications.js"
 
 // Statuses of an order that has been paid and not fully refunded.
 const refundableOrderStatuses: string[] = ["PAID", "SHIPPED", "DELIVERED"]
@@ -300,6 +301,9 @@ async function applyProviderRefund(refundId: number, providerRefund: ProviderRef
             ? "FAILED"
             : providerRefund.outcome === "needs_attention" ? "NEEDS_ATTENTION" : "PROCESSING"
     const now = new Date()
+    // What changed, so the people involved are told once, after it is saved, and not on every later check.
+    let progressedTo = null as "PROCESSING" | "SUCCEEDED" | "FAILED" | "NEEDS_ATTENTION" | null
+    let sellerCharged = false as boolean
 
     await prisma.$transaction(async (tx) => {
         const refund = await tx.refund.findUniqueOrThrow({
@@ -329,6 +333,10 @@ async function applyProviderRefund(refundId: number, providerRefund: ProviderRef
             return
         }
 
+        if (status !== refund.status) {
+            progressedTo = status
+        }
+
         if (status === "FAILED") {
             await voidLiability(tx, refundId)
             return
@@ -336,10 +344,11 @@ async function applyProviderRefund(refundId: number, providerRefund: ProviderRef
 
         // Once Vendly's money has gone to the buyer, the seller owes it back.
         if (refund.chargeSeller && refund.order) {
-            await tx.sellerLiability.createMany({
+            const created = await tx.sellerLiability.createMany({
                 data: [{ sellerId: refund.order.sellerId, refundId, amount: refund.amount }],
                 skipDuplicates: true
             })
+            sellerCharged = created.count === 1
         }
 
         await resolveDisputesForRefund(tx, refund, now)
@@ -348,6 +357,15 @@ async function applyProviderRefund(refundId: number, providerRefund: ProviderRef
             await completeRefund(tx, refund)
         }
     })
+
+    if (progressedTo) {
+        const reached = progressedTo
+        queueNotification("refund progress", () => notifyRefundProgress(refundId, reached))
+    }
+
+    if (sellerCharged) {
+        queueNotification("seller charged", () => notifySellerCharged(refundId))
+    }
 }
 
 // A refund the provider has accepted settles the complaint it was for, and any other open complaint

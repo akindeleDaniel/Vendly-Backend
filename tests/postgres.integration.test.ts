@@ -25,6 +25,10 @@ import { setGoogleVerifierForTesting, type GoogleIdentity } from "../src/lib/goo
 import { setRateLimitingForTesting } from "../src/middleware/rateLimits.js"
 import { isHttpsUrl, priceProblem } from "../src/lib/inputRules.js"
 import { startPaymentChecker } from "../src/lib/payments/paymentChecker.js"
+import { waitForNotifications } from "../src/lib/notifications.js"
+import { recalculateRating } from "../src/lib/reviews.js"
+import { expirePreOrders } from "../src/lib/preOrders.js"
+import { remindAndCloseDeliveries } from "../src/lib/deliveryClosing.js"
 import { flutterwaveAdapter } from "../src/lib/payments/flutterwave.js"
 import { paystackAdapter } from "../src/lib/payments/paystack.js"
 import { setPaymentProvidersForTesting } from "../src/lib/payments/providers.js"
@@ -68,8 +72,8 @@ function emailsTo(address: string) {
 }
 
 function codeSentTo(address: string): string {
-    const email = emailsTo(address).at(-1)
-    assert.ok(email, `No email was sent to ${address}`)
+    const email = emailsTo(address).findLast((candidate) => /Your Vendly code is \d{6}/.test(candidate.text))
+    assert.ok(email, `No email with a code was sent to ${address}`)
     const match = /Your Vendly code is (\d{6})/.exec(email.text)
     assert.ok(match?.[1], "The email has no code in it")
     return match[1]
@@ -241,6 +245,11 @@ async function createCheckoutLifecycleFixture(
                     server!.close((error) => error ? reject(error) : resolve())
                 })
             }
+            await prisma.preOrderRequest.updateMany({ where: { sellerId: seller.id }, data: {} })
+            await prisma.order.updateMany({ where: { preOrderRequest: { sellerId: seller.id } }, data: { preOrderRequestId: null } })
+            await prisma.preOrderRequest.deleteMany({ where: { sellerId: seller.id } })
+            await prisma.productReview.deleteMany({ where: { listingId: listing.id } })
+            await prisma.shopReview.deleteMany({ where: { sellerProfile: { userId: seller.id } } })
             const checkoutIds = (await prisma.checkout.findMany({
                 where: { userId: { in: consumerIds } },
                 select: { id: true }
@@ -7625,4 +7634,1580 @@ test("the background checker can be stopped and waits for a run in progress", as
     await stop()
     // Stopping twice, or when nothing is running, is harmless.
     await stop()
+})
+
+// ---- Small backend items: checkout id on complaints, complaint filter, listing with seller, archive, earnings, admin lookups, unread ----
+
+test("complaints carry the checkout id, so a complaint page can link back to its order", async () => {
+    await withPaymentCheckout("dispute-checkout-id", async (context) => {
+        const { fixture, checkoutId, request, adminToken } = context
+        const orderId = await payAndShip(context)
+        const opened = await complain(context, orderId)
+        assert.equal(opened.status, 201)
+        const id = opened.body.dispute.id
+
+        assert.equal(opened.body.dispute.checkoutId, checkoutId)
+        assert.equal(opened.body.dispute.order.checkoutId, checkoutId)
+        assert.equal((await request("GET", "/disputes")).body.disputes[0].checkoutId, checkoutId)
+        assert.equal((await request("GET", `/disputes/${id}`)).body.dispute.checkoutId, checkoutId)
+        assert.equal((await request("GET", "/seller/disputes", undefined, fixture.sellerToken)).body.disputes[0].checkoutId, checkoutId)
+        assert.equal((await request("GET", `/admin/disputes/${id}`, undefined, adminToken)).body.dispute.order.checkoutId, checkoutId)
+    })
+})
+
+test("the seller's order list can be narrowed to orders with a complaint", async () => {
+    await withPaymentCheckout("orders-by-complaint", async (context) => {
+        const { fixture, request } = context
+        const orderId = await payAndShip(context)
+        const orders = (query: string) => request("GET", `/seller/orders${query}`, undefined, fixture.sellerToken)
+        const total = async (query: string) => (await orders(query)).body.total
+
+        assert.equal(await total(""), 1)
+        assert.equal(await total("?complaint=none"), 1)
+        assert.equal(await total("?complaint=any"), 0)
+        assert.equal(await total("?complaint=active"), 0)
+        assert.equal(await total("?complaint=awaiting-response"), 0)
+        assert.equal((await orders("?complaint=everything")).status, 400)
+
+        const opened = await complain(context, orderId)
+        assert.equal(await total("?complaint=none"), 0)
+        assert.equal(await total("?complaint=any"), 1)
+        assert.equal(await total("?complaint=active"), 1)
+        assert.equal(await total("?complaint=awaiting-response"), 1)
+        assert.equal(await total("?complaint=awaiting-response&status=SHIPPED"), 1)
+        assert.equal(await total("?complaint=awaiting-response&status=PAID"), 0)
+
+        // Once the seller has answered, it no longer awaits them but is still active.
+        await request("POST", `/seller/disputes/${opened.body.dispute.id}/respond`, { action: "DISAGREE", message: "The item left us in perfect condition." }, fixture.sellerToken)
+        assert.equal(await total("?complaint=awaiting-response"), 0)
+        assert.equal(await total("?complaint=active"), 1)
+
+        // A withdrawn complaint does not count.
+        await request("POST", `/disputes/${opened.body.dispute.id}/withdraw`)
+        assert.equal(await total("?complaint=any"), 0)
+        assert.equal(await total("?complaint=none"), 1)
+    })
+})
+
+test("one listing includes its seller's shop name and link, and not the seller's account id", async () => {
+    const fixture = await createCheckoutLifecycleFixture("listing-with-seller", 5, 1)
+
+    try {
+        await withAppServer(async (baseUrl) => {
+            const response = await fetch(`${baseUrl}/listings/${fixture.listingId}`)
+            assert.equal(response.status, 200)
+            const listing = await response.json() as Record<string, unknown>
+            assert.equal(listing.id, fixture.listingId)
+            assert.equal(listing.sellerName, "listing-with-seller Shop")
+            assert.match(String(listing.sellerSlug), /^listing-with-seller-/)
+            assert.equal("userId" in listing, false)
+            assert.equal(listing.title, "listing-with-seller listing")
+        })
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+test("a seller archives a listing that has history: it leaves the shop and carts but orders keep it, and it can come back", async () => {
+    await withPaymentCheckout("archive-listing", async (context) => {
+        const { fixture, request } = context
+        await payAndShip(context)
+        const listingId = fixture.listingId
+        const slug = (await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })).slug
+        const shopListings = async () => (await request("GET", `/seller/shop/${slug}`)).body.listings as Array<{ id: number }>
+        const publicIds = async () => ((await request("GET", "/listings")).body.listings as Array<{ id: number }>).map((listing) => listing.id)
+
+        // It has order history, so it cannot be deleted; the answer says what to do instead.
+        const deleted = await request("DELETE" as "GET", `/listings/${listingId}`, undefined, fixture.sellerToken)
+        assert.equal(deleted.status, 409)
+        assert.equal(deleted.body.code, "LISTING_HAS_HISTORY")
+        assert.match(deleted.body.message, /Archive it instead/)
+
+        const shopper = await fixture.addConsumer(1)
+        assert.equal(await prisma.cartItem.count({ where: { listingId } }), 1)
+        assert.ok((await publicIds()).includes(listingId))
+        assert.ok((await shopListings()).some((listing) => listing.id === listingId))
+
+        // Only its owner can archive it.
+        assert.equal((await request("POST", `/listings/${listingId}/archive`, {}, fixture.token)).status, 403)
+        await withStrangerSeller(async (strangerToken) => {
+            assert.equal((await request("POST", `/listings/${listingId}/archive`, {}, strangerToken)).status, 403)
+        })
+        assert.equal((await request("POST", "/listings/999999999/archive", {}, fixture.sellerToken)).status, 404)
+
+        const archived = await request("POST", `/listings/${listingId}/archive`, {}, fixture.sellerToken)
+        assert.equal(archived.status, 200)
+        assert.ok(archived.body.listing.archivedAt)
+        // Archiving again changes nothing.
+        const again = await request("POST", `/listings/${listingId}/archive`, {}, fixture.sellerToken)
+        assert.equal(again.body.listing.archivedAt, archived.body.listing.archivedAt)
+
+        assert.equal(await prisma.cartItem.count({ where: { listingId } }), 0)
+        assert.equal((await publicIds()).includes(listingId), false)
+        assert.equal((await shopListings()).some((listing) => listing.id === listingId), false)
+        assert.equal((await request("GET", `/listings/${listingId}`)).status, 404)
+        const addToCart = await request("POST", "/cart/items", { listingId, quantity: 1 }, shopper.token)
+        assert.equal(addToCart.status, 404)
+
+        // The seller still has it, and the paid order still names it.
+        assert.equal(((await request("GET", "/listings/Mylisting", undefined, fixture.sellerToken)).body as unknown[]).length, 0)
+        assert.equal(((await request("GET", "/listings/Mylisting?archived=only", undefined, fixture.sellerToken)).body as unknown[]).length, 1)
+        assert.equal(((await request("GET", "/listings/Mylisting?archived=all", undefined, fixture.sellerToken)).body as unknown[]).length, 1)
+        assert.equal((await request("GET", "/listings/Mylisting?archived=maybe", undefined, fixture.sellerToken)).status, 400)
+        const order = await request("GET", `/orders/${context.checkoutId}`)
+        assert.equal(order.body.sellerOrders[0].items[0].title, "archive-listing listing")
+
+        const restored = await request("POST", `/listings/${listingId}/unarchive`, {}, fixture.sellerToken)
+        assert.equal(restored.status, 200)
+        assert.equal(restored.body.listing.archivedAt, null)
+        assert.ok((await publicIds()).includes(listingId))
+        assert.equal((await request("GET", `/listings/${listingId}`)).status, 200)
+    })
+})
+
+test("a seller's earnings summarise paid orders, optionally within dates, and nobody else can read them", async () => {
+    await withPaymentCheckout("seller-earnings", async (context) => {
+        const { fixture, request } = context
+        const empty = await request("GET", "/seller/earnings", undefined, fixture.sellerToken)
+        assert.equal(empty.status, 200)
+        assert.equal(empty.body.totals.orders, 0)
+        assert.equal(empty.body.totals.sales, "0.00")
+        assert.deepEqual(empty.body.months, [])
+
+        await payAndShip(context)
+        const earnings = await request("GET", "/seller/earnings", undefined, fixture.sellerToken)
+        assert.equal(earnings.status, 200)
+        assert.equal(earnings.body.totals.orders, 1)
+        assert.equal(earnings.body.totals.sales, "3000.00")
+        assert.equal(earnings.body.totals.refunded, "0.00")
+        assert.deepEqual(earnings.body.ordersByStatus, { SHIPPED: 1 })
+        assert.equal(earnings.body.owedToVendly.amountStillOwed, "0.00")
+        assert.equal(earnings.body.months.length, 1)
+        assert.equal(earnings.body.months[0].orders, 1)
+        assert.equal(earnings.body.months[0].sales, "3000.00")
+        assert.equal(earnings.body.months[0].month, new Date().toISOString().slice(0, 7))
+
+        const today = new Date().toISOString().slice(0, 10)
+        assert.equal((await request("GET", `/seller/earnings?from=${today}&to=${today}`, undefined, fixture.sellerToken)).body.totals.orders, 1)
+        const past = await request("GET", "/seller/earnings?from=2020-01-01&to=2020-01-31", undefined, fixture.sellerToken)
+        assert.equal(past.body.totals.orders, 0)
+        assert.equal(past.body.from, "2020-01-01")
+        for (const query of ["?from=yesterday", "?to=2026-13-40", "?from=2026-02-30", "?from=2026-05-02&to=2026-05-01"]) {
+            assert.equal((await request("GET", `/seller/earnings${query}`, undefined, fixture.sellerToken)).status, 400, query)
+        }
+
+        assert.equal((await request("GET", "/seller/earnings", undefined, fixture.token)).status, 403)
+        await withStrangerSeller(async (strangerToken) => {
+            assert.equal((await request("GET", "/seller/earnings", undefined, strangerToken)).body.totals.orders, 0)
+        })
+    })
+})
+
+test("buyers and sellers are told which complaints have messages they have not opened", async () => {
+    await withPaymentCheckout("dispute-unread", async (context) => {
+        const { fixture, request, adminToken } = context
+        const orderId = await payAndShip(context)
+        const buyerCount = async () => (await request("GET", "/disputes/unread")).body.count
+        const sellerCount = async () => (await request("GET", "/seller/disputes/unread", undefined, fixture.sellerToken)).body.count
+        const buyerFlag = async () => (await request("GET", "/disputes")).body.disputes[0].unread
+        const sellerFlag = async () => (await request("GET", "/seller/disputes", undefined, fixture.sellerToken)).body.disputes[0].unread
+
+        const opened = await complain(context, orderId)
+        const id = opened.body.dispute.id
+
+        // The buyer's own message is not new to the buyer; it is new to the seller.
+        assert.equal(await buyerCount(), 0)
+        assert.equal(await buyerFlag(), false)
+        assert.equal(await sellerCount(), 1)
+        assert.equal(await sellerFlag(), true)
+        // The complaints waiting for an answer are a different count and are not affected by reading.
+        assert.equal((await request("GET", "/seller/disputes/awaiting-response", undefined, fixture.sellerToken)).body.count, 1)
+
+        // Opening the complaint clears it for that person.
+        await request("GET", `/seller/disputes/${id}`, undefined, fixture.sellerToken)
+        assert.equal(await sellerCount(), 0)
+        assert.equal(await sellerFlag(), false)
+        assert.equal((await request("GET", "/seller/disputes/awaiting-response", undefined, fixture.sellerToken)).body.count, 1)
+
+        // The seller replies: new to the buyer, not to the seller.
+        await request("POST", `/seller/disputes/${id}/messages`, { message: "Please send a photo of the damage." }, fixture.sellerToken)
+        assert.equal(await sellerCount(), 0)
+        assert.equal(await buyerCount(), 1)
+        assert.equal(await buyerFlag(), true)
+        await request("GET", `/disputes/${id}`)
+        assert.equal(await buyerCount(), 0)
+        assert.equal(await buyerFlag(), false)
+
+        // An administrator's message is new to both; the buyer opening it does not clear the seller's.
+        await request("POST", `/admin/disputes/${id}/messages`, { message: "We are looking into this for both of you." }, adminToken)
+        assert.equal(await buyerCount(), 1)
+        assert.equal(await sellerCount(), 1)
+        await request("GET", `/disputes/${id}`)
+        assert.equal(await buyerCount(), 0)
+        assert.equal(await sellerCount(), 1)
+
+        // Posting counts as having seen the thread, and an administrator opening it changes nothing for the others.
+        await request("GET", `/admin/disputes/${id}`, undefined, adminToken)
+        assert.equal(await sellerCount(), 1)
+        await request("POST", `/seller/disputes/${id}/messages`, { message: "Understood, we will wait for the decision." }, fixture.sellerToken)
+        assert.equal(await sellerCount(), 0)
+
+        // Strangers see nothing, and the counts need the right role.
+        const other = await fixture.addConsumer(1)
+        assert.equal((await request("GET", "/disputes/unread", undefined, other.token)).body.count, 0)
+        assert.equal((await request("GET", "/disputes/unread", undefined, fixture.sellerToken)).status, 403)
+        assert.equal((await request("GET", "/seller/disputes/unread", undefined, fixture.token)).status, 403)
+    })
+})
+
+test("administrators can see what needs attention, and find orders and people when someone phones or emails", async () => {
+    await withPaymentCheckout("admin-lookup", async (context) => {
+        const { fixture, request, adminToken, checkoutId } = context
+        const summary = async () => (await request("GET", "/admin/summary", undefined, adminToken)).body
+        const before = await summary()
+        assert.deepEqual(Object.keys(before).sort(), ["complaints", "liabilities", "recoveryCases", "refunds"])
+
+        const orderId = await payAndShip(context)
+        await complain(context, orderId)
+        const during = await summary()
+        assert.equal(during.complaints.awaitingSeller, before.complaints.awaitingSeller + 1)
+        assert.equal(during.complaints.awaitingDecision, before.complaints.awaitingDecision)
+        assert.match(during.liabilities.amountStillOwed, /^\d+\.\d{2}$/)
+
+        // Orders: found by id, checkout id, buyer, seller, shop, delivery name and payment reference.
+        const attempt = await prisma.paymentAttempt.findFirstOrThrow({ where: { checkoutId } })
+        const consumerEmail = (await prisma.user.findUniqueOrThrow({ where: { id: fixture.consumerId } })).email
+        const sellerEmail = (await prisma.user.findUniqueOrThrow({ where: { id: fixture.sellerId } })).email
+        const found = async (query: string) => (await request("GET", `/admin/orders${query}`, undefined, adminToken)).body
+        for (const search of [String(orderId), String(checkoutId), consumerEmail.toUpperCase(), sellerEmail, "admin-lookup Shop", "Test Consumer", attempt.reference]) {
+            const result = await found(`?search=${encodeURIComponent(search)}`)
+            assert.ok(result.orders.some((order: { id: number }) => order.id === orderId), `searching for ${search}`)
+        }
+        const row = (await found(`?search=${orderId}`)).orders.find((order: { id: number }) => order.id === orderId)
+        assert.equal(row.checkoutId, checkoutId)
+        assert.equal(row.status, "SHIPPED")
+        assert.equal(row.buyer.email, consumerEmail)
+        assert.equal(row.seller.businessName, "admin-lookup Shop")
+        assert.equal(row.complaint.status, "OPEN")
+        assert.equal(row.itemCount, 2)
+        assert.equal((await found(`?sellerId=${fixture.sellerId}&status=SHIPPED`)).total, 1)
+        assert.equal((await found(`?buyerId=${fixture.consumerId}&status=PAID`)).total, 0)
+        assert.equal((await found("?search=no-such-person-anywhere")).total, 0)
+        for (const query of ["?page=0", "?status=LOST", "?buyerId=abc", `?search=${"x".repeat(101)}`]) {
+            assert.equal((await request("GET", `/admin/orders${query}`, undefined, adminToken)).status, 400, query)
+        }
+
+        const detail = await request("GET", `/admin/orders/${orderId}`, undefined, adminToken)
+        assert.equal(detail.status, 200)
+        const order = detail.body.order
+        assert.equal(order.total, "3000.00")
+        assert.equal(order.buyer.email, consumerEmail)
+        assert.equal(order.seller.email, sellerEmail)
+        assert.equal(order.delivery.name, "Test Consumer")
+        assert.ok(order.delivery.address)
+        assert.equal(order.payments[0].reference, attempt.reference)
+        assert.equal(order.payments[0].status, "SUCCESS")
+        assert.equal(order.complaints[0].reason, "DAMAGED")
+        assert.equal(order.items[0].lineTotal, "3000.00")
+        assert.equal(JSON.stringify(detail.body).includes("authorizationUrl"), false)
+        assert.equal((await request("GET", "/admin/orders/999999999", undefined, adminToken)).status, 404)
+
+        // People: found by id, email, name or shop; secrets are never returned.
+        const people = async (query: string) => (await request("GET", `/admin/users${query}`, undefined, adminToken)).body
+        for (const search of [String(fixture.sellerId), sellerEmail.toUpperCase(), "admin-lookup Shop"]) {
+            assert.ok((await people(`?search=${encodeURIComponent(search)}`)).users.some((user: { id: number }) => user.id === fixture.sellerId), search)
+        }
+        const sellers = await people("?role=SELLER&search=admin-lookup")
+        assert.equal(sellers.users.length, 1)
+        assert.deepEqual(sellers.users[0].shop.businessName, "admin-lookup Shop")
+        assert.equal(sellers.users[0].emailConfirmed, false)
+        assert.equal((await people("?admin=true&search=admin-lookup")).users.length, 1)
+        assert.equal((await request("GET", "/admin/users?role=ADMIN", undefined, adminToken)).status, 400)
+        assert.equal((await request("GET", "/admin/users?page=x", undefined, adminToken)).status, 400)
+
+        const seller = (await request("GET", `/admin/users/${fixture.sellerId}`, undefined, adminToken)).body.user
+        assert.equal(seller.ordersAsSeller, 1)
+        assert.equal(seller.ordersAsBuyer, 0)
+        assert.equal(seller.activeComplaints, 1)
+        assert.equal(seller.openLiabilities.amountStillOwed, "0.00")
+        const buyer = (await request("GET", `/admin/users/${fixture.consumerId}`, undefined, adminToken)).body.user
+        assert.equal(buyer.ordersAsBuyer, 1)
+        assert.equal(buyer.activeComplaints, 1)
+        assert.equal((await request("GET", "/admin/users/999999999", undefined, adminToken)).status, 404)
+
+        const everything = JSON.stringify([detail.body, await people(""), seller, buyer])
+        assert.equal(everything.includes("passwordHash"), false)
+        assert.equal(everything.includes("integration-test-not-a-password"), false)
+
+        // Only administrators.
+        for (const path of ["/admin/summary", "/admin/orders", `/admin/orders/${orderId}`, "/admin/users", `/admin/users/${fixture.sellerId}`]) {
+            assert.equal((await request("GET", path, undefined, fixture.token)).status, 403, path)
+            assert.equal((await request("GET", path, undefined, fixture.sellerToken)).status, 403, path)
+        }
+    })
+})
+
+test("a public shop page says what delivery costs", async () => {
+    const fixture = await createCheckoutLifecycleFixture("shop-shipping", 5, 1)
+
+    try {
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+
+        await withAppServer(async (baseUrl) => {
+            const free = await (await fetch(`${baseUrl}/seller/shop/${profile.slug}`)).json() as { profile: Record<string, unknown> }
+            assert.equal(free.profile.shippingPolicy, "FREE")
+            assert.equal(free.profile.shippingCost, null)
+
+            await prisma.sellerProfile.update({ where: { id: profile.id }, data: { shippingPolicy: "FIXED", shippingCost: "1500.50" } })
+            const fixed = await (await fetch(`${baseUrl}/seller/shop/${profile.slug}`)).json() as { profile: Record<string, unknown> }
+            assert.equal(fixed.profile.shippingPolicy, "FIXED")
+            assert.equal(fixed.profile.shippingCost, "1500.5")
+            // Nothing private came with it.
+            assert.equal("businessPhone" in fixed.profile, false)
+            assert.equal("latitude" in fixed.profile, false)
+        })
+    } finally {
+        await fixture.cleanup()
+    }
+})
+
+// ---- Several photos per listing ----
+
+test("a listing can have up to five photos, the first is the card's picture, and they can be replaced and reordered", async () => {
+    const fixture = await createCheckoutLifecycleFixture("listing-photos", 5, 1)
+
+    try {
+        const send = (body: Record<string, unknown>, method = "POST", path = "/listings") => fetch(`${fixture.baseUrl}${path}`, {
+            method,
+            headers: { "content-type": "application/json", cookie: `token=${fixture.sellerToken}` },
+            body: JSON.stringify(body)
+        })
+        const photo = (name: string) => `https://images.example.test/${name}.jpg`
+        const valid = { title: "Dress", description: "A red dress", price: 8000, category: "Fashion & Clothing", stockQuantity: 4 }
+        const refused = async (body: Record<string, unknown>, message: RegExp) => {
+            const response = await send(body)
+            assert.equal(response.status, 400, JSON.stringify(body).slice(0, 80))
+            assert.match((await response.json() as { message: string }).message, message)
+        }
+
+        await refused({ ...valid, imageUrls: [] }, /between 1 and 5 photos/)
+        await refused({ ...valid, imageUrls: ["a", "b", "c", "d", "e", "f"].map(photo) }, /between 1 and 5 photos/)
+        await refused({ ...valid, imageUrls: "not a list" }, /between 1 and 5 photos/)
+        await refused({ ...valid, imageUrls: [photo("a"), "http://images.example.test/b.jpg"] }, /https links/)
+        await refused({ ...valid, imageUrls: [photo("a"), 7] }, /https links/)
+        await refused({ ...valid, imageUrls: [photo("a"), photo("a")] }, /only be added once/)
+        await refused({ ...valid }, /All areas must be filled/)
+
+        const created = await send({ ...valid, imageUrls: ["red", "blue", "green"].map(photo) })
+        assert.equal(created.status, 201)
+        const listing = await created.json() as { id: number; imageUrl: string; images: string[] }
+        assert.deepEqual(listing.images, ["red", "blue", "green"].map(photo))
+        assert.equal(listing.imageUrl, photo("red"))
+
+        // The older single-photo request still works.
+        const single = await send({ ...valid, imageUrl: photo("only") })
+        const singleListing = await single.json() as { id: number; images: string[] }
+        assert.equal(single.status, 201)
+        assert.deepEqual(singleListing.images, [photo("only")])
+
+        // Every place that shows a listing carries the photos.
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+        const one = await (await fetch(`${fixture.baseUrl}/listings/${listing.id}`)).json() as { images: string[]; imageUrl: string }
+        assert.deepEqual(one.images, ["red", "blue", "green"].map(photo))
+        const all = (await (await fetch(`${fixture.baseUrl}/listings`)).json() as { listings: Array<{ id: number; images: string[] }> }).listings
+        assert.deepEqual(all.find((candidate) => candidate.id === listing.id)?.images, ["red", "blue", "green"].map(photo))
+        await withAppServer(async (appUrl) => {
+            const shop = await (await fetch(`${appUrl}/seller/shop/${profile.slug}`)).json() as { listings: Array<{ id: number; images: string[] }> }
+            assert.deepEqual(shop.listings.find((candidate) => candidate.id === listing.id)?.images, ["red", "blue", "green"].map(photo))
+        })
+        const mine = await (await fetch(`${fixture.baseUrl}/listings/Mylisting`, { headers: { cookie: `token=${fixture.sellerToken}` } })).json() as Array<{ id: number; images: string[] }>
+        assert.deepEqual(mine.find((candidate) => candidate.id === listing.id)?.images, ["red", "blue", "green"].map(photo))
+
+        // Reordering and replacing: the order sent is the order shown, and the card picture follows the first.
+        const reordered = await send({ imageUrls: ["green", "red", "yellow", "pink", "black"].map(photo) }, "PATCH", `/listings/${listing.id}`)
+        assert.equal(reordered.status, 200)
+        const reorderedBody = await reordered.json() as { images: string[]; imageUrl: string }
+        assert.deepEqual(reorderedBody.images, ["green", "red", "yellow", "pink", "black"].map(photo))
+        assert.equal(reorderedBody.imageUrl, photo("green"))
+        assert.equal(await prisma.listingImage.count({ where: { listingId: listing.id } }), 5)
+        assert.equal((await send({ imageUrls: [] }, "PATCH", `/listings/${listing.id}`)).status, 400)
+        assert.equal((await send({ imageUrls: [photo("a"), photo("a")] }, "PATCH", `/listings/${listing.id}`)).status, 400)
+
+        // Editing something else leaves the photos alone; the old single field replaces them with one.
+        const retitled = await (await send({ title: "Red dress" }, "PATCH", `/listings/${listing.id}`)).json() as { images: string[] }
+        assert.equal(retitled.images.length, 5)
+        const oneAgain = await (await send({ imageUrl: photo("solo") }, "PATCH", `/listings/${listing.id}`)).json() as { images: string[]; imageUrl: string }
+        assert.deepEqual(oneAgain.images, [photo("solo")])
+        assert.equal(oneAgain.imageUrl, photo("solo"))
+
+        // A listing made before photos existed (no photo rows) falls back to its one picture.
+        await prisma.listingImage.deleteMany({ where: { listingId: listing.id } })
+        const legacy = await (await fetch(`${fixture.baseUrl}/listings/${listing.id}`)).json() as { images: string[] }
+        assert.deepEqual(legacy.images, [photo("solo")])
+
+        // Photos go with a listing that is deleted.
+        await prisma.listingImage.create({ data: { listingId: singleListing.id, url: photo("extra"), position: 1 } })
+        const deleted = await send({}, "DELETE", `/listings/${singleListing.id}`)
+        assert.equal(deleted.status, 200)
+        assert.equal(await prisma.listingImage.count({ where: { listingId: singleListing.id } }), 0)
+    } finally {
+        await prisma.listing.deleteMany({ where: { userId: fixture.sellerId, id: { not: fixture.listingId } } })
+        await fixture.cleanup()
+    }
+})
+
+// ---- Emails about accounts, orders, refunds and complaints; the 7-day delivery closing ----
+
+async function addressesOf(fixture: CheckoutLifecycleFixture) {
+    const consumer = await prisma.user.findUniqueOrThrow({ where: { id: fixture.consumerId } })
+    const seller = await prisma.user.findUniqueOrThrow({ where: { id: fixture.sellerId } })
+    return { buyer: consumer.email, seller: seller.email }
+}
+
+function subjectsTo(address: string) {
+    return emailsTo(address).map((email) => email.subject)
+}
+
+test("a welcome email is sent once the email is confirmed, and a notice when the password changes", async () => {
+    await withAppServer(async (baseUrl) => {
+        const email = `welcome-${randomUUID()}@example.test`
+        const sellerEmail = `welcome-seller-${randomUUID()}@example.test`
+
+        try {
+            await register(baseUrl, { name: "Ada Obi", email, password: goodPassword, role: "CONSUMER" })
+            await register(baseUrl, { name: "Seller Sam", email: sellerEmail, password: goodPassword, role: "SELLER" })
+            await waitForNotifications()
+            assert.equal(subjectsTo(email).some((subject) => subject === "Welcome to Vendly"), false)
+
+            const confirmed = await postJson(baseUrl, "/users/verify-email", { email, code: codeSentTo(email) })
+            await postJson(baseUrl, "/users/verify-email", { email: sellerEmail, code: codeSentTo(sellerEmail) })
+            await waitForNotifications()
+            const welcome = emailsTo(email).find((mail) => mail.subject === "Welcome to Vendly")
+            assert.ok(welcome)
+            assert.match(welcome.text, /Welcome to Vendly, Ada Obi/)
+            assert.match(welcome.text, new RegExp(config.frontendUrl.replace(/[.]/g, "\\.")))
+            assert.match(emailsTo(sellerEmail).find((mail) => mail.subject === "Welcome to Vendly")?.text ?? "", /set up your shop/i)
+
+            // Only once.
+            assert.equal(emailsTo(email).filter((mail) => mail.subject === "Welcome to Vendly").length, 1)
+
+            // Changing the password tells the owner, and the notice never contains the passwords.
+            const access = cookiesFrom(confirmed).token?.value
+            assert.ok(access)
+            await postJson(baseUrl, "/users/change-password", { currentPassword: goodPassword, newPassword: "a-brand-new-password" }, `token=${access}`)
+            await waitForNotifications()
+            const notice = emailsTo(email).find((mail) => mail.subject === "Your password was changed")
+            assert.ok(notice)
+            assert.match(notice.text, /logged out of your other devices/)
+            assert.equal(notice.text.includes(goodPassword) || notice.text.includes("a-brand-new-password"), false)
+
+            // A reset sends one too.
+            await postJson(baseUrl, "/users/forgot-password", { email })
+            await postJson(baseUrl, "/users/reset-password", { email, code: codeSentTo(email), newPassword: "another-new-password" })
+            await waitForNotifications()
+            assert.equal(emailsTo(email).filter((mail) => mail.subject === "Your password was changed").length, 2)
+            assert.ok(emailsTo(email).some((mail) => /was reset/.test(mail.text)))
+        } finally {
+            await deleteRegistered([email, sellerEmail])
+        }
+    })
+})
+
+test("a payment, shipping, delivery and its confirmation each email the right person exactly once", async () => {
+    await withPaymentCheckout("order-emails", async (context) => {
+        const { fixture, request, checkoutId } = context
+        const { buyer, seller } = await addressesOf(fixture)
+        const orderId = await payForCheckout(context)
+        await waitForNotifications()
+
+        const receipt = emailsTo(buyer).find((mail) => mail.subject === "Payment received: ₦3,000.00")
+        assert.ok(receipt)
+        assert.match(receipt.text, /2 × order-emails listing/)
+        assert.match(receipt.text, new RegExp(`/orders/${checkoutId}`))
+        const alert = emailsTo(seller).find((mail) => mail.subject === "New order: ₦3,000.00")
+        assert.ok(alert)
+        assert.match(alert.text, new RegExp(`/seller/orders/${orderId}`))
+        // The seller is told where it goes, but never who the buyer is.
+        assert.equal(alert.text.includes(buyer) || alert.text.includes("Test Consumer"), false)
+        assert.equal(receipt.text.includes(seller), false)
+
+        // A repeated payment check does not send them again.
+        const attempt = await prisma.paymentAttempt.findFirstOrThrow({ where: { checkoutId } })
+        await request("GET", `/payments/${attempt.reference}`)
+        await waitForNotifications()
+        assert.equal(emailsTo(buyer).filter((mail) => mail.subject.startsWith("Payment received")).length, 1)
+
+        await request("POST", `/seller/orders/${orderId}/ship`, { note: "Sent by Gokada rider" }, fixture.sellerToken)
+        await request("POST", `/seller/orders/${orderId}/ship`, { note: "Sent by Gokada rider" }, fixture.sellerToken)
+        await waitForNotifications()
+        const shipped = emailsTo(buyer).filter((mail) => /has shipped$/.test(mail.subject))
+        assert.equal(shipped.length, 1)
+        assert.match(shipped[0]!.text, /Sent by Gokada rider/)
+
+        await request("POST", `/seller/orders/${orderId}/delivered`, {}, fixture.sellerToken)
+        await request("POST", `/seller/orders/${orderId}/delivered`, {}, fixture.sellerToken)
+        await waitForNotifications()
+        const reported = emailsTo(buyer).filter((mail) => /says your order was delivered/.test(mail.subject))
+        assert.equal(reported.length, 1)
+        assert.match(reported[0]!.text, /within 7 days/)
+
+        await request("POST", `/orders/${checkoutId}/seller-orders/${orderId}/confirm-delivery`, {})
+        await request("POST", `/orders/${checkoutId}/seller-orders/${orderId}/confirm-delivery`, {})
+        await waitForNotifications()
+        assert.equal(emailsTo(seller).filter((mail) => mail.subject === `Order #${orderId} was confirmed as received`).length, 1)
+    })
+})
+
+test("complaints email the other side at each step, with a short excerpt and a link, and never the other side's contact details", async () => {
+    await withPaymentCheckout("complaint-emails", async (context) => {
+        const { fixture, request, adminToken, checkoutId } = context
+        const { buyer, seller } = await addressesOf(fixture)
+        const orderId = await payAndShip(context)
+        const opened = await complain(context, orderId)
+        const id = opened.body.dispute.id as number
+        await waitForNotifications()
+
+        const newComplaint = emailsTo(seller).find((mail) => mail.subject === `New complaint about order #${orderId}: please answer`)
+        assert.ok(newComplaint)
+        assert.match(newComplaint.text, /cracked casing/)
+        assert.match(newComplaint.text, new RegExp(`/seller/disputes/${id}`))
+        assert.equal(newComplaint.text.includes(buyer), false)
+        // Nobody emailed the buyer about their own message.
+        assert.equal(subjectsTo(buyer).some((subject) => /^(New complaint|The seller replied|The complaint)/.test(subject)), false)
+
+        await request("POST", `/seller/disputes/${id}/respond`, { action: "AGREE_TO_REFUND", message: "Sorry about that, please refund this buyer." }, fixture.sellerToken)
+        await waitForNotifications()
+        const replied = emailsTo(buyer).find((mail) => mail.subject === `The seller replied about order #${orderId}`)
+        assert.ok(replied)
+        assert.match(replied.text, /agreed, and it is waiting for Vendly to approve/)
+        assert.match(replied.text, new RegExp(`/disputes/${id}`))
+        assert.equal(replied.text.includes(seller), false)
+
+        await request("POST", `/admin/disputes/${id}/messages`, { message: "We are checking the photos you sent." }, adminToken)
+        await waitForNotifications()
+        assert.ok(emailsTo(buyer).some((mail) => mail.subject === `Vendly wrote in the complaint about order #${orderId}`))
+        assert.ok(emailsTo(seller).some((mail) => mail.subject === `Vendly wrote in the complaint about order #${orderId}`))
+
+        await request("POST", `/admin/disputes/${id}/reject`, { note: "The photos do not show damage, so this is not approved." }, adminToken)
+        await waitForNotifications()
+        for (const address of [buyer, seller]) {
+            const decision = emailsTo(address).find((mail) => mail.subject === `Vendly's decision on the complaint about order #${orderId}`)
+            assert.ok(decision, address)
+            assert.match(decision.text, /did not approve a refund/)
+            assert.match(decision.text, /do not show damage/)
+        }
+        assert.ok(checkoutId)
+    })
+})
+
+test("a withdrawn complaint, a seller's refund offer and an escalation are each emailed", async () => {
+    await withPaymentCheckout("complaint-emails-more", async (context) => {
+        const { fixture, request } = context
+        const { buyer, seller } = await addressesOf(fixture)
+        const orderId = await payAndShip(context)
+
+        const offer = await request("POST", `/seller/orders/${orderId}/refund-offer`, { message: "I would like to refund this order, sorry." }, fixture.sellerToken)
+        assert.equal(offer.status, 201)
+        await waitForNotifications()
+        assert.ok(emailsTo(buyer).some((mail) => mail.subject === `The seller offered you a refund for order #${orderId}`))
+        await request("POST", `/seller/disputes/${offer.body.dispute.id}/withdraw`, {}, fixture.sellerToken)
+        await waitForNotifications()
+        assert.ok(emailsTo(buyer).some((mail) => mail.subject === `The complaint about order #${orderId} was withdrawn`))
+        assert.ok(emailsTo(seller).some((mail) => mail.subject === `The complaint about order #${orderId} was withdrawn`))
+
+        const complaint = await complain(context, orderId)
+        const id = complaint.body.dispute.id as number
+        await prisma.dispute.update({ where: { id }, data: { responseDueAt: new Date(Date.now() - 1000) } })
+        await escalateOverdueDisputes()
+        await waitForNotifications()
+        assert.ok(emailsTo(buyer).some((mail) => mail.subject === `The complaint about order #${orderId} was passed to Vendly`))
+        assert.ok(emailsTo(seller).some((mail) => mail.subject === `The complaint about order #${orderId} was passed to Vendly`))
+    })
+})
+
+test("a refund emails the buyer as it starts and as it completes, and tells the seller they owe it", async () => {
+    await withPaymentCheckout("refund-emails", async (context) => {
+        const { fixture, request, adminToken, fakes } = context
+        const { buyer, seller } = await addressesOf(fixture)
+        const orderId = await payAndShip(context)
+        const refunded = await request("POST", `/admin/orders/${orderId}/refunds`, { amount: 1000, reason: "Goodwill refund for a late delivery" }, adminToken)
+        assert.equal(refunded.status, 201)
+        await waitForNotifications()
+
+        const started = emailsTo(buyer).find((mail) => mail.subject === "Your refund of ₦1,000.00 has started")
+        assert.ok(started)
+        assert.match(started.text, new RegExp(`order #${orderId}`))
+        const charged = emailsTo(seller).find((mail) => mail.subject === `Vendly refunded a buyer for order #${orderId}`)
+        assert.ok(charged)
+        assert.match(charged.text, /₦1,000\.00/)
+        assert.match(charged.text, /Goodwill refund for a late delivery/)
+        assert.match(charged.text, /at most half/)
+        // The seller is told, but the buyer never sees the reason the seller was charged.
+        assert.equal(started.text.includes("Goodwill"), false)
+
+        // Checking again while it is still processing sends nothing more.
+        await request("POST", `/admin/refunds/${refunded.body.refund.id}/sync`, {}, adminToken)
+        await waitForNotifications()
+        assert.equal(emailsTo(buyer).filter((mail) => mail.subject.startsWith("Your refund of")).length, 1)
+
+        // When the provider reports it done, the buyer is told once.
+        const stored = await prisma.refund.findUniqueOrThrow({ where: { id: refunded.body.refund.id } })
+        fakes.behaviors.PAYSTACK.findRefunds = async () => [fakeProviderRefund({
+            providerRefundId: stored.providerRefundId ?? "unknown", amountKobo: 100000, outcome: "succeeded", providerStatus: "processed"
+        })]
+        await request("POST", `/admin/refunds/${refunded.body.refund.id}/sync`, {}, adminToken)
+        await request("POST", `/admin/refunds/${refunded.body.refund.id}/sync`, {}, adminToken)
+        await waitForNotifications()
+        assert.equal(emailsTo(buyer).filter((mail) => mail.subject === "Your refund of ₦1,000.00 is complete").length, 1)
+        assert.equal(emailsTo(seller).filter((mail) => mail.subject.startsWith("Vendly refunded a buyer")).length, 1)
+    })
+})
+
+test("emails that cannot be sent never undo or delay what they are about", async (t) => {
+    await withPaymentCheckout("email-failure", async (context) => {
+        const consoleError = t.mock.method(console, "error", () => {})
+        setEmailSenderForTesting(async () => { throw new Error("the email service is down") })
+
+        try {
+            const orderId = await payForCheckout(context)
+            await waitForNotifications()
+            const order = await prisma.order.findUniqueOrThrow({ where: { id: orderId } })
+            assert.equal(order.status, "PAID")
+            assert.ok(consoleError.mock.calls.some((call) => call.arguments[0] === "Could not send an email"))
+        } finally {
+            setEmailSenderForTesting(async (email) => { sentEmails.push(email) })
+        }
+    })
+})
+
+// A shipped order whose seller reported delivery `days` ago.
+async function shippedAndReportedDelivered(context: PaymentTestContext, days: number) {
+    const orderId = await payAndShip(context)
+    await context.request("POST", `/seller/orders/${orderId}/delivered`, {}, context.fixture.sellerToken)
+    await prisma.order.update({ where: { id: orderId }, data: { deliveryReportedAt: new Date(Date.now() - days * 24 * 60 * 60 * 1000) } })
+    return orderId
+}
+
+test("a buyer is reminded 4 days after the seller reports delivery, and the order closes as delivered at 7 days", async () => {
+    await withPaymentCheckout("delivery-closing", async (context) => {
+        const { fixture, request, checkoutId } = context
+        const { buyer, seller } = await addressesOf(fixture)
+        const orderId = await shippedAndReportedDelivered(context, 2)
+
+        // Too early for anything.
+        assert.deepEqual(await remindAndCloseDeliveries(), { closed: 0, reminded: 0 })
+
+        // Day 5: a reminder, once.
+        await prisma.order.update({ where: { id: orderId }, data: { deliveryReportedAt: new Date(Date.now() - 5 * 24 * 60 * 60 * 1000) } })
+        assert.deepEqual(await remindAndCloseDeliveries(), { closed: 0, reminded: 1 })
+        assert.deepEqual(await remindAndCloseDeliveries(), { closed: 0, reminded: 0 })
+        await waitForNotifications()
+        const reminders = emailsTo(buyer).filter((mail) => mail.subject === "Did your order arrive?")
+        assert.equal(reminders.length, 1)
+        assert.match(reminders[0]!.text, /closed as delivered on/)
+        assert.equal((await prisma.order.findUniqueOrThrow({ where: { id: orderId } })).status, "SHIPPED")
+
+        // Day 8: closed automatically, and both sides are told.
+        await prisma.order.update({ where: { id: orderId }, data: { deliveryReportedAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000) } })
+        assert.deepEqual(await remindAndCloseDeliveries(), { closed: 1, reminded: 0 })
+        assert.deepEqual(await remindAndCloseDeliveries(), { closed: 0, reminded: 0 })
+        await waitForNotifications()
+        const order = await prisma.order.findUniqueOrThrow({ where: { id: orderId } })
+        assert.equal(order.status, "DELIVERED")
+        assert.ok(order.deliveryAutoClosedAt)
+        assert.equal(order.deliveryConfirmedAt, null)
+        assert.ok(emailsTo(buyer).some((mail) => mail.subject === "Your order was closed as delivered"))
+        assert.ok(emailsTo(seller).some((mail) => mail.subject === `Order #${orderId} was closed as delivered`))
+
+        // Both sides can see it was automatic, and the buyer's own confirmation was not claimed.
+        const buyerView = await request("GET", `/orders/${checkoutId}`)
+        assert.equal(buyerView.body.sellerOrders[0].status, "DELIVERED")
+        assert.ok(buyerView.body.sellerOrders[0].deliveryAutoClosedAt)
+        assert.equal(buyerView.body.sellerOrders[0].deliveryConfirmedAt, null)
+        const sellerView = await request("GET", `/seller/orders/${orderId}`, undefined, fixture.sellerToken)
+        assert.ok(sellerView.body.deliveryAutoClosedAt)
+
+        // Silence is not proof of receipt: the buyer can still say it never arrived.
+        const complaint = await complain(context, orderId, { reason: "NOT_RECEIVED", message: "Nothing ever arrived at my address." })
+        assert.equal(complaint.status, 201)
+    })
+})
+
+test("an order the buyer confirmed, or that has an open complaint, is never closed or reminded automatically", async () => {
+    await withPaymentCheckout("delivery-closing-skips", async (context) => {
+        const { request, checkoutId } = context
+        const confirmedOrder = await shippedAndReportedDelivered(context, 9)
+        await request("POST", `/orders/${checkoutId}/seller-orders/${confirmedOrder}/confirm-delivery`, {})
+        const order = await prisma.order.findUniqueOrThrow({ where: { id: confirmedOrder } })
+        assert.ok(order.deliveryConfirmedAt)
+        assert.deepEqual(await remindAndCloseDeliveries(), { closed: 0, reminded: 0 })
+        assert.equal((await prisma.order.findUniqueOrThrow({ where: { id: confirmedOrder } })).deliveryAutoClosedAt, null)
+    })
+
+    await withPaymentCheckout("delivery-closing-complaint", async (context) => {
+        const orderId = await shippedAndReportedDelivered(context, 9)
+        const complaint = await complain(context, orderId)
+        assert.equal(complaint.status, 201)
+
+        // An open complaint holds the order open, whatever its age.
+        assert.deepEqual(await remindAndCloseDeliveries(), { closed: 0, reminded: 0 })
+        assert.equal((await prisma.order.findUniqueOrThrow({ where: { id: orderId } })).status, "SHIPPED")
+
+        // Once the complaint is withdrawn the order can close.
+        await context.request("POST", `/disputes/${complaint.body.dispute.id}/withdraw`, {})
+        assert.deepEqual(await remindAndCloseDeliveries(), { closed: 1, reminded: 0 })
+    })
+})
+
+// ---- Reviews ----
+
+// A paid order that has been shipped, reported delivered and confirmed by the buyer.
+async function payShipDeliverConfirm(context: PaymentTestContext) {
+    const orderId = await payAndShip(context)
+    await context.request("POST", `/seller/orders/${orderId}/delivered`, {}, context.fixture.sellerToken)
+    const confirmed = await context.request("POST", `/orders/${context.checkoutId}/seller-orders/${orderId}/confirm-delivery`, {})
+    assert.equal(confirmed.status, 200)
+    return orderId
+}
+
+// Other buyers who have left reviews, made straight in the database so a test can have several.
+async function addOtherReviewers(context: PaymentTestContext, orderId: number, ratings: number[]) {
+    const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: context.fixture.sellerId } })
+    const users = []
+
+    for (const rating of ratings) {
+        const user = await prisma.user.create({
+            data: { name: `Reviewer ${rating}`, email: `reviewer-${randomUUID()}@example.test`, passwordHash: "integration-test-not-a-password", role: "CONSUMER" }
+        })
+        await prisma.productReview.create({ data: { listingId: context.fixture.listingId, buyerId: user.id, orderId, rating } })
+        await prisma.shopReview.create({ data: { sellerProfileId: profile.id, buyerId: user.id, orderId, rating } })
+        users.push(user)
+    }
+
+    // The app keeps each rating up to date as reviews change; reviews made directly need the same step.
+    await prisma.$transaction(async (tx) => {
+        await recalculateRating(tx, "product", context.fixture.listingId)
+        await recalculateRating(tx, "shop", profile.id)
+    })
+
+    return users
+}
+
+async function removeUsers(users: Array<{ id: number }>) {
+    await prisma.productReview.deleteMany({ where: { buyerId: { in: users.map((user) => user.id) } } })
+    await prisma.shopReview.deleteMany({ where: { buyerId: { in: users.map((user) => user.id) } } })
+    await prisma.user.deleteMany({ where: { id: { in: users.map((user) => user.id) } } })
+}
+
+test("only a buyer whose order was delivered can review it, and what is allowed is checked", async () => {
+    await withPaymentCheckout("review-rules", async (context) => {
+        const { fixture, request, checkoutId } = context
+        const orderId = await payAndShip(context)
+        const path = `/orders/${checkoutId}/seller-orders/${orderId}/reviews`
+        const review = (body: unknown, token = fixture.token) => request("POST", path, body, token)
+        const listingId = fixture.listingId
+
+        // Not before it is delivered.
+        const early = await request("GET", path)
+        assert.equal(early.body.canReview, false)
+        const tooEarly = await review({ shop: { rating: 5 } })
+        assert.equal(tooEarly.status, 409)
+        assert.equal(tooEarly.body.code, "REVIEW_NOT_ALLOWED")
+
+        await request("POST", `/seller/orders/${orderId}/delivered`, {}, fixture.sellerToken)
+        await request("POST", `/orders/${checkoutId}/seller-orders/${orderId}/confirm-delivery`, {})
+        const state = await request("GET", path)
+        assert.equal(state.body.canReview, true)
+        assert.deepEqual(state.body.products, [{ listingId, title: "review-rules listing", review: null }])
+        assert.equal(state.body.shop, null)
+
+        // Bad requests.
+        const refused = async (body: unknown, message: RegExp) => {
+            const response = await review(body)
+            assert.equal(response.status, 400, JSON.stringify(body))
+            assert.match(response.body.message, message)
+        }
+        await refused({}, /shop, a product, or both/)
+        await refused({ shop: {} }, /1 to 5/)
+        await refused({ shop: { rating: 0 } }, /1 to 5/)
+        await refused({ shop: { rating: 6 } }, /1 to 5/)
+        await refused({ shop: { rating: 4.5 } }, /1 to 5/)
+        await refused({ shop: { rating: "5" } }, /1 to 5/)
+        await refused({ shop: null }, /1 to 5/)
+        await refused({ shop: { rating: 5, comment: "c".repeat(1001) } }, /1000 characters/)
+        await refused({ shop: { rating: 5, comment: { x: 1 } } }, /1000 characters/)
+        await refused({ products: [] }, /1 to 20/)
+        await refused({ products: "x" }, /1 to 20/)
+        await refused({ products: [{ rating: 5 }] }, /listingId/)
+        await refused({ products: [{ listingId, rating: 9 }] }, /1 to 5/)
+        await refused({ products: [{ listingId, rating: 5 }, { listingId, rating: 4 }] }, /only be reviewed once/)
+        await refused({ products: [{ listingId: listingId + 999999, rating: 5 }] }, /only review products from this order/)
+        assert.equal(await prisma.productReview.count({ where: { listingId } }), 0)
+
+        // Someone else's order is not theirs to review.
+        const other = await fixture.addConsumer(1)
+        assert.equal((await review({ shop: { rating: 5 } }, other.token)).status, 404)
+        assert.equal((await request("GET", path, undefined, other.token)).status, 404)
+        assert.equal((await review({ shop: { rating: 5 } }, fixture.sellerToken)).status, 403)
+        assert.equal((await request("POST", `/orders/${checkoutId}/seller-orders/999999999/reviews`, { shop: { rating: 5 } })).status, 404)
+
+        // Blank comments mean no comment; control characters are dropped.
+        const created = await review({ shop: { rating: 4, comment: "   " }, products: [{ listingId, rating: 5, comment: "Great\u0000 charger\n\n\n\nworks well" }] })
+        assert.equal(created.status, 201)
+        assert.equal(created.body.shop.comment, null)
+        assert.equal(created.body.products[0].comment, "Great charger\n\nworks well")
+
+        // Once each.
+        const again = await review({ products: [{ listingId, rating: 1 }] })
+        assert.equal(again.status, 409)
+        assert.equal(again.body.code, "REVIEW_EXISTS")
+        assert.equal((await review({ shop: { rating: 1 } })).status, 409)
+        assert.equal(await prisma.productReview.count({ where: { listingId } }), 1)
+    })
+})
+
+test("an order closed automatically after 7 days of silence can be reviewed, and a refunded one cannot", async () => {
+    await withPaymentCheckout("review-auto-closed", async (context) => {
+        const { fixture, request, checkoutId } = context
+        const orderId = await payAndShip(context)
+        await request("POST", `/seller/orders/${orderId}/delivered`, {}, fixture.sellerToken)
+        await prisma.order.update({ where: { id: orderId }, data: { deliveryReportedAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000) } })
+        await remindAndCloseDeliveries()
+        const path = `/orders/${checkoutId}/seller-orders/${orderId}/reviews`
+        assert.equal((await request("GET", path)).body.canReview, true)
+        assert.equal((await request("POST", path, { shop: { rating: 3 } })).status, 201)
+
+        await prisma.order.update({ where: { id: orderId }, data: { status: "REFUNDED" } })
+        assert.equal((await request("GET", path)).body.canReview, false)
+    })
+})
+
+test("ratings and reviews show on listings, shops and the public review lists, without anything private", async () => {
+    await withPaymentCheckout("review-public", async (context) => {
+        const { fixture, request, checkoutId } = context
+        const orderId = await payShipDeliverConfirm(context)
+        const listingId = fixture.listingId
+        const slug = (await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })).slug
+
+        // No reviews yet: no average, a count of zero.
+        const before = (await request("GET", `/listings/${listingId}`)).body
+        assert.equal(before.ratingAverage, null)
+        assert.equal(before.ratingCount, 0)
+        assert.equal("ratingSum" in before, false)
+
+        const created = await request("POST", `/orders/${checkoutId}/seller-orders/${orderId}/reviews`, {
+            shop: { rating: 4, comment: "Quick and friendly" },
+            products: [{ listingId, rating: 5, comment: "Works perfectly" }]
+        })
+        assert.equal(created.status, 201)
+        const others = await addOtherReviewers(context, orderId, [2, 2])
+
+        try {
+            // Re-count with the others included, by hiding and showing nothing: a new review through the app recalculates,
+            // so recalculate by changing the buyer's own review to the same rating.
+            await request("PATCH" as "GET", `/reviews/products/${created.body.products[0].id}`, { rating: 5 })
+            await request("PATCH" as "GET", `/reviews/shops/${created.body.shop.id}`, { rating: 4 })
+
+            const listing = (await request("GET", `/listings/${listingId}`)).body
+            assert.equal(listing.ratingCount, 3)
+            assert.equal(listing.ratingAverage, 3)
+            assert.equal("ratingSum" in listing, false)
+            const inList = ((await request("GET", "/listings")).body.listings as Array<{ id: number; ratingAverage: number | null; ratingCount: number }>).find((item) => item.id === listingId)
+            assert.deepEqual([inList?.ratingAverage, inList?.ratingCount], [3, 3])
+
+            const shop = (await request("GET", `/seller/shop/${slug}`)).body
+            assert.equal(shop.profile.ratingCount, 3)
+            assert.equal(shop.profile.ratingAverage, 2.7)
+            assert.equal("ratingSum" in shop.profile, false)
+            assert.equal(shop.listings[0].ratingAverage, 3)
+            const shops = (await request("GET", "/seller/shops?category=Electronics")).body as Array<{ id: number; ratingAverage: number | null; ratingCount: number }>
+            const card = shops.find((candidate) => candidate.id === shop.profile.id)
+            assert.deepEqual([card?.ratingAverage, card?.ratingCount], [2.7, 3])
+            assert.equal("ratingSum" in (card ?? {}), false)
+            const mine = (await request("GET", "/seller/profile", undefined, fixture.sellerToken)).body
+            assert.equal(mine.ratingAverage, 2.7)
+
+            // The public list: newest first, with the count of each star, and only a first name and initial.
+            const list = (await request("GET", `/listings/${listingId}/reviews`)).body
+            assert.equal(list.summary.average, 3)
+            assert.equal(list.summary.count, 3)
+            assert.deepEqual(list.summary.distribution, { "1": 0, "2": 2, "3": 0, "4": 0, "5": 1 })
+            assert.equal(list.reviews.length, 3)
+            assert.ok(list.reviews.some((item: { reviewer: string; comment: string }) => item.reviewer === "review-public C." && item.comment === "Works perfectly"))
+            assert.ok(list.reviews.some((item: { reviewer: string }) => item.reviewer === "Reviewer 2."))
+            const text = JSON.stringify(list)
+            assert.equal(text.includes("@example.test") || text.includes("buyerId") || text.includes("orderId") || text.includes("hidden"), false)
+            const shopList = (await request("GET", `/seller/shop/${slug}/reviews`)).body
+            assert.equal(shopList.summary.count, 3)
+            assert.equal(shopList.summary.average, 2.7)
+            assert.equal((await request("GET", `/listings/${listingId}/reviews?page=2`)).body.reviews.length, 0)
+
+            // Bad requests and things that are not there.
+            assert.equal((await request("GET", `/listings/${listingId}/reviews?page=0`)).status, 400)
+            assert.equal((await request("GET", "/listings/999999999/reviews")).status, 404)
+            assert.equal((await request("GET", "/listings/abc/reviews")).status, 404)
+            assert.equal((await request("GET", "/seller/shop/no-such-shop/reviews")).status, 404)
+
+            // An archived listing's reviews are not public.
+            await request("POST", `/listings/${listingId}/archive`, {}, fixture.sellerToken)
+            assert.equal((await request("GET", `/listings/${listingId}/reviews`)).status, 404)
+        } finally {
+            await removeUsers(others)
+        }
+    })
+})
+
+test("a buyer can change or remove their review for a week, and the rating follows", async () => {
+    await withPaymentCheckout("review-edit", async (context) => {
+        const { fixture, request, checkoutId } = context
+        const orderId = await payShipDeliverConfirm(context)
+        const listingId = fixture.listingId
+        const created = (await request("POST", `/orders/${checkoutId}/seller-orders/${orderId}/reviews`, {
+            shop: { rating: 5 },
+            products: [{ listingId, rating: 5, comment: "Lovely" }]
+        })).body
+        const productId = created.products[0].id as number
+        const shopId = created.shop.id as number
+        const patch = (path: string, body: unknown, token = fixture.token) => request("PATCH" as "GET", path, body, token)
+        const average = async () => ((await request("GET", `/listings/${listingId}`)).body as { ratingAverage: number | null }).ratingAverage
+
+        assert.equal(await average(), 5)
+        const changed = await patch(`/reviews/products/${productId}`, { rating: 3, comment: "Okay after a week of use" })
+        assert.equal(changed.status, 200)
+        assert.equal(changed.body.review.rating, 3)
+        assert.equal(await average(), 3)
+        const list = (await request("GET", `/listings/${listingId}/reviews`)).body
+        assert.equal(list.reviews[0].comment, "Okay after a week of use")
+        assert.equal(list.reviews[0].edited, false, "changed within a second of writing")
+
+        // Clearing the comment, and the things that are refused.
+        assert.equal((await patch(`/reviews/products/${productId}`, { comment: null })).body.review.comment, null)
+        assert.equal((await patch(`/reviews/products/${productId}`, {})).status, 400)
+        assert.equal((await patch(`/reviews/products/${productId}`, { rating: 7 })).status, 400)
+        assert.equal((await patch(`/reviews/products/${productId}`, { comment: "c".repeat(1001) })).status, 400)
+        assert.equal((await patch(`/reviews/gifts/${productId}`, { rating: 1 })).status, 404)
+        assert.equal((await patch("/reviews/products/999999999", { rating: 1 })).status, 404)
+        const other = await fixture.addConsumer(1)
+        assert.equal((await patch(`/reviews/products/${productId}`, { rating: 1 }, other.token)).status, 404)
+        assert.equal((await request("DELETE" as "GET", `/reviews/products/${productId}`, undefined, other.token)).status, 404)
+        assert.equal((await patch(`/reviews/products/${productId}`, { rating: 1 }, fixture.sellerToken)).status, 403)
+
+        // Removing takes it out of the rating, and the product can be reviewed again.
+        assert.equal((await request("DELETE" as "GET", `/reviews/products/${productId}`)).status, 200)
+        assert.equal(await average(), null)
+        assert.equal(((await request("GET", `/listings/${listingId}`)).body as { ratingCount: number }).ratingCount, 0)
+        assert.equal((await request("POST", `/orders/${checkoutId}/seller-orders/${orderId}/reviews`, { products: [{ listingId, rating: 4 }] })).status, 201)
+
+        // After a week it is final.
+        await prisma.shopReview.update({ where: { id: shopId }, data: { createdAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000) } })
+        const locked = await patch(`/reviews/shops/${shopId}`, { rating: 1 })
+        assert.equal(locked.status, 409)
+        assert.equal(locked.body.code, "REVIEW_LOCKED")
+        assert.equal((await request("DELETE" as "GET", `/reviews/shops/${shopId}`)).status, 409)
+        assert.equal((await request("GET", `/orders/${checkoutId}/seller-orders/${orderId}/reviews`)).body.shop.canChange, false)
+    })
+})
+
+test("a seller can report a review of their shop and an administrator can hide it, which takes it out of the rating", async () => {
+    await withPaymentCheckout("review-moderation", async (context) => {
+        const { fixture, request, checkoutId, adminToken } = context
+        const orderId = await payShipDeliverConfirm(context)
+        const listingId = fixture.listingId
+        const created = (await request("POST", `/orders/${checkoutId}/seller-orders/${orderId}/reviews`, {
+            shop: { rating: 1, comment: "Terrible, they are scammers" },
+            products: [{ listingId, rating: 1, comment: "Rubbish" }]
+        })).body
+        const productId = created.products[0].id as number
+        const shopId = created.shop.id as number
+        const others = await addOtherReviewers(context, orderId, [5, 5])
+
+        try {
+            await waitForNotifications()
+            // The seller is told about it, with the words, and can look at them.
+            const sellerEmail = (await prisma.user.findUniqueOrThrow({ where: { id: fixture.sellerId } })).email
+            const notice = emailsTo(sellerEmail).find((mail) => mail.subject === "A buyer reviewed your order")
+            assert.ok(notice)
+            assert.match(notice.text, /Terrible, they are scammers/)
+            const mineShop = (await request("GET", "/seller/reviews", undefined, fixture.sellerToken)).body
+            assert.equal(mineShop.total, 3)
+            assert.equal(mineShop.reviews.find((item: { id: number }) => item.id === shopId).reported, false)
+            const mineProducts = (await request("GET", "/seller/reviews?type=product", undefined, fixture.sellerToken)).body
+            assert.equal(mineProducts.reviews.find((item: { id: number }) => item.id === productId).listing.title, "review-moderation listing")
+            assert.equal((await request("GET", "/seller/reviews?type=gift", undefined, fixture.sellerToken)).status, 400)
+
+            // Reporting: only the seller it is about, with a reason.
+            const report = (kind: string, id: number, body: unknown, token = fixture.sellerToken) => request("POST", `/seller/reviews/${kind}/${id}/report`, body, token)
+            assert.equal((await report("shops", shopId, {})).status, 400)
+            assert.equal((await report("shops", shopId, { reason: "no" })).status, 400)
+            assert.equal((await report("gifts", shopId, { reason: "Not true at all" })).status, 404)
+            assert.equal((await report("shops", shopId, { reason: "Not true at all" }, fixture.token)).status, 403)
+            await withStrangerSeller(async (strangerToken) => {
+                assert.equal((await report("shops", shopId, { reason: "Not true at all" }, strangerToken)).status, 404)
+                assert.equal((await report("products", productId, { reason: "Not true at all" }, strangerToken)).status, 404)
+            })
+            assert.equal((await report("shops", shopId, { reason: "This buyer never received anything wrong and is lying" })).status, 200)
+            assert.equal((await report("shops", shopId, { reason: "Reporting again changes nothing here" })).status, 200)
+            assert.equal((await report("products", productId, { reason: "A competitor wrote this review" })).status, 200)
+            assert.equal(((await request("GET", "/seller/reviews", undefined, fixture.sellerToken)).body.reviews.find((item: { id: number }) => item.id === shopId)).reported, true)
+
+            // The administrator sees what was reported, with the reason and who wrote it.
+            const reported = await request("GET", "/admin/reviews?type=shop", undefined, adminToken)
+            assert.equal(reported.status, 200)
+            assert.equal(reported.body.total, 1)
+            assert.equal(reported.body.reviews[0].id, shopId)
+            assert.match(reported.body.reviews[0].reportReason, /never received anything wrong/)
+            assert.match(reported.body.reviews[0].buyer.email, /review-moderation-consumer/)
+            assert.equal(reported.body.reviews[0].subject.businessName, "review-moderation Shop")
+            assert.equal((await request("GET", "/admin/reviews?type=shop", undefined, fixture.sellerToken)).status, 403)
+            assert.equal((await request("GET", "/admin/reviews?status=pending", undefined, adminToken)).status, 400)
+            assert.equal((await request("GET", "/admin/reviews?type=gift", undefined, adminToken)).status, 400)
+
+            // Hiding needs a reason and removes it from the lists and from the average.
+            const slug = (await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })).slug
+            assert.equal(((await request("GET", `/seller/shop/${slug}`)).body.profile).ratingAverage, 3.7)
+            assert.equal((await request("POST", `/admin/reviews/shops/${shopId}/hide`, {}, adminToken)).status, 400)
+            assert.equal((await request("POST", `/admin/reviews/shops/${shopId}/hide`, { reason: "Untrue claim about scams" }, fixture.sellerToken)).status, 403)
+            assert.equal((await request("POST", "/admin/reviews/shops/999999999/hide", { reason: "Untrue claim about scams" }, adminToken)).status, 404)
+            assert.equal((await request("POST", `/admin/reviews/shops/${shopId}/hide`, { reason: "Untrue claim about scams" }, adminToken)).status, 200)
+            const shop = (await request("GET", `/seller/shop/${slug}`)).body.profile
+            assert.equal(shop.ratingCount, 2)
+            assert.equal(shop.ratingAverage, 5)
+            assert.equal((await request("GET", `/seller/shop/${slug}/reviews`)).body.reviews.some((item: { id: number }) => item.id === shopId), false)
+            assert.equal((await request("GET", "/admin/reviews?type=shop", undefined, adminToken)).body.total, 0)
+            const hidden = await request("GET", "/admin/reviews?type=shop&status=hidden", undefined, adminToken)
+            assert.equal(hidden.body.reviews[0].hiddenReason, "Untrue claim about scams")
+            // The buyer is told it is hidden, and the seller can see it is.
+            assert.equal((await request("GET", `/orders/${checkoutId}/seller-orders/${orderId}/reviews`)).body.shop.hidden, true)
+            assert.equal(((await request("GET", "/seller/reviews", undefined, fixture.sellerToken)).body.reviews.find((item: { id: number }) => item.id === shopId)).hidden, true)
+
+            // Showing it again puts it back.
+            assert.equal((await request("POST", `/admin/reviews/shops/${shopId}/show`, {}, adminToken)).status, 200)
+            assert.equal((await request("GET", `/seller/shop/${slug}`)).body.profile.ratingCount, 3)
+
+            // Products too.
+            assert.equal((await request("POST", `/admin/reviews/products/${productId}/hide`, { reason: "A competitor wrote this" }, adminToken)).status, 200)
+            assert.equal(((await request("GET", `/listings/${listingId}`)).body as { ratingAverage: number }).ratingAverage, 5)
+            assert.equal((await request("GET", `/listings/${listingId}/reviews`)).body.summary.count, 2)
+        } finally {
+            await removeUsers(others)
+        }
+    })
+})
+
+// ---- Pre-orders for food shops ----
+
+const inHours = (hours: number) => new Date(Date.now() + hours * 60 * 60 * 1000).toISOString()
+
+// Makes the fixture's one listing food and sets how the shop takes orders.
+async function makeFoodShop(context: PaymentTestContext, type: "NOW" | "PRE_ORDER" | "BOTH") {
+    await prisma.listing.update({ where: { id: context.fixture.listingId }, data: { category: "Food & Grocery" } })
+    const response = await context.request("PATCH" as "GET", "/seller/profile", { foodOrderType: type }, context.fixture.sellerToken)
+    assert.equal(response.status, 200)
+    assert.equal(response.body.foodOrderType, type)
+}
+
+async function shopSlug(context: PaymentTestContext) {
+    return (await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: context.fixture.sellerId } })).slug
+}
+
+// Asks the shop for a pre-order of what is in the buyer's cart.
+function askForPreOrder(context: PaymentTestContext, body: Record<string, unknown> = {}, token = context.fixture.token) {
+    return shopSlug(context).then((slug) => context.request("POST", "/pre-orders", { sellerSlug: slug, readyAt: inHours(48), ...body }, token))
+}
+
+// Creates a checkout from the cart, as the checkout page does: look at the prices, then confirm.
+async function checkoutFromCart(context: PaymentTestContext, preOrderIds?: number[]) {
+    const preview = await context.request("GET", "/checkout/preview")
+    assert.equal(preview.status, 200)
+    return context.request("POST", "/checkout", {
+        reviewToken: preview.body.reviewToken,
+        delivery: fixtureDelivery,
+        ...(preOrderIds ? { preOrderIds } : {})
+    })
+}
+
+async function payCheckout(context: PaymentTestContext, checkoutId: number) {
+    const started = await context.request("POST", `/checkout/${checkoutId}/payments`, { provider: "PAYSTACK" })
+    assert.equal(started.status, 201)
+    const reference = started.body.payment.reference as string
+    context.fakes.behaviors.PAYSTACK.verify = async () => paystackVerification("success", reference)
+    await context.request("GET", `/payments/${reference}`)
+    const [order] = await prisma.order.findMany({ where: { checkoutId } })
+    assert.equal(order?.status, "PAID")
+    return order!.id
+}
+
+test("only a shop that sells food can take pre-orders, and the setting is shown to shoppers", async () => {
+    await withPaymentCheckout("preorder-setting", async (context) => {
+        const { fixture, request } = context
+        const patch = (body: unknown, token = fixture.sellerToken) => request("PATCH" as "GET", "/seller/profile", body, token)
+
+        // A shop with no food cannot take pre-orders.
+        const noFood = await patch({ foodOrderType: "PRE_ORDER" })
+        assert.equal(noFood.status, 400)
+        assert.match(noFood.body.message, /Food & Grocery/)
+        assert.equal((await patch({ foodOrderType: "SOMETIMES" })).status, 400)
+        assert.equal((await patch({ foodOrderType: "BOTH" }, fixture.token)).status, 403)
+
+        await makeFoodShop(context, "PRE_ORDER")
+        const slug = await shopSlug(context)
+        assert.equal((await request("GET", `/seller/shop/${slug}`)).body.profile.foodOrderType, "PRE_ORDER")
+        assert.equal((await request("GET", "/seller/profile", undefined, fixture.sellerToken)).body.foodOrderType, "PRE_ORDER")
+        const shops = (await request("GET", "/seller/shops?category=Food%20%26%20Grocery")).body as Array<{ slug: string; foodOrderType: string }>
+        assert.equal(shops.find((shop) => shop.slug === slug)?.foodOrderType, "PRE_ORDER")
+
+        assert.equal((await patch({ foodOrderType: "BOTH" })).body.foodOrderType, "BOTH")
+        assert.equal((await patch({ foodOrderType: "NOW" })).body.foodOrderType, "NOW")
+    })
+})
+
+test("a buyer asks for a pre-order, the seller approves, and the paid order carries the ready time", async () => {
+    await withPaymentCheckout("preorder-flow", async (context) => {
+        const { fixture, request, checkoutId } = context
+        const buyer = (await prisma.user.findUniqueOrThrow({ where: { id: fixture.consumerId } })).email
+        const seller = (await prisma.user.findUniqueOrThrow({ where: { id: fixture.sellerId } })).email
+        await makeFoodShop(context, "PRE_ORDER")
+
+        // This shop only takes pre-orders: the preview says so, and a plain checkout is refused.
+        const preview = await request("GET", "/checkout/preview")
+        assert.equal(preview.body.sellers[0].orderType, "PRE_ORDER")
+        assert.deepEqual(preview.body.sellers[0].preOrder, { required: true, approved: null })
+        const refused = await checkoutFromCart(context)
+        assert.equal(refused.status, 409)
+        assert.equal(refused.body.code, "CHECKOUT_PREORDER_REQUIRED")
+        assert.equal(refused.body.seller.businessName, "preorder-flow Shop")
+
+        // Asking: the time must be sensible, and the buyer needs something in the cart.
+        for (const body of [{ readyAt: "tomorrow" }, { readyAt: "2026-11-02T14:00:00" }, { readyAt: 12345 }, { readyAt: inHours(2) }, { readyAt: inHours(24 * 31) }, { note: 42 }, { note: "n".repeat(501) }]) {
+            const response = await askForPreOrder(context, body)
+            assert.equal(response.status, 400, JSON.stringify(body))
+        }
+        assert.equal((await request("POST", "/pre-orders", { readyAt: inHours(48) })).status, 400)
+        assert.equal((await request("POST", "/pre-orders", { sellerSlug: "no-such-shop", readyAt: inHours(48) })).status, 404)
+        assert.equal((await askForPreOrder(context, {}, fixture.sellerToken)).status, 403)
+        const empty = await fixture.addConsumer(1)
+        await prisma.cartItem.deleteMany({ where: { cart: { userId: empty.id } } })
+        assert.equal((await askForPreOrder(context, {}, empty.token)).body.code, "PREORDER_CART_EMPTY")
+
+        const readyAt = inHours(48)
+        const asked = await askForPreOrder(context, { readyAt, note: "For my daughter's birthday" })
+        assert.equal(asked.status, 201)
+        const preOrder = asked.body.preOrder
+        assert.equal(preOrder.status, "REQUESTED")
+        assert.equal(preOrder.subtotal, "3000.00")
+        assert.deepEqual(preOrder.items, [{ listingId: fixture.listingId, title: "preorder-flow listing", quantity: 2, unitPrice: "1500.00" }])
+        assert.equal(preOrder.note, "For my daughter's birthday")
+        assert.equal(preOrder.seller.businessName, "preorder-flow Shop")
+        const answerWithin = (new Date(preOrder.respondBy).getTime() - Date.now()) / 3_600_000
+        assert.ok(answerWithin > 47.9 && answerWithin <= 48)
+        // One open request per shop.
+        const again = await askForPreOrder(context)
+        assert.equal(again.status, 409)
+        assert.equal(again.body.code, "PREORDER_EXISTS")
+        assert.equal(again.body.preOrderId, preOrder.id)
+
+        await waitForNotifications()
+        assert.ok(emailsTo(seller).some((mail) => mail.subject === "A buyer asked for a pre-order" && /For my daughter's birthday/.test(mail.text)))
+
+        // The seller sees it, with the buyer's first name only, and can count what is waiting.
+        assert.equal((await request("GET", "/seller/pre-orders/awaiting-answer", undefined, fixture.sellerToken)).body.count, 1)
+        const sellerList = await request("GET", "/seller/pre-orders", undefined, fixture.sellerToken)
+        assert.equal(sellerList.body.total, 1)
+        assert.equal(sellerList.body.preOrders[0].buyerName, "preorder-flow")
+        assert.equal(JSON.stringify(sellerList.body).includes(buyer), false)
+        assert.equal((await request("GET", "/seller/pre-orders?status=NOPE", undefined, fixture.sellerToken)).status, 400)
+        assert.equal((await request("GET", "/pre-orders")).body.total, 1)
+        assert.equal((await request("GET", `/pre-orders/${preOrder.id}`)).body.preOrder.status, "REQUESTED")
+        assert.equal((await request("GET", `/pre-orders/${preOrder.id}`, undefined, empty.token)).status, 404)
+        await withStrangerSeller(async (strangerToken) => {
+            assert.equal((await request("GET", `/seller/pre-orders/${preOrder.id}`, undefined, strangerToken)).status, 404)
+            assert.equal((await request("POST", `/seller/pre-orders/${preOrder.id}/approve`, {}, strangerToken)).status, 404)
+        })
+        assert.equal((await request("POST", `/seller/pre-orders/${preOrder.id}/approve`, {}, fixture.token)).status, 403)
+
+        // Declining needs a reason, and the buyer can then ask again.
+        assert.equal((await request("POST", `/seller/pre-orders/${preOrder.id}/decline`, {}, fixture.sellerToken)).status, 400)
+        const declined = await request("POST", `/seller/pre-orders/${preOrder.id}/decline`, { note: "We are closed that day" }, fixture.sellerToken)
+        assert.equal(declined.status, 200)
+        assert.equal(declined.body.preOrder.status, "DECLINED")
+        assert.equal((await request("POST", `/seller/pre-orders/${preOrder.id}/approve`, {}, fixture.sellerToken)).status, 409)
+        await waitForNotifications()
+        assert.ok(emailsTo(buyer).some((mail) => mail.subject === "preorder-flow Shop could not take your pre-order" && /closed that day/.test(mail.text)))
+
+        const second = (await askForPreOrder(context, { readyAt })).body.preOrder
+        const approved = await request("POST", `/seller/pre-orders/${second.id}/approve`, { note: "See you then" }, fixture.sellerToken)
+        assert.equal(approved.status, 200)
+        assert.equal(approved.body.preOrder.status, "APPROVED")
+        const payWithin = (new Date(approved.body.preOrder.payBy).getTime() - Date.now()) / 3_600_000
+        assert.ok(payWithin > 23.9 && payWithin <= 24)
+        await waitForNotifications()
+        assert.ok(emailsTo(buyer).some((mail) => mail.subject === "preorder-flow Shop approved your pre-order" && /See you then/.test(mail.text)))
+
+        // The buyer sees the approval, and checkout now accepts it.
+        const reviewed = (await request("GET", "/checkout/preview")).body.sellers[0].preOrder
+        assert.equal(reviewed.required, true)
+        assert.equal(reviewed.approved.id, second.id)
+        assert.equal(new Date(reviewed.approved.readyAt).getTime(), new Date(readyAt).getTime())
+        assert.equal((await checkoutFromCart(context)).body.code, "CHECKOUT_PREORDER_REQUIRED")
+        assert.equal((await checkoutFromCart(context, [second.id + 999])).body.code, "CHECKOUT_PREORDER_INVALID")
+        assert.equal((await context.request("POST", "/checkout", { delivery: fixtureDelivery, preOrderIds: ["x"] })).status, 400)
+        const created = await checkoutFromCart(context, [second.id])
+        assert.equal(created.status, 201)
+        assert.equal(created.body.orders[0].fulfilmentType, "PRE_ORDER")
+        assert.equal(new Date(created.body.orders[0].readyAt).getTime(), new Date(readyAt).getTime())
+        // Asking again with the same choice reuses the checkout.
+        assert.equal((await checkoutFromCart(context, [second.id])).body.code, "CHECKOUT_REUSED")
+
+        // Paying uses the approval up, and the order carries the ready time for both sides.
+        const orderId = await payCheckout(context, created.body.checkout.id)
+        assert.equal((await prisma.preOrderRequest.findUniqueOrThrow({ where: { id: second.id } })).status, "USED")
+        const order = await prisma.order.findUniqueOrThrow({ where: { id: orderId } })
+        assert.equal(order.fulfilmentType, "PRE_ORDER")
+        assert.equal(order.readyAt?.getTime(), new Date(readyAt).getTime())
+        assert.equal(order.preOrderRequestId, second.id)
+        const buyerOrder = (await request("GET", `/orders/${created.body.checkout.id}`)).body.sellerOrders[0]
+        assert.equal(buyerOrder.fulfilmentType, "PRE_ORDER")
+        assert.equal(new Date(buyerOrder.readyAt).getTime(), new Date(readyAt).getTime())
+        const sellerOrder = (await request("GET", `/seller/orders/${orderId}`, undefined, fixture.sellerToken)).body
+        assert.equal(sellerOrder.fulfilmentType, "PRE_ORDER")
+        assert.equal((await request("GET", `/admin/orders/${orderId}`, undefined, context.adminToken)).body.order.fulfilmentType, "PRE_ORDER")
+        await waitForNotifications()
+        assert.ok(emailsTo(buyer).some((mail) => /Pre-order, to be ready/.test(mail.text)))
+        assert.ok(emailsTo(seller).some((mail) => /pre-order you approved/.test(mail.text)))
+        assert.ok(checkoutId)
+    })
+})
+
+test("an approval is only good for exactly what was approved, and lapses", async () => {
+    await withPaymentCheckout("preorder-changes", async (context) => {
+        const { fixture, request } = context
+        await makeFoodShop(context, "PRE_ORDER")
+        const approvedRequest = async () => {
+            const asked = (await askForPreOrder(context)).body.preOrder
+            await request("POST", `/seller/pre-orders/${asked.id}/approve`, {}, fixture.sellerToken)
+            return asked.id as number
+        }
+
+        // A changed cart no longer matches.
+        let id = await approvedRequest()
+        assert.equal((await request("GET", "/checkout/preview")).body.sellers[0].preOrder.approved.id, id)
+        await prisma.cartItem.updateMany({ where: { cart: { userId: fixture.consumerId } }, data: { quantity: 1 } })
+        assert.equal((await request("GET", "/checkout/preview")).body.sellers[0].preOrder.approved, null)
+        assert.equal((await checkoutFromCart(context, [id])).body.code, "CHECKOUT_PREORDER_INVALID")
+        await prisma.cartItem.updateMany({ where: { cart: { userId: fixture.consumerId } }, data: { quantity: 2 } })
+
+        // So does a changed price.
+        await prisma.listing.update({ where: { id: fixture.listingId }, data: { price: 1600 } })
+        assert.equal((await checkoutFromCart(context, [id])).body.code, "CHECKOUT_PREORDER_INVALID")
+        await prisma.listing.update({ where: { id: fixture.listingId }, data: { price: 1500 } })
+        assert.equal((await checkoutFromCart(context, [id])).status, 201)
+
+        // A buyer can cancel, and only their own.
+        assert.equal((await request("POST", `/pre-orders/${id}/cancel`, {}, (await fixture.addConsumer(1)).token)).status, 404)
+        const cancelled = await request("POST", `/pre-orders/${id}/cancel`, {})
+        assert.equal(cancelled.status, 200)
+        assert.equal(cancelled.body.preOrder.status, "CANCELLED")
+        assert.equal((await request("POST", `/pre-orders/${id}/cancel`, {})).status, 409)
+        assert.equal((await checkoutFromCart(context, [id])).body.code, "CHECKOUT_PREORDER_INVALID")
+
+        // An approval the buyer never pays for lapses, and so does a request the seller never answers.
+        id = await approvedRequest()
+        await prisma.preOrderRequest.update({ where: { id }, data: { payBy: new Date(Date.now() - 1000) } })
+        assert.equal(await expirePreOrders(), 1)
+        const unanswered = (await askForPreOrder(context, { readyAt: inHours(72) }))
+        assert.equal(unanswered.status, 201)
+        await prisma.preOrderRequest.update({ where: { id: unanswered.body.preOrder.id }, data: { respondBy: new Date(Date.now() - 1000) } })
+        assert.equal(await expirePreOrders(), 1)
+        assert.equal(await expirePreOrders(), 0)
+        await waitForNotifications()
+        const buyer = (await prisma.user.findUniqueOrThrow({ where: { id: fixture.consumerId } })).email
+        assert.ok(emailsTo(buyer).some((mail) => mail.subject === "Your pre-order approval has lapsed"))
+        assert.ok(emailsTo(buyer).some((mail) => mail.subject === "preorder-changes Shop did not answer your pre-order"))
+        assert.equal((await request("POST", `/seller/pre-orders/${unanswered.body.preOrder.id}/approve`, {}, fixture.sellerToken)).status, 409)
+        assert.equal((await request("GET", "/seller/pre-orders/awaiting-answer", undefined, fixture.sellerToken)).body.count, 0)
+
+        // The seller cannot approve a time that is too close or has passed.
+        const soon = (await askForPreOrder(context, { readyAt: inHours(7) })).body.preOrder
+        await prisma.preOrderRequest.update({ where: { id: soon.id }, data: { readyAt: new Date(Date.now() + 30 * 60 * 1000) } })
+        const tooLate = await request("POST", `/seller/pre-orders/${soon.id}/approve`, {}, fixture.sellerToken)
+        assert.equal(tooLate.status, 409)
+        assert.equal(tooLate.body.code, "PREORDER_TIME_INVALID")
+    })
+})
+
+test("a shop that takes both lets the buyer choose, and a shop that stops taking pre-orders cannot be paid as one", async () => {
+    await withPaymentCheckout("preorder-both", async (context) => {
+        const { fixture, request } = context
+        await makeFoodShop(context, "BOTH")
+
+        // Without a request it is an ordinary order, ready now.
+        const preview = (await request("GET", "/checkout/preview")).body.sellers[0]
+        assert.equal(preview.orderType, "BOTH")
+        assert.deepEqual(preview.preOrder, { required: false, approved: null })
+        const now = await checkoutFromCart(context)
+        assert.ok([200, 201].includes(now.status))
+        assert.equal(now.body.orders[0].fulfilmentType, "NOW")
+        assert.equal(now.body.orders[0].readyAt, null)
+
+        // With an approved request and its id, it is a pre-order, and the earlier checkout is replaced.
+        const asked = (await askForPreOrder(context)).body.preOrder
+        await request("POST", `/seller/pre-orders/${asked.id}/approve`, {}, fixture.sellerToken)
+        const planned = await checkoutFromCart(context, [asked.id])
+        assert.equal(planned.status, 201)
+        assert.equal(planned.body.orders[0].fulfilmentType, "PRE_ORDER")
+        // ...and leaving the id out brings back the ordinary one.
+        const plain = await checkoutFromCart(context)
+        assert.equal(plain.body.orders[0].fulfilmentType, "NOW")
+
+        // A shop that stops taking pre-orders cannot be paid for as one.
+        await request("PATCH" as "GET", "/seller/profile", { foodOrderType: "NOW" }, fixture.sellerToken)
+        const refused = await checkoutFromCart(context, [asked.id])
+        assert.equal(refused.status, 409)
+        assert.equal(refused.body.code, "CHECKOUT_PREORDER_NOT_AVAILABLE")
+        assert.equal((await askForPreOrder(context)).body.code, "PREORDER_NOT_AVAILABLE")
+    })
+})
+
+test("a pre-order's complaint periods count from the ready time, not from payment", async () => {
+    await withPaymentCheckout("preorder-clocks", async (context) => {
+        const { fixture, request } = context
+        await makeFoodShop(context, "PRE_ORDER")
+        const asked = (await askForPreOrder(context, { readyAt: inHours(24 * 10) })).body.preOrder
+        await request("POST", `/seller/pre-orders/${asked.id}/approve`, {}, fixture.sellerToken)
+        const created = await checkoutFromCart(context, [asked.id])
+        const orderId = await payCheckout(context, created.body.checkout.id)
+        const checkoutId = created.body.checkout.id as number
+        const day = 24 * 60 * 60 * 1000
+        const complain = (body: Record<string, unknown>) => request("POST", `/orders/${checkoutId}/seller-orders/${orderId}/disputes`, {
+            reason: "NOT_RECEIVED", message: "Nothing has arrived at my address yet.", ...body
+        })
+
+        // Paid 20 days ago and still not shipped: an ordinary order could be reported by now, but this one is not due for 10 more days.
+        await backdatePayment(checkoutId, 20)
+        const early = await complain({})
+        assert.equal(early.status, 409)
+        assert.equal(early.body.code, "DISPUTE_NOT_ALLOWED")
+        assert.match(early.body.message, /agreed ready time/)
+
+        // The ready time has passed by 3 days: still not 7 days late.
+        await prisma.order.update({ where: { id: orderId }, data: { readyAt: new Date(Date.now() - 3 * day) } })
+        assert.equal((await complain({})).status, 409)
+
+        // 8 days after the ready time and still not shipped: it can be reported.
+        await prisma.order.update({ where: { id: orderId }, data: { readyAt: new Date(Date.now() - 8 * day) } })
+        const late = await complain({})
+        assert.equal(late.status, 201)
+        await request("POST", `/disputes/${late.body.dispute.id}/withdraw`, {})
+
+        // The 30-day window counts from the ready time too: paid 40 days ago, due 5 days ago, so there is time left.
+        await shipPaidOrder(context, orderId)
+        await backdatePayment(checkoutId, 40)
+        await prisma.order.update({ where: { id: orderId }, data: { readyAt: new Date(Date.now() - 5 * day) } })
+        assert.equal((await complain({ reason: "DAMAGED", message: "The food arrived spoiled and cold." })).status, 201)
+    })
+    await withPaymentCheckout("preorder-clocks-late", async (context) => {
+        const { fixture, request } = context
+        await makeFoodShop(context, "PRE_ORDER")
+        const asked = (await askForPreOrder(context)).body.preOrder
+        await request("POST", `/seller/pre-orders/${asked.id}/approve`, {}, fixture.sellerToken)
+        const created = await checkoutFromCart(context, [asked.id])
+        const orderId = await payCheckout(context, created.body.checkout.id)
+        await shipPaidOrder(context, orderId)
+        const day = 24 * 60 * 60 * 1000
+
+        // Due 40 days ago: the window has closed.
+        await backdatePayment(created.body.checkout.id, 45)
+        await prisma.order.update({ where: { id: orderId }, data: { readyAt: new Date(Date.now() - 40 * day) } })
+        const closed = await request("POST", `/orders/${created.body.checkout.id}/seller-orders/${orderId}/disputes`, {
+            reason: "DAMAGED", message: "The food arrived spoiled and cold."
+        })
+        assert.equal(closed.status, 409)
+        assert.match(closed.body.message, /30-day period/)
+    })
+})
+
+// ---- Listing pages ----
+
+test("the public listings come a page at a time, newest first", async () => {
+    const fixture = await createCheckoutLifecycleFixture("listing-pages", 5, 1)
+    const marker = `pagetest-${randomUUID()}`
+
+    try {
+        // 26 listings with distinct creation times, oldest first in the loop.
+        const start = Date.now() - 60_000
+        await prisma.listing.createMany({
+            data: Array.from({ length: 26 }, (_, index) => ({
+                title: `${marker} item ${String(index).padStart(2, "0")}`,
+                description: "A listing for the page test",
+                price: 1000,
+                stockQuantity: 1,
+                category: "Electronics",
+                imageUrl: "https://example.test/page.png",
+                userId: fixture.sellerId,
+                createdAt: new Date(start + index * 1000)
+            }))
+        })
+        const get = async (query: string) => {
+            const response = await fetch(`${fixture.baseUrl}/listings?${query}`)
+            return { status: response.status, body: await response.json() as { page: number; pageSize: number; total: number; listings: Array<{ title: string }> } }
+        }
+
+        const first = await get(`search=${marker}`)
+        assert.equal(first.status, 200)
+        assert.deepEqual([first.body.page, first.body.pageSize, first.body.total, first.body.listings.length], [1, 24, 26, 24])
+        // Newest first: item 25 leads, and the page ends at item 02.
+        assert.match(first.body.listings[0]!.title, /item 25$/)
+        assert.match(first.body.listings[23]!.title, /item 02$/)
+
+        const second = await get(`search=${marker}&page=2`)
+        assert.deepEqual(second.body.listings.map((listing) => listing.title.slice(-7)), ["item 01", "item 00"])
+        assert.equal((await get(`search=${marker}&page=3`)).body.listings.length, 0)
+
+        // The same order every time, and filters still apply.
+        assert.deepEqual((await get(`search=${marker}`)).body.listings.map((listing) => listing.title), first.body.listings.map((listing) => listing.title))
+        assert.equal((await get(`search=${marker}&category=Pet%20Supplies`)).body.total, 0)
+        assert.equal((await get(`search=${marker}&category=electronics`)).body.total, 26)
+
+        for (const query of ["page=0", "page=-1", "page=1.5", "page=abc", "page=1&page=2"]) {
+            assert.equal((await get(query)).status, 400, query)
+        }
+    } finally {
+        await prisma.listing.deleteMany({ where: { userId: fixture.sellerId, id: { not: fixture.listingId } } })
+        await fixture.cleanup()
+    }
+})
+
+// ---- Appeals and reopening ----
+
+test("a buyer can appeal Vendly's rejection once, within a week, and the second decision is final", async () => {
+    await withPaymentCheckout("dispute-appeal", async (context) => {
+        const { fixture, request, adminToken } = context
+        const seller = (await prisma.user.findUniqueOrThrow({ where: { id: fixture.sellerId } })).email
+        const orderId = await payAndShip(context)
+        const id = (await complain(context, orderId)).body.dispute.id as number
+        const appeal = (body: unknown, token = fixture.token) => request("POST", `/disputes/${id}/appeal`, body, token)
+        const appealText = { message: "I have a new photo that clearly shows the crack.", evidenceUrls: ["https://images.example.test/crack-2.jpg"] }
+
+        // Nothing to appeal while it is still open.
+        assert.equal((await request("GET", `/disputes/${id}`)).body.dispute.appeal.canAppeal, false)
+        const early = await appeal(appealText)
+        assert.equal(early.status, 409)
+        assert.equal(early.body.code, "DISPUTE_NOT_APPEALABLE")
+
+        await request("POST", `/admin/disputes/${id}/reject`, { note: "The first photos do not show any damage." }, adminToken)
+        const rejected = (await request("GET", `/disputes/${id}`)).body.dispute
+        assert.equal(rejected.status, "RESOLVED")
+        assert.equal(rejected.appeal.canAppeal, true)
+        assert.equal(rejected.appeal.appealed, false)
+        const daysLeft = (new Date(rejected.appeal.deadline).getTime() - Date.now()) / 86_400_000
+        assert.ok(daysLeft > 6.9 && daysLeft <= 7)
+
+        // Who can appeal, and what is checked.
+        assert.equal((await appeal({ message: "short" })).status, 400)
+        assert.equal((await appeal({ message: "A long enough message.", evidenceUrls: ["http://not-https.example.test/a.jpg"] })).status, 400)
+        assert.equal((await appeal(appealText, (await fixture.addConsumer(1)).token)).status, 404)
+        assert.equal((await appeal(appealText, fixture.sellerToken)).status, 403)
+        assert.equal((await request("POST", "/disputes/999999/appeal", appealText)).status, 404)
+
+        const appealed = await appeal(appealText)
+        assert.equal(appealed.status, 201)
+        const dispute = appealed.body.dispute
+        assert.equal(dispute.status, "UNDER_REVIEW")
+        assert.equal(dispute.outcome, null)
+        assert.equal(dispute.decisionNote, null)
+        assert.equal(dispute.appeal.appealed, true)
+        assert.equal(dispute.appeal.canAppeal, false)
+        const last = dispute.messages.at(-1)
+        assert.equal(last.author, "BUYER")
+        assert.match(last.body, /^Appeal: I have a new photo/)
+        assert.deepEqual(last.evidenceUrls, ["https://images.example.test/crack-2.jpg"])
+        await waitForNotifications()
+        assert.ok(emailsTo(seller).some((mail) => /New message about the complaint/.test(mail.subject) && /Appeal: I have a new photo/.test(mail.text)))
+
+        // It is back in the administrators' queue, and appealing again is refused.
+        assert.equal((await request("GET", "/admin/disputes", undefined, adminToken)).body.disputes.some((item: { id: number }) => item.id === id), true)
+        const twice = await appeal(appealText)
+        assert.equal(twice.status, 409)
+        assert.match(twice.body.message, /Only a complaint that Vendly rejected/)
+
+        // The second rejection is final for the buyer.
+        await request("POST", `/admin/disputes/${id}/reject`, { note: "We looked again and the decision stands." }, adminToken)
+        const final = (await request("GET", `/disputes/${id}`)).body.dispute
+        assert.equal(final.status, "RESOLVED")
+        assert.equal(final.outcome, "REJECTED")
+        assert.equal(final.appeal.canAppeal, false)
+        assert.equal(final.appeal.appealed, true)
+        const afterFinal = await appeal(appealText)
+        assert.equal(afterFinal.status, 409)
+        assert.match(afterFinal.body.message, /already appealed/)
+        assert.equal((await complain(context, orderId)).body.code, "DISPUTE_ALREADY_DECIDED")
+    })
+
+    // An appeal that succeeds ends in a refund like any complaint.
+    await withPaymentCheckout("dispute-appeal-approved", async (context) => {
+        const { request, adminToken } = context
+        const orderId = await payAndShip(context)
+        const id = (await complain(context, orderId)).body.dispute.id as number
+        await request("POST", `/admin/disputes/${id}/reject`, { note: "Not enough evidence to approve this." }, adminToken)
+        await request("POST", `/disputes/${id}/appeal`, { message: "Here is a video of the problem, please look." })
+        const approved = await request("POST", `/admin/disputes/${id}/approve`, { note: "The video settles it, so we refund." }, adminToken)
+        assert.equal(approved.status, 201)
+        assert.equal(approved.body.dispute.outcome, "REFUNDED")
+        assert.equal(approved.body.dispute.appeal.appealed, true)
+    })
+
+    // The week is up.
+    await withPaymentCheckout("dispute-appeal-late", async (context) => {
+        const { request, adminToken } = context
+        const orderId = await payAndShip(context)
+        const id = (await complain(context, orderId)).body.dispute.id as number
+        await request("POST", `/admin/disputes/${id}/reject`, { note: "Not enough evidence to approve this." }, adminToken)
+        await prisma.dispute.update({ where: { id }, data: { resolvedAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000) } })
+        const late = await request("POST", `/disputes/${id}/appeal`, { message: "I only just found the photo again." })
+        assert.equal(late.status, 409)
+        assert.match(late.body.message, /7-day period to appeal/)
+        assert.equal((await request("GET", `/disputes/${id}`)).body.dispute.appeal.canAppeal, false)
+    })
+})
+
+test("an administrator can reopen a rejected complaint, but not one that ended in a refund", async () => {
+    await withPaymentCheckout("dispute-reopen", async (context) => {
+        const { fixture, request, adminToken } = context
+        const { buyer, seller } = await addressesOf(fixture)
+        const orderId = await payAndShip(context)
+        const id = (await complain(context, orderId)).body.dispute.id as number
+        const reopen = (body: unknown, token = adminToken) => request("POST", `/admin/disputes/${id}/reopen`, body, token)
+
+        // Only a rejected complaint can be reopened, and only by an administrator, with a note.
+        assert.equal((await reopen({ note: "Reopening this one for another look." })).status, 409)
+        await request("POST", `/admin/disputes/${id}/reject`, { note: "The photos do not show any damage." }, adminToken)
+        assert.equal((await reopen({ note: "Reopening this one for another look." }, fixture.token)).status, 403)
+        assert.equal((await reopen({})).status, 400)
+        assert.equal((await reopen({ note: "short" })).status, 400)
+        assert.equal((await request("POST", "/admin/disputes/999999/reopen", { note: "Reopening this one for another look." }, adminToken)).status, 404)
+
+        const reopened = await reopen({ note: "The courier has sent us a damage report." })
+        assert.equal(reopened.status, 200)
+        const dispute = reopened.body.dispute
+        assert.equal(dispute.status, "UNDER_REVIEW")
+        assert.equal(dispute.outcome, null)
+        assert.equal(dispute.decisionNote, null)
+        const last = dispute.messages.at(-1)
+        assert.equal(last.author, "ADMIN")
+        assert.match(last.body, /^Vendly reopened this complaint: The courier has sent us a damage report\./)
+        // Reopening is not the buyer's appeal, so the buyer's one appeal is still there for later.
+        assert.equal(dispute.appeal.appealed, false)
+        await waitForNotifications()
+        for (const address of [buyer, seller]) {
+            assert.ok(emailsTo(address).some((mail) => /Vendly wrote in the complaint/.test(mail.subject) && /reopened this complaint/.test(mail.text)), address)
+        }
+        assert.equal((await reopen({ note: "Reopening an open one again." })).status, 409)
+
+        // It can be decided again, and a refund cannot be reopened.
+        const approved = await request("POST", `/admin/disputes/${id}/approve`, { note: "The damage report settles it." }, adminToken)
+        assert.equal(approved.status, 201)
+        const refunded = await reopen({ note: "Trying to reopen a refunded one." })
+        assert.equal(refunded.status, 409)
+        assert.equal(refunded.body.code, "DISPUTE_NOT_REOPENABLE")
+    })
 })

@@ -4,6 +4,7 @@ import prisma from "../lib/prisma.js"
 import { Prisma } from "../generated/prisma/client.js"
 import { buildLocation } from "../lib/nigeriaLocation.js"
 import { heldReservationConditions } from "../lib/inventoryReservations.js"
+import { snapshotMatches } from "../lib/preOrders.js"
 
 const checkoutListingSelect = {
     id: true,
@@ -21,7 +22,8 @@ const checkoutListingSelect = {
                     businessName: true,
                     slug: true,
                     shippingPolicy: true,
-                    shippingCost: true
+                    shippingCost: true,
+                    foodOrderType: true
                 }
             }
         }
@@ -57,10 +59,14 @@ type SellerPreview = {
         businessName: string
         slug: string
     }
+    foodOrderType: "NOW" | "PRE_ORDER" | "BOTH"
     items: PreviewItem[]
     subtotal: Prisma.Decimal
     shipping: Prisma.Decimal
 }
+
+// A pre-order the seller approved, still payable, for exactly what is in the cart from that seller.
+type ApprovedPreOrder = { id: number; readyAt: Date; payBy: Date | null }
 
 type DeliveryInput = {
     fullName: string
@@ -75,6 +81,10 @@ type CheckoutReview = {
     reviewToken: string
     sellers: Array<{
         seller: SellerPreview["seller"]
+        // How this shop takes orders, and for a shop that takes pre-orders whether one is needed and whether an
+        // approved request exists for what is in the cart. Send the approved request's id in preOrderIds to use it.
+        orderType: SellerPreview["foodOrderType"]
+        preOrder: { required: boolean; approved: { id: number; readyAt: Date; payBy: Date | null } | null }
         items: PreviewItem[]
         subtotal: string
         shipping: string
@@ -90,6 +100,9 @@ type CheckoutErrorCode =
     | "CHECKOUT_LOCKED"
     | "CHECKOUT_REVIEW_REQUIRED"
     | "CHECKOUT_ITEMS_UNAVAILABLE"
+    | "CHECKOUT_PREORDER_REQUIRED"
+    | "CHECKOUT_PREORDER_INVALID"
+    | "CHECKOUT_PREORDER_NOT_AVAILABLE"
 
 class CheckoutRequestError extends Error {
     constructor(
@@ -122,6 +135,8 @@ const maximumCheckoutAmount = new Prisma.Decimal("9999999999.99")
 type CheckoutRequest = {
     delivery: DeliveryInput
     reviewToken: string | null
+    // Approved pre-order requests to pay for in this checkout, one per food shop at most.
+    preOrderIds: number[]
 }
 
 function formatMoney(amount: Prisma.Decimal): string {
@@ -168,7 +183,8 @@ function createReviewToken(
 
 function buildCheckoutReview(
     userId: number,
-    sellers: SellerPreview[]
+    sellers: SellerPreview[],
+    approvals: Map<number, ApprovedPreOrder> = new Map()
 ): CheckoutReview {
     const sortedSellers = [...sellers].sort((left, right) => left.sellerId - right.sellerId)
     const sellerGroups = sortedSellers.map((seller) => {
@@ -176,6 +192,8 @@ function buildCheckoutReview(
 
         return {
             seller: seller.seller,
+            orderType: seller.foodOrderType,
+            preOrder: { required: seller.foodOrderType === "PRE_ORDER", approved: approvals.get(seller.sellerId) ?? null },
             items: [...seller.items].sort((left, right) => left.listingId - right.listingId),
             subtotal: formatMoney(seller.subtotal),
             shipping: formatMoney(seller.shipping),
@@ -289,6 +307,7 @@ function priceCheckoutItems(
                     businessName: sellerProfile.businessName,
                     slug: sellerProfile.slug
                 },
+                foodOrderType: sellerProfile.foodOrderType,
                 items: [],
                 subtotal: new Prisma.Decimal(0),
                 shipping
@@ -337,6 +356,76 @@ function priceCheckoutItems(
     }
 
     return { sellerPreviews, subtotal, shipping, total }
+}
+
+// The pre-orders the buyer could pay for right now: approved, not lapsed, the time still ahead, and for exactly what
+// is in the cart from that seller at today's prices. Keyed by seller.
+async function findApprovedPreOrders(
+    client: Prisma.TransactionClient | typeof prisma,
+    userId: number,
+    sellerPreviews: SellerPreview[],
+    now: Date
+): Promise<Map<number, ApprovedPreOrder>> {
+    const candidates = await client.preOrderRequest.findMany({
+        where: {
+            buyerId: userId,
+            sellerId: { in: sellerPreviews.map((seller) => seller.sellerId) },
+            status: "APPROVED",
+            payBy: { gt: now },
+            readyAt: { gt: now }
+        },
+        orderBy: { id: "desc" }
+    })
+    const approvals = new Map<number, ApprovedPreOrder>()
+
+    for (const seller of sellerPreviews) {
+        const current = seller.items.map((item) => ({ listingId: item.listingId, quantity: item.quantity, unitPrice: item.unitPrice }))
+        const match = candidates.find((candidate) => candidate.sellerId === seller.sellerId && snapshotMatches(candidate.items, current))
+
+        if (match) {
+            approvals.set(seller.sellerId, { id: match.id, readyAt: match.readyAt, payBy: match.payBy })
+        }
+    }
+
+    return approvals
+}
+
+// Decides which sellers' orders are pre-orders. A shop that only takes pre-orders needs an approved request for the
+// cart; a shop that takes both uses one only if the buyer sends its id; any other shop cannot have one.
+function choosePreOrders(sellerPreviews: SellerPreview[], approvals: Map<number, ApprovedPreOrder>, requestedIds: number[]): Map<number, ApprovedPreOrder> {
+    const chosen = new Map<number, ApprovedPreOrder>()
+
+    for (const id of requestedIds) {
+        const entry = [...approvals.entries()].find(([, approval]) => approval.id === id)
+
+        if (!entry) {
+            throw new CheckoutRequestError(
+                409,
+                "That pre-order approval can no longer be used: it has lapsed, or your cart has changed since the seller approved it",
+                "CHECKOUT_PREORDER_INVALID",
+                { preOrderId: id }
+            )
+        }
+
+        chosen.set(entry[0], entry[1])
+    }
+
+    for (const seller of sellerPreviews) {
+        if (seller.foodOrderType === "NOW" && chosen.has(seller.sellerId)) {
+            throw new CheckoutRequestError(409, `${seller.seller.businessName} no longer takes pre-orders`, "CHECKOUT_PREORDER_NOT_AVAILABLE", { seller: seller.seller })
+        }
+
+        if (seller.foodOrderType === "PRE_ORDER" && !chosen.has(seller.sellerId)) {
+            throw new CheckoutRequestError(
+                409,
+                `${seller.seller.businessName} only takes pre-orders. Ask for a time and wait for the seller to approve it.`,
+                "CHECKOUT_PREORDER_REQUIRED",
+                { seller: seller.seller }
+            )
+        }
+    }
+
+    return chosen
 }
 
 function deliveryMatchesCheckout(delivery: DeliveryInput, checkout: {
@@ -438,7 +527,7 @@ function parseCheckoutRequest(body: unknown): CheckoutRequest | null {
         !body ||
         typeof body !== "object" ||
         Array.isArray(body) ||
-        Object.keys(body).some((field) => field !== "delivery" && field !== "reviewToken") ||
+        Object.keys(body).some((field) => field !== "delivery" && field !== "reviewToken" && field !== "preOrderIds") ||
         !("delivery" in body)
     ) {
         return null
@@ -466,7 +555,11 @@ function parseCheckoutRequest(body: unknown): CheckoutRequest | null {
         typeof deliveryFields.lga !== "string" ||
         (deliveryFields.instructions !== undefined && typeof deliveryFields.instructions !== "string") ||
         (fields.reviewToken !== undefined &&
-            (typeof fields.reviewToken !== "string" || !/^[a-f0-9]{64}$/.test(fields.reviewToken)))
+            (typeof fields.reviewToken !== "string" || !/^[a-f0-9]{64}$/.test(fields.reviewToken))) ||
+        (fields.preOrderIds !== undefined &&
+            (!Array.isArray(fields.preOrderIds) ||
+                fields.preOrderIds.length > 20 ||
+                !fields.preOrderIds.every((id) => Number.isSafeInteger(id) && id > 0)))
     ) {
         return null
     }
@@ -489,7 +582,8 @@ function parseCheckoutRequest(body: unknown): CheckoutRequest | null {
                 ? deliveryFields.instructions.trim()
                 : null
         },
-        reviewToken: typeof fields.reviewToken === "string" ? fields.reviewToken : null
+        reviewToken: typeof fields.reviewToken === "string" ? fields.reviewToken : null,
+        preOrderIds: Array.isArray(fields.preOrderIds) ? [...new Set(fields.preOrderIds as number[])] : []
     }
 }
 
@@ -510,7 +604,7 @@ export async function createCheckout(req: Request, res: Response) {
         return
     }
 
-    const { delivery, reviewToken } = checkoutRequest
+    const { delivery, reviewToken, preOrderIds } = checkoutRequest
 
     try {
         await expireExpiredCheckouts(userId)
@@ -615,7 +709,10 @@ export async function createCheckout(req: Request, res: Response) {
                 reservedQuantities
             )
 
-            const review = buildCheckoutReview(userId, sellerPreviews)
+            // Food shops that take pre-orders: which of this checkout's orders are pre-orders.
+            const approvals = await findApprovedPreOrders(tx, userId, sellerPreviews, now)
+            const chosenPreOrders = choosePreOrders(sellerPreviews, approvals, preOrderIds)
+            const review = buildCheckoutReview(userId, sellerPreviews, approvals)
             const cartSnapshot = sortCartItems(cart.cartItems)
             const hasSameCart = (checkout: typeof existingCheckouts[number]) => {
                 const savedItems = sortCartItems(checkout.checkoutItems)
@@ -670,8 +767,12 @@ export async function createCheckout(req: Request, res: Response) {
                 checkout.orders.length === 0 ||
                 checkout.orders.some((order) => order.status !== "PENDING_PAYMENT")
 
+            const hasSamePreOrders = (checkout: typeof existingCheckouts[number]) =>
+                checkout.orders.every((order) => (order.preOrderRequestId ?? null) === (chosenPreOrders.get(order.sellerId)?.id ?? null))
+
             const reusableCheckout = existingCheckouts.find((checkout) =>
                 hasSameCart(checkout) &&
+                hasSamePreOrders(checkout) &&
                 deliveryMatchesCheckout(delivery, checkout) &&
                 hasSamePricesAndShipping(checkout) &&
                 reservationsMatch(checkout) &&
@@ -751,6 +852,8 @@ export async function createCheckout(req: Request, res: Response) {
                                 }
                                 : null,
                             status: order.status,
+                            fulfilmentType: order.fulfilmentType,
+                            readyAt: order.readyAt,
                             subtotal: formatMoney(order.subtotal),
                             shipping: formatMoney(order.shippingCost),
                             total: formatMoney(order.total),
@@ -841,11 +944,15 @@ export async function createCheckout(req: Request, res: Response) {
 
             for (const seller of sellerPreviews) {
                 const orderTotal = seller.subtotal.plus(seller.shipping)
+                const preOrder = chosenPreOrders.get(seller.sellerId)
                 const order = await tx.order.create({
                     data: {
                         checkoutId: checkout.id,
                         sellerId: seller.sellerId,
                         status: "PENDING_PAYMENT",
+                        fulfilmentType: preOrder ? "PRE_ORDER" : "NOW",
+                        readyAt: preOrder?.readyAt ?? null,
+                        preOrderRequestId: preOrder?.id ?? null,
                         subtotal: seller.subtotal,
                         shippingCost: seller.shipping,
                         total: orderTotal,
@@ -876,6 +983,8 @@ export async function createCheckout(req: Request, res: Response) {
                     sellerId: seller.sellerId,
                     seller: seller.seller,
                     status: "PENDING_PAYMENT" as const,
+                    fulfilmentType: preOrder ? "PRE_ORDER" as const : "NOW" as const,
+                    readyAt: preOrder?.readyAt ?? null,
                     subtotal: formatMoney(seller.subtotal),
                     shipping: formatMoney(seller.shipping),
                     total: formatMoney(orderTotal)
@@ -1011,8 +1120,9 @@ export async function getCheckoutPreview(req: Request, res: Response) {
         }
 
         const { sellerPreviews } = priceCheckoutItems(cart.cartItems, reservedQuantities)
+        const approvals = await findApprovedPreOrders(prisma, userId, sellerPreviews, now)
 
-        res.send(buildCheckoutReview(userId, sellerPreviews))
+        res.send(buildCheckoutReview(userId, sellerPreviews, approvals))
     } catch (error) {
         if (error instanceof CheckoutRequestError) {
             sendCheckoutRequestError(error, res)

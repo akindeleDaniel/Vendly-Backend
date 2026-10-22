@@ -4,6 +4,7 @@ import { assertEmailEnvironment } from "./lib/email/config.js"
 import app from "./app.js"
 import prisma from "./lib/prisma.js"
 import { startPaymentChecker } from "./lib/payments/paymentChecker.js"
+import { waitForNotifications } from "./lib/notifications.js"
 
 assertRequiredEnvironment(process.env)
 assertEmailEnvironment(process.env)
@@ -37,6 +38,7 @@ async function shutDown(reason: string, exitCode: number) {
             server.closeIdleConnections()
         })
         await stopPaymentChecker()
+        await waitForNotifications()
         await prisma.$disconnect()
     } catch (error) {
         console.error("Error while shutting down", error instanceof Error ? error.message : undefined)

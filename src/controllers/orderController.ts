@@ -1,6 +1,7 @@
 import type { Request, Response } from "express"
 import prisma from "../lib/prisma.js"
 import type { OrderStatus, Prisma } from "../generated/prisma/client.js"
+import { notifyDeliveryConfirmed, notifyDeliveryReported, notifyShipped, queueNotification } from "../lib/notifications.js"
 
 const pageSize = 20
 const maximumShippingNoteLength = 200
@@ -37,12 +38,17 @@ function toDeliveryResponse(order: { deliveryName: string; deliveryPhone: string
 // Where an order is in fulfilment. An order is only DELIVERED once the buyer confirms; while the
 // seller has reported delivery but the buyer has not confirmed, the status is still SHIPPED and
 // deliveryReportedAt is set.
-function toFulfilmentResponse(order: { shippedAt: Date | null; shippingNote: string | null; deliveryReportedAt: Date | null; deliveryConfirmedAt: Date | null }) {
+function toFulfilmentResponse(order: { shippedAt: Date | null; shippingNote: string | null; deliveryReportedAt: Date | null; deliveryConfirmedAt: Date | null; deliveryAutoClosedAt: Date | null; fulfilmentType: "NOW" | "PRE_ORDER"; readyAt: Date | null }) {
     return {
+        // NOW, or PRE_ORDER: a food order the seller approved for readyAt.
+        fulfilmentType: order.fulfilmentType,
+        readyAt: order.readyAt,
         shippedAt: order.shippedAt,
         shippingNote: order.shippingNote,
         deliveryReportedAt: order.deliveryReportedAt,
-        deliveryConfirmedAt: order.deliveryConfirmedAt
+        deliveryConfirmedAt: order.deliveryConfirmedAt,
+        // Set when the order was closed as delivered after 7 days without an answer from the buyer.
+        deliveryAutoClosedAt: order.deliveryAutoClosedAt
     }
 }
 
@@ -165,6 +171,9 @@ export const listMyOrders = async (req: Request, res: Response) => {
                         shippingNote: true,
                         deliveryReportedAt: true,
                         deliveryConfirmedAt: true,
+                        deliveryAutoClosedAt: true,
+                        fulfilmentType: true,
+                        readyAt: true,
                         refundedAmount: true,
                         refunds: customerRefundSelect,
                         disputes: latestDisputeSelect,
@@ -307,10 +316,14 @@ export const confirmOrderDelivery = async (req: Request, res: Response) => {
             return
         }
 
-        await prisma.order.updateMany({
+        const confirmed = await prisma.order.updateMany({
             where: { id: orderId, status: "SHIPPED", deliveryReportedAt: { not: null } },
             data: { status: "DELIVERED", deliveryConfirmedAt: new Date() }
         })
+
+        if (confirmed.count === 1) {
+            queueNotification("delivery confirmed", () => notifyDeliveryConfirmed(orderId, "BUYER"))
+        }
     }
 
     const checkout = await findMyOrder(checkoutId, userId)
@@ -326,9 +339,33 @@ function parseSellerStatus(value: unknown): OrderStatus | undefined | null {
 }
 
 // A seller's orders to fulfil, newest first, with the fee the provider took from each one.
+// Which complaints an order list is narrowed to. "awaiting-response" is the ones the seller must answer.
+const complaintFilters = {
+    "awaiting-response": { disputes: { some: { status: "OPEN" } } },
+    active: { disputes: { some: { status: { in: ["OPEN", "SELLER_AGREED", "UNDER_REVIEW"] } } } },
+    any: { disputes: { some: { status: { not: "WITHDRAWN" } } } },
+    none: { disputes: { none: { status: { not: "WITHDRAWN" } } } }
+} as const satisfies Record<string, Prisma.OrderWhereInput>
+
+function parseComplaintFilter(value: unknown): Prisma.OrderWhereInput | undefined | null {
+    if (value === undefined) {
+        return undefined
+    }
+
+    return typeof value === "string" && Object.hasOwn(complaintFilters, value)
+        ? complaintFilters[value as keyof typeof complaintFilters]
+        : null
+}
+
 export const listSellerOrders = async (req: Request, res: Response) => {
     const page = parsePage(req.query.page)
     const status = parseSellerStatus(req.query.status)
+    const complaintFilter = parseComplaintFilter(req.query.complaint)
+
+    if (complaintFilter === null) {
+        res.status(400).send({ message: `Complaint must be one of ${Object.keys(complaintFilters).join(", ")}` })
+        return
+    }
 
     if (page === null) {
         res.status(400).send({ message: "Page must be a positive whole number" })
@@ -342,7 +379,8 @@ export const listSellerOrders = async (req: Request, res: Response) => {
 
     const where: Prisma.OrderWhereInput = {
         sellerId: req.user!.id,
-        status: status ?? { in: sellerVisibleStatuses }
+        status: status ?? { in: sellerVisibleStatuses },
+        ...complaintFilter
     }
     const [total, orders] = await Promise.all([
         prisma.order.count({ where }),
@@ -473,10 +511,14 @@ export const shipSellerOrder = async (req: Request, res: Response) => {
     }
 
     if (order.status === "PAID") {
-        await prisma.order.updateMany({
+        const shipped = await prisma.order.updateMany({
             where: { id, sellerId, status: "PAID" },
             data: { status: "SHIPPED", shippedAt: new Date(), shippingNote: note }
         })
+
+        if (shipped.count === 1) {
+            queueNotification("order shipped", () => notifyShipped(id))
+        }
     }
 
     res.send(toSellerOrderResponse((await findSellerOrder(id, sellerId))!))
@@ -501,17 +543,22 @@ export const reportSellerOrderDelivered = async (req: Request, res: Response) =>
     }
 
     if (order.status === "PAID" || (order.status === "SHIPPED" && !order.deliveryReportedAt)) {
-        await prisma.$transaction(async (tx) => {
+        const reported = await prisma.$transaction(async (tx) => {
             const now = new Date()
             await tx.order.updateMany({
                 where: { id, sellerId, status: "PAID" },
                 data: { status: "SHIPPED", shippedAt: now }
             })
-            await tx.order.updateMany({
+            const result = await tx.order.updateMany({
                 where: { id, sellerId, status: "SHIPPED", deliveryReportedAt: null },
                 data: { deliveryReportedAt: now }
             })
+            return result.count
         })
+
+        if (reported === 1) {
+            queueNotification("delivery reported", () => notifyDeliveryReported(id))
+        }
     }
 
     res.send(toSellerOrderResponse((await findSellerOrder(id, sellerId))!))

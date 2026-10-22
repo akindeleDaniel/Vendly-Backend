@@ -1,6 +1,7 @@
 import { Prisma } from "../../generated/prisma/client.js"
 import { acquireCheckoutCreationLock } from "../../controllers/checkoutController.js"
 import prisma from "../prisma.js"
+import { notifyPaymentSettled, queueNotification } from "../notifications.js"
 import { allocateProportionally, applyRecoveredAmount } from "../liabilities.js"
 import type { SellerShare } from "./types.js"
 
@@ -20,7 +21,14 @@ class SettlementNeedsReview extends Error {}
 export async function settleCheckoutPayment(attemptId: number): Promise<SettlementResult> {
     for (let attempt = 1; ; attempt++) {
         try {
-            return await settleOnce(attemptId)
+            const result = await settleOnce(attemptId)
+
+            // Only the call that actually settled the checkout sends the receipt and the new-order alerts.
+            if (result === "settled") {
+                queueNotification("payment settled", () => notifyPaymentSettled(attemptId))
+            }
+
+            return result
         } catch (error) {
             if (error instanceof SettlementNeedsReview) {
                 await openRecoveryCase(attemptId, error.message)
@@ -73,6 +81,7 @@ async function settleOnce(attemptId: number): Promise<SettlementResult> {
                         status: true,
                         total: true,
                         liabilityDeduction: true,
+                        preOrderRequestId: true,
                         seller: {
                             select: {
                                 sellerProfile: {
@@ -142,6 +151,16 @@ async function settleOnce(attemptId: number): Promise<SettlementResult> {
             where: { checkoutId: checkout.id, status: "PENDING_PAYMENT" },
             data: { status: "PAID" }
         })
+
+        // A pre-order approval is used up by the payment, even if it lapsed while the buyer was paying.
+        const usedRequestIds = checkout.orders.flatMap((order) => order.preOrderRequestId === null ? [] : [order.preOrderRequestId])
+
+        if (usedRequestIds.length > 0) {
+            await tx.preOrderRequest.updateMany({
+                where: { id: { in: usedRequestIds }, status: { in: ["APPROVED", "EXPIRED"] } },
+                data: { status: "USED" }
+            })
+        }
 
         // Record what the provider reported for each seller's share, so sellers see the real fee.
         const shares = Array.isArray(paymentAttempt.sellerShares) ? paymentAttempt.sellerShares as SellerShare[] : []

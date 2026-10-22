@@ -65,3 +65,9 @@ export const complaintLimiter = limiter(60 * minute, 10, userKey("complaint"))
 
 // Starting a checkout or a payment: per user.
 export const paymentStartLimiter = limiter(10 * minute, 30, userKey("payment"))
+
+// Writing reviews, per user.
+export const reviewLimiter = limiter(60 * minute, 20, userKey("review"))
+
+// Asking for pre-orders, per user.
+export const preOrderLimiter = limiter(60 * minute, 15, userKey("pre-order"))

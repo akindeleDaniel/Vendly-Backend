@@ -10,6 +10,8 @@ import paymentRoutes from "./routes/paymentRoutes.js"
 import orderRoutes from "./routes/orderRoutes.js"
 import adminRoutes from "./routes/adminRoutes.js"
 import disputeRoutes from "./routes/disputeRoutes.js"
+import reviewRoutes from "./routes/reviewRoutes.js"
+import preOrderRoutes from "./routes/preOrderRoutes.js"
 import webhookRoutes from "./routes/webhookRoutes.js"
 import { ensureRequestBody, errorHandler, notFoundHandler } from "./middleware/errorHandlers.js"
 import config from "./config.js"
@@ -46,6 +48,8 @@ app.use("/payments", paymentRoutes)
 app.use("/orders", orderRoutes)
 app.use("/admin", adminRoutes)
 app.use("/disputes", disputeRoutes)
+app.use("/reviews", reviewRoutes)
+app.use("/pre-orders", preOrderRoutes)
 app.use(notFoundHandler)
 app.use(errorHandler)
 

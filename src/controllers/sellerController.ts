@@ -8,6 +8,8 @@ import { haversineDistance } from "../lib/distance.js"
 import { getDrivingRouteDistances, getRouteCandidateLimit } from "../lib/routeMatrix.js"
 import { getCanonicalCategory } from "../lib/categories.js"
 import { isHttpsUrl, maximumBusinessNameLength } from "../lib/inputRules.js"
+import { imagesInclude, withImages } from "../lib/listingImages.js"
+import { averageRating } from "../lib/reviews.js"
 
 function hasValidCoordinates<T extends { latitude: number | null; longitude: number | null }>(
     shop: T
@@ -20,6 +22,12 @@ function hasValidCoordinates<T extends { latitude: number | null; longitude: num
         shop.latitude <= 90 &&
         shop.longitude >= -180 &&
         shop.longitude <= 180
+}
+
+// A shop with its star rating as `ratingAverage` (one decimal, null until it has a review) next to `ratingCount`.
+function withShopRating<T extends { ratingCount: number; ratingSum: number }>(shop: T): Omit<T, "ratingSum"> & { ratingAverage: number | null } {
+    const { ratingSum, ...rest } = shop
+    return { ...rest, ratingAverage: averageRating(ratingSum, shop.ratingCount) }
 }
 
 const maximumShippingCost = new Prisma.Decimal("9999999999.99")
@@ -159,14 +167,14 @@ export const getMySellerProfile = async (req: Request, res: Response) => {
             return
         }
 
-        res.send(profile)
+        res.send(withShopRating(profile))
     }catch(error){
         res.status(500).send({message:"Sorry there is an issue on our end"})
     }
 }
 
 export const updateSeller = async(req: Request, res: Response) => {
-    const {businessName, state, lga, logoUrl, shippingPolicy, shippingCost} = req.body
+    const {businessName, state, lga, logoUrl, shippingPolicy, shippingCost, foodOrderType} = req.body
 
     if(
         businessName === undefined &&
@@ -174,7 +182,8 @@ export const updateSeller = async(req: Request, res: Response) => {
         logoUrl === undefined &&
         lga === undefined &&
         shippingPolicy === undefined &&
-        shippingCost === undefined
+        shippingCost === undefined &&
+        foodOrderType === undefined
     ){
         res.status(400).send({message:"Provide at least one field to update"})
         return
@@ -223,6 +232,23 @@ export const updateSeller = async(req: Request, res: Response) => {
         if (shippingPolicy !== undefined && shippingPolicy !== "FREE" && shippingPolicy !== "FIXED") {
             res.status(400).send({ message: "Shipping policy must be FREE or FIXED" })
             return
+        }
+
+        if (foodOrderType !== undefined) {
+            if (foodOrderType !== "NOW" && foodOrderType !== "PRE_ORDER" && foodOrderType !== "BOTH") {
+                res.status(400).send({ message: "Food order type must be NOW, PRE_ORDER or BOTH" })
+                return
+            }
+
+            // Only a shop that sells food can take pre-orders.
+            if (foodOrderType !== "NOW") {
+                const sellsFood = await prisma.listing.count({ where: { userId: req.user!.id, category: "Food & Grocery", archivedAt: null } })
+
+                if (sellsFood === 0) {
+                    res.status(400).send({ message: "Only shops that sell Food & Grocery can take pre-orders. Add a food listing first." })
+                    return
+                }
+            }
         }
 
         const nextShippingPolicy = shippingPolicy ?? existingProfile.shippingPolicy
@@ -288,11 +314,12 @@ export const updateSeller = async(req: Request, res: Response) => {
                 location,
                 ...(shippingPolicy !== undefined ? { shippingPolicy: nextShippingPolicy } : {}),
                 ...(shippingCostData !== undefined ? { shippingCost: shippingCostData } : {}),
+                ...(foodOrderType !== undefined ? { foodOrderType } : {}),
                 ...coordinateData
             }
         })
 
-        res.send(updatedProfile)
+        res.send(withShopRating(updatedProfile))
     }catch(error){
         res.status(500).send({message:"Sorry there is an issue on our end"})
     }
@@ -320,7 +347,13 @@ export const getPublicShop = async (req: Request, res: Response) => {
                 lga:true,
                 location:true,
                 logoUrl:true,
-                slug:true
+                slug:true,
+                // Shoppers are told what delivery costs before they add anything to the cart.
+                shippingPolicy:true,
+                shippingCost:true,
+                foodOrderType:true,
+                ratingCount:true,
+                ratingSum:true
             }
         })
 
@@ -332,15 +365,17 @@ export const getPublicShop = async (req: Request, res: Response) => {
         const listings = await prisma.listing.findMany({
             where:{
                 userId: profile.userId,
+                archivedAt: null,
                 ...(searchTerm
                     ? { title: { contains: searchTerm, mode: "insensitive" as const } }
                     : {})
-            }
+            },
+            include: { images: imagesInclude }
         })
 
         res.send({
-            profile,
-            listings
+            profile: withShopRating(profile),
+            listings: listings.map(withImages)
         })
     }catch(error){
         res.status(500).send({message:"Sorry there is an issue on our end"})
@@ -414,7 +449,7 @@ export const getCategoryShops = async (req: Request, res: Response) => {
                             user: {
                                 listings: {
                                     some: {
-                                        category: { equals: category, mode: "insensitive" }
+                                        category: { equals: category, mode: "insensitive" }, archivedAt: null
                                     }
                                 }
                             }
@@ -429,7 +464,7 @@ export const getCategoryShops = async (req: Request, res: Response) => {
                                     user: {
                                         listings: {
                                             some: {
-                                                category: { equals: category, mode: "insensitive" },
+                                                category: { equals: category, mode: "insensitive" }, archivedAt: null,
                                                 title: { contains: searchTerm, mode: "insensitive" }
                                             }
                                         }
@@ -443,7 +478,7 @@ export const getCategoryShops = async (req: Request, res: Response) => {
                     user: {
                         listings: {
                             some: {
-                                category: { equals: category, mode: "insensitive" }
+                                category: { equals: category, mode: "insensitive" }, archivedAt: null
                             }
                         }
                     }
@@ -457,13 +492,16 @@ export const getCategoryShops = async (req: Request, res: Response) => {
                 logoUrl: true,
                 slug: true,
                 latitude: true,
-                longitude: true
+                longitude: true,
+                foodOrderType: true,
+                ratingCount: true,
+                ratingSum: true
             },
             orderBy: [{ businessName: "asc" }, { id: "asc" }]
         })
 
         if (!consumerCoordinates || shops.length === 0) {
-            res.send(shops.map(({ latitude: _latitude, longitude: _longitude, ...shop }) => shop))
+            res.send(shops.map(({ latitude: _latitude, longitude: _longitude, ...shop }) => withShopRating(shop)))
             return
         }
 
@@ -484,7 +522,7 @@ export const getCategoryShops = async (req: Request, res: Response) => {
             .slice(0, candidateLimit)
 
         if (candidates.length === 0) {
-            res.send(shops.map(({ latitude: _latitude, longitude: _longitude, ...shop }) => shop))
+            res.send(shops.map(({ latitude: _latitude, longitude: _longitude, ...shop }) => withShopRating(shop)))
             return
         }
 
@@ -511,7 +549,7 @@ export const getCategoryShops = async (req: Request, res: Response) => {
                 })
         } catch {
             console.warn("Geoapify route matrix failed; using category shop ordering")
-            res.send(shops.map(({ latitude: _latitude, longitude: _longitude, ...shop }) => shop))
+            res.send(shops.map(({ latitude: _latitude, longitude: _longitude, ...shop }) => withShopRating(shop)))
             return
         }
 
@@ -522,7 +560,7 @@ export const getCategoryShops = async (req: Request, res: Response) => {
             ...remainingShops
         ]
 
-        res.send(orderedShops.map(({ latitude: _latitude, longitude: _longitude, ...shop }) => shop))
+        res.send(orderedShops.map(({ latitude: _latitude, longitude: _longitude, ...shop }) => withShopRating(shop)))
     } catch {
         res.status(500).send({ message: "Sorry there is an issue on our end" })
     }

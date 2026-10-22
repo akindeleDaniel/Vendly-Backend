@@ -11,10 +11,12 @@ import {
     parseEvidenceUrls,
     parseMessageBody,
     parseNairaToKobo,
-    rejectDispute
+    rejectDispute,
+    reopenDispute
 } from "../lib/disputes.js"
 import { issueRefund, RefundRequestError } from "../lib/payments/refunds.js"
 import { listDisputes, loadDisputeDetail, showDispute } from "./disputeController.js"
+import { notifyComplaintActivity, queueNotification } from "../lib/notifications.js"
 
 const maximumShortTextLength = 300
 
@@ -168,6 +170,7 @@ export const approveDispute = async (req: Request, res: Response) => {
         await prisma.disputeMessage.create({
             data: { disputeId: dispute.id, author: "ADMIN", authorId: req.user!.id, body: note }
         })
+        queueNotification("complaint approved", () => notifyComplaintActivity(dispute.id))
 
         res.status(201).send({
             dispute: await loadDisputeDetail(dispute.id, "ADMIN"),
@@ -196,6 +199,30 @@ export const rejectAdminDispute = async (req: Request, res: Response) => {
         }
 
         await rejectDispute({ disputeId, adminId: req.user!.id, note })
+        res.send({ dispute: await loadDisputeDetail(disputeId, "ADMIN") })
+    } catch (error) {
+        if (!sendError(error, res)) {
+            throw error
+        }
+    }
+}
+
+// Reopens a complaint that was rejected, with a note both sides read.
+export const reopenAdminDispute = async (req: Request, res: Response) => {
+    const disputeId = parseId(req.params.id)
+    const note = parseMessageBody(req.body.note)
+
+    if (note === null) {
+        res.status(400).send({ message: `A note of ${minimumMessageLength} to ${maximumMessageLength} characters is required` })
+        return
+    }
+
+    try {
+        if (disputeId === null) {
+            throw new DisputeRequestError(404, "Complaint not found")
+        }
+
+        await reopenDispute({ disputeId, adminId: req.user!.id, note })
         res.send({ dispute: await loadDisputeDetail(disputeId, "ADMIN") })
     } catch (error) {
         if (!sendError(error, res)) {

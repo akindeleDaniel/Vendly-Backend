@@ -3,6 +3,7 @@ import prisma from "../lib/prisma.js"
 import type { DisputeStatus, Prisma } from "../generated/prisma/client.js"
 import {
     addDisputeMessage,
+    appealDispute,
     buyerDisputeReasons,
     DisputeRequestError,
     maximumEvidenceLinks,
@@ -15,6 +16,7 @@ import {
     respondToDispute,
     withdrawDispute
 } from "../lib/disputes.js"
+import { countUnreadDisputes, markDisputeRead, unreadDisputeIds, type ReadingParty } from "../lib/disputeUnread.js"
 import { disputeDetailInclude, disputeListInclude, toDisputeDetail, toDisputeSummary } from "../lib/disputeViews.js"
 import type { DisputeViewer } from "../lib/disputeViews.js"
 
@@ -70,7 +72,7 @@ export async function loadDisputeDetail(id: number, viewer: DisputeViewer) {
 }
 
 // Lists complaints matching `where`, newest first. With no ?status=, only defaultStatuses are listed when given.
-export async function listDisputes(req: Request, res: Response, where: Prisma.DisputeWhereInput, defaultStatuses?: DisputeStatus[]) {
+export async function listDisputes(req: Request, res: Response, where: Prisma.DisputeWhereInput, defaultStatuses?: DisputeStatus[], reader?: ReadingParty) {
     const page = parsePage(req.query.page)
     const status = req.query.status === undefined ? undefined : disputeStatuses.find((candidate) => candidate === req.query.status) ?? null
 
@@ -99,15 +101,29 @@ export async function listDisputes(req: Request, res: Response, where: Prisma.Di
         })
     ])
 
-    res.send({ page, pageSize, total, disputes: disputes.map(toDisputeSummary) })
+    // Buyers and sellers are told which complaints have messages they have not opened yet.
+    const unread = reader ? await unreadDisputeIds(reader, req.user!.id, disputes.map((dispute) => dispute.id)) : null
+
+    res.send({
+        page,
+        pageSize,
+        total,
+        disputes: disputes.map((dispute) => unread ? { ...toDisputeSummary(dispute), unread: unread.has(dispute.id) } : toDisputeSummary(dispute))
+    })
 }
 
 export async function showDispute(res: Response, id: number | null, where: Prisma.DisputeWhereInput, viewer: DisputeViewer) {
+    // Taken before loading, so a message that arrives while this runs is still new next time.
+    const seenAt = new Date()
     const dispute = id === null ? null : await prisma.dispute.findFirst({ where: { ...where, id }, include: disputeDetailInclude })
 
     if (!dispute) {
         res.status(404).send({ message: "Complaint not found" })
         return
+    }
+
+    if (viewer !== "ADMIN") {
+        await markDisputeRead(viewer, dispute.id, seenAt)
     }
 
     res.send({ dispute: toDisputeDetail(dispute, viewer) })
@@ -165,7 +181,12 @@ export const openBuyerDispute = async (req: Request, res: Response) => {
 }
 
 export const listMyDisputes = (req: Request, res: Response) =>
-    listDisputes(req, res, { order: { checkout: { userId: req.user!.id } } })
+    listDisputes(req, res, { order: { checkout: { userId: req.user!.id } } }, undefined, "BUYER")
+
+// How many of the buyer's complaints have a reply they have not opened yet, for a notice on the site.
+export const countBuyerUnreadDisputes = async (req: Request, res: Response) => {
+    res.send({ count: await countUnreadDisputes("BUYER", req.user!.id) })
+}
 
 export const getMyDispute = (req: Request, res: Response) =>
     showDispute(res, parseId(req.params.id), { order: { checkout: { userId: req.user!.id } } }, "BUYER")
@@ -185,6 +206,32 @@ export const postBuyerMessage = async (req: Request, res: Response) => {
         }
 
         await addDisputeMessage({ disputeId, actor: { party: "BUYER", userId: req.user!.id }, ...thread })
+        await markDisputeRead("BUYER", disputeId, new Date())
+        res.status(201).send({ dispute: await loadDisputeDetail(disputeId, "BUYER") })
+    } catch (error) {
+        if (!sendDisputeError(error, res)) {
+            throw error
+        }
+    }
+}
+
+// The buyer appeals a rejection by Vendly, once, within 7 days, with a new message and any new evidence.
+export const appealMyDispute = async (req: Request, res: Response) => {
+    const disputeId = parseId(req.params.id)
+    const thread = readThreadInput(req.body)
+
+    if ("error" in thread) {
+        res.status(400).send({ message: thread.error })
+        return
+    }
+
+    try {
+        if (disputeId === null) {
+            throw new DisputeRequestError(404, "Complaint not found")
+        }
+
+        await appealDispute({ disputeId, buyerId: req.user!.id, ...thread })
+        await markDisputeRead("BUYER", disputeId, new Date())
         res.status(201).send({ dispute: await loadDisputeDetail(disputeId, "BUYER") })
     } catch (error) {
         if (!sendDisputeError(error, res)) {
@@ -215,7 +262,12 @@ export const withdrawMyDispute = async (req: Request, res: Response) => {
 // ---------------------------------------------------------------------------
 
 export const listSellerDisputes = (req: Request, res: Response) =>
-    listDisputes(req, res, { order: { sellerId: req.user!.id } })
+    listDisputes(req, res, { order: { sellerId: req.user!.id } }, undefined, "SELLER")
+
+// How many of the seller's complaints have messages they have not opened yet (different from the ones awaiting their answer).
+export const countSellerUnreadDisputes = async (req: Request, res: Response) => {
+    res.send({ count: await countUnreadDisputes("SELLER", req.user!.id) })
+}
 
 export const getSellerDispute = (req: Request, res: Response) =>
     showDispute(res, parseId(req.params.id), { order: { sellerId: req.user!.id } }, "SELLER")
@@ -270,6 +322,7 @@ export const postSellerMessage = async (req: Request, res: Response) => {
         }
 
         await addDisputeMessage({ disputeId, actor: { party: "SELLER", userId: req.user!.id }, ...thread })
+        await markDisputeRead("SELLER", disputeId, new Date())
         res.status(201).send({ dispute: await loadDisputeDetail(disputeId, "SELLER") })
     } catch (error) {
         if (!sendDisputeError(error, res)) {

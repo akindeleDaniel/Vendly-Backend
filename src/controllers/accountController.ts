@@ -6,6 +6,7 @@ import { normaliseEmail, validatePassword } from "../lib/accountRules.js"
 import { checkOtp, issueOtp } from "../lib/otp.js"
 import { endAllSessions, startSession } from "../lib/sessions.js"
 import { trustThisDevice } from "../lib/trustedDevices.js"
+import { notifyPasswordChanged, notifyWelcome, queueNotification } from "../lib/notifications.js"
 
 const badCodeMessage = "That code is not right or has expired. Ask for a new one."
 // Same answer whether or not the address has an account, so these routes cannot be used to find out who is registered.
@@ -38,6 +39,7 @@ export const verifyEmail = async (req: Request, res: Response) => {
 
     if (!user.emailVerifiedAt) {
         await prisma.user.update({ where: { id: user.id }, data: { emailVerifiedAt: new Date() } })
+        queueNotification("welcome", () => notifyWelcome(user.id))
     }
 
     await startSession(req, res, user.id)
@@ -130,6 +132,7 @@ export const resetPassword = async (req: Request, res: Response) => {
         }
     })
     await endAllSessions(user.id)
+    queueNotification("password reset", () => notifyPasswordChanged(user.id, "reset"))
     res.send({ message: "Your password has been changed. Log in with the new password." })
 }
 
@@ -174,6 +177,7 @@ export const changePassword = async (req: Request, res: Response) => {
     await prisma.user.update({ where: { id: user.id }, data: { passwordHash: await bcrypt.hash(newPassword, 10) } })
     await endAllSessions(user.id)
     await startSession(req, res, user.id)
+    queueNotification("password changed", () => notifyPasswordChanged(user.id, "changed"))
     res.send({ message: "Your password has been changed." })
 }
 
@@ -225,5 +229,6 @@ export const setPassword = async (req: Request, res: Response) => {
     await prisma.user.update({ where: { id: user.id }, data: { passwordHash: await bcrypt.hash(newPassword, 10) } })
     await endAllSessions(user.id)
     await startSession(req, res, user.id)
+    queueNotification("password set", () => notifyPasswordChanged(user.id, "set"))
     res.send({ message: "Your password has been set." })
 }

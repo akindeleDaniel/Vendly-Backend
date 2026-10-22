@@ -174,10 +174,11 @@ export async function addToCart(req: Request, res: Response) {
         const result = await prisma.$transaction(async (tx) => {
             const listing = await tx.listing.findUnique({
                 where: { id: listingId },
-                select: { stockQuantity: true }
+                select: { stockQuantity: true, archivedAt: true }
             });
 
-            if (!listing) {
+            // A listing the seller took off sale cannot be bought.
+            if (!listing || listing.archivedAt) {
                 throw new CartRequestError(404, "This Listing was not found");
             }
 

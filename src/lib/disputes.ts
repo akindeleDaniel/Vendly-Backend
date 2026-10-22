@@ -1,4 +1,5 @@
 import prisma from "./prisma.js"
+import { notifyComplaintActivity, queueNotification } from "./notifications.js"
 import { Prisma, type DisputeReason, type DisputeStatus } from "../generated/prisma/client.js"
 
 // How the complaint process behaves. These are policy choices the owner can change.
@@ -10,6 +11,8 @@ export const maximumDisputeMessages = 50
 export const maximumEvidenceLinks = 5
 export const minimumMessageLength = 10
 export const maximumMessageLength = 2000
+// After Vendly rejects a complaint the buyer has this long to appeal it, once.
+export const appealWindowDays = 7
 
 const dayMs = 24 * 60 * 60 * 1000
 const disputeLockNamespace = 1447380561
@@ -36,6 +39,8 @@ export type DisputeErrorCode =
     | "DISPUTE_NOT_OPEN"
     | "DISPUTE_CLOSED"
     | "DISPUTE_MESSAGE_LIMIT"
+    | "DISPUTE_NOT_APPEALABLE"
+    | "DISPUTE_NOT_REOPENABLE"
 
 export class DisputeRequestError extends Error {
     constructor(
@@ -175,7 +180,11 @@ export async function openDispute(input: OpenDisputeInput): Promise<number> {
 
     if (actor.party === "BUYER") {
         const paidAt = order.checkout.paymentAttempts[0]?.verifiedAt ?? order.createdAt
-        const sincePaid = Date.now() - paidAt.getTime()
+        // A pre-order is paid long before it is due, so its periods count from the ready time the seller approved
+        // (when that is later than payment). Before that time nothing is late yet.
+        const isPreOrder = order.fulfilmentType === "PRE_ORDER" && order.readyAt !== null && order.readyAt > paidAt
+        const clockStart = isPreOrder && order.readyAt ? order.readyAt : paidAt
+        const sincePaid = Date.now() - clockStart.getTime()
 
         if (sincePaid > disputeWindowDays * dayMs) {
             throw new DisputeRequestError(
@@ -186,14 +195,15 @@ export async function openDispute(input: OpenDisputeInput): Promise<number> {
         }
 
         if (input.reason === "NOT_RECEIVED") {
-            if (order.status === "DELIVERED") {
+            // An order closed automatically after 7 days of silence is not the buyer saying it arrived.
+            if (order.status === "DELIVERED" && !order.deliveryAutoClosedAt) {
                 throw new DisputeRequestError(409, "You confirmed that you received this order", "DISPUTE_NOT_ALLOWED")
             }
 
             if (order.status === "PAID" && sincePaid < unshippedDisputeAfterDays * dayMs) {
                 throw new DisputeRequestError(
                     409,
-                    `The seller has not shipped this order yet. You can report it as not received if it has not shipped ${unshippedDisputeAfterDays} days after payment.`,
+                    `The seller has not shipped this order yet. You can report it as not received if it has not shipped ${unshippedDisputeAfterDays} days after ${isPreOrder ? "the agreed ready time" : "payment"}.`,
                     "DISPUTE_NOT_ALLOWED"
                 )
             }
@@ -221,7 +231,7 @@ export async function openDispute(input: OpenDisputeInput): Promise<number> {
     const now = new Date()
     const offeredBySeller = actor.party === "SELLER"
 
-    return prisma.$transaction(async (tx) => {
+    const createdId = await prisma.$transaction(async (tx) => {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(${disputeLockNamespace}::integer, ${order.id}::integer)`
 
         const existing = await tx.dispute.findMany({ where: { orderId: order.id }, select: { id: true, status: true, outcome: true } })
@@ -262,6 +272,9 @@ export async function openDispute(input: OpenDisputeInput): Promise<number> {
 
         return dispute.id
     })
+
+    queueNotification("complaint opened", () => notifyComplaintActivity(createdId))
+    return createdId
 }
 
 // The seller answers a buyer's complaint: agreeing sends it to an administrator to approve the
@@ -310,6 +323,8 @@ export async function respondToDispute(input: {
             }
         })
     })
+
+    queueNotification("complaint answered", () => notifyComplaintActivity(dispute.id))
 }
 
 // Adds a message to an active complaint's shared thread. The buyer and seller must be the ones
@@ -351,6 +366,8 @@ export async function addDisputeMessage(input: {
             evidenceUrls: input.evidenceUrls
         }
     })
+
+    queueNotification("complaint message", () => notifyComplaintActivity(dispute.id))
 }
 
 // Whoever opened a complaint can take it back while it is still active.
@@ -391,6 +408,8 @@ export async function withdrawDispute(input: { disputeId: number; actor: { party
             }
         })
     })
+
+    queueNotification("complaint withdrawn", () => notifyComplaintActivity(dispute.id))
 }
 
 // An administrator turns a complaint down, with a note both sides can read.
@@ -415,6 +434,8 @@ export async function rejectDispute(input: { disputeId: number; adminId: number;
             data: { disputeId: dispute.id, author: "ADMIN", authorId: input.adminId, body: input.note }
         })
     })
+
+    queueNotification("complaint rejected", () => notifyComplaintActivity(dispute.id))
 }
 
 // Passes complaints the seller has not answered in time to an administrator. Each is moved once
@@ -451,8 +472,97 @@ export async function escalateOverdueDisputes(now = new Date()): Promise<number>
 
         if (moved) {
             escalated++
+            queueNotification("complaint escalated", () => notifyComplaintActivity(id))
         }
     }
 
     return escalated
+}
+
+// Whether the buyer can still appeal a complaint, and until when. Only a rejection by Vendly can be appealed, once,
+// within a week of the decision.
+export function appealStatus(dispute: { status: DisputeStatus; outcome: string | null; appealedAt: Date | null; resolvedAt: Date | null }): { canAppeal: boolean; appealed: boolean; deadline: Date | null } {
+    const rejected = dispute.status === "RESOLVED" && dispute.outcome === "REJECTED" && dispute.resolvedAt !== null
+    const deadline = rejected && dispute.resolvedAt ? new Date(dispute.resolvedAt.getTime() + appealWindowDays * dayMs) : null
+
+    return {
+        canAppeal: rejected && dispute.appealedAt === null && deadline !== null && deadline.getTime() > Date.now(),
+        appealed: dispute.appealedAt !== null,
+        deadline
+    }
+}
+
+// The buyer appeals Vendly's rejection with a new message (and evidence). The complaint goes back to an administrator,
+// who decides again; that second decision is final.
+export async function appealDispute(input: { disputeId: number; buyerId: number; message: string; evidenceUrls: string[] }): Promise<void> {
+    const dispute = await prisma.dispute.findFirst({
+        where: { id: input.disputeId, order: { checkout: { userId: input.buyerId } } },
+        select: { id: true, status: true, outcome: true, appealedAt: true, resolvedAt: true }
+    })
+
+    if (!dispute) {
+        throw new DisputeRequestError(404, "Complaint not found")
+    }
+
+    if (dispute.status !== "RESOLVED" || dispute.outcome !== "REJECTED") {
+        throw new DisputeRequestError(409, "Only a complaint that Vendly rejected can be appealed", "DISPUTE_NOT_APPEALABLE")
+    }
+
+    if (dispute.appealedAt !== null) {
+        throw new DisputeRequestError(409, "You have already appealed this decision, and the second decision is final", "DISPUTE_NOT_APPEALABLE")
+    }
+
+    if (!appealStatus(dispute).canAppeal) {
+        throw new DisputeRequestError(409, `The ${appealWindowDays}-day period to appeal this decision has ended`, "DISPUTE_NOT_APPEALABLE")
+    }
+
+    await prisma.$transaction(async (tx) => {
+        const now = new Date()
+        const moved = await tx.dispute.updateMany({
+            where: { id: dispute.id, status: "RESOLVED", outcome: "REJECTED", appealedAt: null },
+            data: { status: "UNDER_REVIEW", outcome: null, decisionNote: null, approvedAmount: null, resolvedAt: null, appealedAt: now, escalatedAt: now }
+        })
+
+        if (moved.count !== 1) {
+            throw new DisputeRequestError(409, "You have already appealed this decision, and the second decision is final", "DISPUTE_NOT_APPEALABLE")
+        }
+
+        await tx.disputeMessage.create({
+            data: { disputeId: dispute.id, author: "BUYER", authorId: input.buyerId, body: `Appeal: ${input.message}`, evidenceUrls: input.evidenceUrls }
+        })
+    })
+
+    queueNotification("complaint appealed", () => notifyComplaintActivity(dispute.id))
+}
+
+// An administrator reopens a complaint that was rejected, for example after new information. It goes back to
+// "with Vendly" for a new decision. Only rejections can be reopened; a refund that was approved cannot be undone this way.
+export async function reopenDispute(input: { disputeId: number; adminId: number; note: string }): Promise<void> {
+    const dispute = await prisma.dispute.findUnique({ where: { id: input.disputeId }, select: { id: true, status: true, outcome: true } })
+
+    if (!dispute) {
+        throw new DisputeRequestError(404, "Complaint not found")
+    }
+
+    if (dispute.status !== "RESOLVED" || dispute.outcome !== "REJECTED") {
+        throw new DisputeRequestError(409, "Only a complaint that was rejected can be reopened", "DISPUTE_NOT_REOPENABLE")
+    }
+
+    await prisma.$transaction(async (tx) => {
+        const now = new Date()
+        const moved = await tx.dispute.updateMany({
+            where: { id: dispute.id, status: "RESOLVED", outcome: "REJECTED" },
+            data: { status: "UNDER_REVIEW", outcome: null, decisionNote: null, approvedAmount: null, resolvedAt: null, escalatedAt: now }
+        })
+
+        if (moved.count !== 1) {
+            throw new DisputeRequestError(409, "Only a complaint that was rejected can be reopened", "DISPUTE_NOT_REOPENABLE")
+        }
+
+        await tx.disputeMessage.create({
+            data: { disputeId: dispute.id, author: "ADMIN", authorId: input.adminId, body: `Vendly reopened this complaint: ${input.note}` }
+        })
+    })
+
+    queueNotification("complaint reopened", () => notifyComplaintActivity(dispute.id))
 }

@@ -1,5 +1,5 @@
 import type { Prisma } from "../generated/prisma/client.js"
-import { disputeReasonLabels } from "./disputes.js"
+import { appealStatus, disputeReasonLabels } from "./disputes.js"
 
 export type DisputeViewer = "BUYER" | "SELLER" | "ADMIN"
 
@@ -9,6 +9,7 @@ function money(amount: Prisma.Decimal): string {
 
 const orderSummarySelect = {
     id: true,
+    checkoutId: true,
     status: true,
     total: true,
     deliveryName: true,
@@ -42,6 +43,8 @@ export function toDisputeSummary(dispute: ListRecord) {
     return {
         id: dispute.id,
         orderId: dispute.orderId,
+        // The buyer's order pages are addressed by checkout, so a complaint can link back to its order.
+        checkoutId: dispute.order.checkoutId,
         reason: dispute.reason,
         reasonLabel: disputeReasonLabels[dispute.reason],
         openedBy: dispute.openedBy,
@@ -69,10 +72,13 @@ export function toDisputeDetail(dispute: DetailRecord, viewer: DisputeViewer) {
     return {
         ...toDisputeSummary({ ...dispute, messages: dispute.messages.slice(-1).map((message) => ({ createdAt: message.createdAt, author: message.author })) }),
         decisionNote: dispute.decisionNote,
+        // A rejection by Vendly can be appealed once, within 7 days: canAppeal and until when.
+        appeal: appealStatus(dispute),
         sellerRespondedAt: dispute.sellerRespondedAt,
         escalatedAt: dispute.escalatedAt,
         order: {
             id: order.id,
+            checkoutId: order.checkoutId,
             status: order.status,
             total: money(order.total),
             seller: order.seller.sellerProfile ? { businessName: order.seller.sellerProfile.businessName, slug: order.seller.sellerProfile.slug } : null,

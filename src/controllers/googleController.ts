@@ -5,6 +5,7 @@ import { isRegistrationRole } from "../lib/accountRules.js"
 import { googleSignInAvailable, verifyGoogleCredential, type GoogleIdentity } from "../lib/google.js"
 import { checkOtp, issueOtp } from "../lib/otp.js"
 import { startSession } from "../lib/sessions.js"
+import { notifyWelcome, queueNotification } from "../lib/notifications.js"
 
 const badCodeMessage = "That code is not right or has expired. Ask for a new one."
 
@@ -123,6 +124,7 @@ export const googleSignIn = async (req: Request, res: Response) => {
 
             return created
         })
+        queueNotification("welcome", () => notifyWelcome(user.id))
         await finishLogin(req, res, user, { isNewAccount: true })
     } catch (error) {
         // Two requests creating the same account at once: the other one won, so this one signs in as it.
