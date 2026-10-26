@@ -3239,9 +3239,18 @@ test("uses local-development defaults when deployment settings are not configure
         frontendUrl: "http://localhost:5173",
         cookieSameSite: "lax",
         cookieSecure: false,
-        trustProxy: false
+        trustProxy: false,
+        maximumOrderValue: 100000,
+        sellerDebtLimit: 50000
     })
     assert.equal(loadConfig({ NODE_ENV: "production" }).cookieSecure, true)
+    assert.equal(loadConfig({ MAX_ORDER_VALUE: "250000", SELLER_DEBT_LIMIT: " 0 " }).maximumOrderValue, 250000)
+    assert.equal(loadConfig({ MAX_ORDER_VALUE: "250000", SELLER_DEBT_LIMIT: " 0 " }).sellerDebtLimit, null)
+    assert.equal(loadConfig({ MAX_ORDER_VALUE: "0" }).maximumOrderValue, null)
+    for (const bad of ["abc", "-5", "1.5", "100000000000"]) {
+        assert.throws(() => loadConfig({ MAX_ORDER_VALUE: bad }), /MAX_ORDER_VALUE must be a whole number of naira/)
+        assert.throws(() => loadConfig({ SELLER_DEBT_LIMIT: bad }), /SELLER_DEBT_LIMIT must be a whole number of naira/)
+    }
 })
 
 test("reads valid deployment settings from the environment", () => {
@@ -3254,7 +3263,9 @@ test("reads valid deployment settings from the environment", () => {
         frontendUrl: "https://vendly.example",
         cookieSameSite: "strict",
         cookieSecure: false,
-        trustProxy: false
+        trustProxy: false,
+        maximumOrderValue: 100000,
+        sellerDebtLimit: 50000
     })
     assert.deepEqual(loadConfig({ COOKIE_SAME_SITE: "none" }).cookieSecure, true)
 })
@@ -9682,5 +9693,83 @@ test("the platform figures show people, sales, refunds, complaints and what need
         assert.equal(refunded.sellerDebts.open, before.sellerDebts.open + 1)
         assert.equal(Number(refunded.sellerDebts.amountStillOwed) - Number(before.sellerDebts.amountStillOwed), 3000)
         assert.equal(checkoutId > 0, true)
+    })
+})
+
+// ---- Order and debt limits ----
+
+test("an order above the limit cannot be checked out, and the limit can be switched off", async () => {
+    await withPaymentCheckout("order-limit", async (context) => {
+        const { request } = context
+        const original = config.maximumOrderValue
+
+        try {
+            // The checkout holds one order of 2 × ₦1,500 = ₦3,000. The limit is not advertised in the review.
+            const open = await request("GET", "/checkout/preview")
+            assert.equal(open.status, 200)
+            assert.equal("orderLimit" in open.body, false)
+            assert.equal(JSON.stringify(open.body).includes("100000"), false)
+
+            config.maximumOrderValue = 2500
+            const preview = await request("GET", "/checkout/preview")
+            assert.equal(preview.status, 409)
+            assert.equal(preview.body.code, "CHECKOUT_ORDER_TOO_LARGE")
+            assert.equal(preview.body.orderTotal, "3000.00")
+            assert.equal(preview.body.limit, "2500.00")
+            assert.match(preview.body.message, /at most ₦2,500/)
+            assert.equal(typeof preview.body.seller.businessName, "string")
+            const creating = await request("POST", "/checkout", { reviewToken: "x", delivery: fixtureDelivery })
+            assert.notEqual(creating.status, 201)
+
+            // Exactly the limit is fine, and null means no limit.
+            config.maximumOrderValue = 3000
+            assert.equal((await request("GET", "/checkout/preview")).status, 200)
+            config.maximumOrderValue = null
+            assert.equal((await request("GET", "/checkout/preview")).status, 200)
+        } finally {
+            config.maximumOrderValue = original
+        }
+    })
+})
+
+test("a seller who owes too much for refunds takes no new orders, without the buyer being told why", async () => {
+    await withPaymentCheckout("debt-limit", async (context) => {
+        const { fixture, request, adminToken } = context
+        const original = config.sellerDebtLimit
+
+        try {
+            // A refund charged to the seller makes a debt of ₦3,000.
+            const orderId = await payAndShip(context)
+            const issued = await refundOrder(context, orderId)
+            assert.equal(issued.status, 201)
+            const standing = async (token: string, path: string) => (await request("GET", path, undefined, token)).body.standing
+            let mine = await standing(fixture.sellerToken, "/seller/standing")
+            assert.deepEqual(mine.debt, { amountOwed: "3000.00", limit: "50000.00", ordersPaused: false })
+
+            // Under the limit, the next order goes ahead.
+            const cart = await prisma.cart.findUniqueOrThrow({ where: { userId: fixture.consumerId } })
+            await prisma.cartItem.create({ data: { cartId: cart.id, listingId: fixture.listingId, quantity: 1 } })
+            assert.equal((await request("GET", "/checkout/preview")).status, 200)
+
+            // Over the limit, the shop stops taking orders. The buyer sees a plain message with no debt figure.
+            config.sellerDebtLimit = 2000
+            const paused = await request("GET", "/checkout/preview")
+            assert.equal(paused.status, 409)
+            assert.equal(paused.body.code, "CHECKOUT_ITEMS_UNAVAILABLE")
+            assert.match(paused.body.message, /is not taking new orders at the moment/)
+            assert.equal(JSON.stringify(paused.body).includes("3000"), false)
+            mine = await standing(fixture.sellerToken, "/seller/standing")
+            assert.deepEqual(mine.debt, { amountOwed: "3000.00", limit: "2000.00", ordersPaused: true })
+            assert.equal((await standing(adminToken, `/admin/sellers/${fixture.sellerId}/standing`)).debt.ordersPaused, true)
+
+            // Exactly at the limit is allowed; switching the limit off, or raising it, lets orders through again.
+            config.sellerDebtLimit = 3000
+            assert.equal((await request("GET", "/checkout/preview")).status, 200)
+            config.sellerDebtLimit = null
+            assert.equal((await request("GET", "/checkout/preview")).status, 200)
+            assert.equal((await standing(fixture.sellerToken, "/seller/standing")).debt.limit, null)
+        } finally {
+            config.sellerDebtLimit = original
+        }
     })
 })

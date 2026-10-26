@@ -1,4 +1,7 @@
 import prisma from "./prisma.js"
+import config from "../config.js"
+import { Prisma } from "../generated/prisma/client.js"
+import { openDebtBySeller, overDebtLimit } from "./orderLimits.js"
 import { notifySellerBlocked, notifySellerUnblocked, notifySellerWarned, queueNotification } from "./notifications.js"
 
 // A seller's standing. A complaint that ends in a refund against the seller is a strike, unless the seller agreed
@@ -54,6 +57,7 @@ export async function getSellerStanding(sellerId: number) {
     }
 
     const strikes = await loadStrikes(sellerId)
+    const owed = (await openDebtBySeller(prisma, [sellerId])).get(sellerId)
 
     return {
         strikes: strikes.length,
@@ -64,6 +68,12 @@ export async function getSellerStanding(sellerId: number) {
         blocked: profile.blockedAt !== null,
         blockedAt: profile.blockedAt,
         blockReason: profile.blockReason,
+        // What the seller still owes for refunds, and whether that has paused new orders (the limit is in naira).
+        debt: {
+            amountOwed: (owed ?? new Prisma.Decimal(0)).toFixed(2),
+            limit: config.sellerDebtLimit === null ? null : new Prisma.Decimal(config.sellerDebtLimit).toFixed(2),
+            ordersPaused: overDebtLimit(owed)
+        },
         recent: strikes
     }
 }

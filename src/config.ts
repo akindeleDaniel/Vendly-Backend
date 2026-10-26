@@ -8,6 +8,10 @@ export type AppConfig = {
     // How many proxies (a load balancer, the host's router) sit in front of the server. Tells Express which
     // address in X-Forwarded-For is the real visitor, which rate limiting depends on. False for none.
     trustProxy: number | false
+    // The most one seller's order may be worth, in naira, and the most a seller may owe for unrecovered refunds
+    // before new orders pause. Null means no limit. See lib/orderLimits.ts.
+    maximumOrderValue: number | null
+    sellerDebtLimit: number | null
 }
 
 const cookieSameSiteValues: CookieSameSite[] = ["lax", "strict", "none"]
@@ -55,14 +59,34 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
         throw new Error("TRUST_PROXY must be the number of proxies in front of the server (0 for none, usually 1 on a host), not true or an address")
     }
 
+    const maximumOrderValue = readNairaLimit(env.MAX_ORDER_VALUE, "MAX_ORDER_VALUE", 100000)
+    const sellerDebtLimit = readNairaLimit(env.SELLER_DEBT_LIMIT, "SELLER_DEBT_LIMIT", 50000)
+
     return {
         port,
         frontendUrl: frontendUrl.origin,
         cookieSameSite,
         trustProxy: Number(trustProxyValue) || false,
         // Browsers reject SameSite=None cookies that are not Secure.
-        cookieSecure: env.NODE_ENV === "production" || cookieSameSite === "none"
+        cookieSecure: env.NODE_ENV === "production" || cookieSameSite === "none",
+        maximumOrderValue,
+        sellerDebtLimit
     }
+}
+
+// A limit in whole naira. Unset uses the default; 0 switches the limit off.
+function readNairaLimit(value: string | undefined, name: string, fallback: number): number | null {
+    const text = value?.trim()
+
+    if (!text) {
+        return fallback
+    }
+
+    if (!/^\d{1,10}$/.test(text)) {
+        throw new Error(`${name} must be a whole number of naira (0 to switch the limit off)`)
+    }
+
+    return Number(text) || null
 }
 
 // Secrets have no safe default, so the server refuses to start without them.

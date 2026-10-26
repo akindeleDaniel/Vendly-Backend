@@ -5,6 +5,7 @@ import { Prisma } from "../generated/prisma/client.js"
 import { buildLocation } from "../lib/nigeriaLocation.js"
 import { heldReservationConditions } from "../lib/inventoryReservations.js"
 import { snapshotMatches } from "../lib/preOrders.js"
+import { assertOrderLimits, OrderLimitError } from "../lib/orderLimits.js"
 
 const checkoutListingSelect = {
     id: true,
@@ -104,6 +105,7 @@ type CheckoutErrorCode =
     | "CHECKOUT_PREORDER_REQUIRED"
     | "CHECKOUT_PREORDER_INVALID"
     | "CHECKOUT_PREORDER_NOT_AVAILABLE"
+    | "CHECKOUT_ORDER_TOO_LARGE"
 
 class CheckoutRequestError extends Error {
     constructor(
@@ -237,6 +239,20 @@ function buildCheckoutReview(
         subtotal: formatMoney(subtotal),
         shipping: formatMoney(shipping),
         total: formatMoney(subtotal.plus(shipping))
+    }
+}
+
+// Applies the order-value and seller-debt limits, turning a refusal into the checkout's own error. The order limit
+// is not advertised anywhere else: a buyer only learns it when an order goes over it (and from the Terms).
+async function limitOrders(client: Prisma.TransactionClient | typeof prisma, sellerPreviews: SellerPreview[]): Promise<void> {
+    try {
+        await assertOrderLimits(client, sellerPreviews)
+    } catch (error) {
+        if (error instanceof OrderLimitError) {
+            throw new CheckoutRequestError(409, error.message, error.code, error.details)
+        }
+
+        throw error
     }
 }
 
@@ -710,6 +726,8 @@ export async function createCheckout(req: Request, res: Response) {
                 reservedQuantities
             )
 
+            await limitOrders(tx, sellerPreviews)
+
             // Food shops that take pre-orders: which of this checkout's orders are pre-orders.
             const approvals = await findApprovedPreOrders(tx, userId, sellerPreviews, now)
             const chosenPreOrders = choosePreOrders(sellerPreviews, approvals, preOrderIds)
@@ -1121,6 +1139,7 @@ export async function getCheckoutPreview(req: Request, res: Response) {
         }
 
         const { sellerPreviews } = priceCheckoutItems(cart.cartItems, reservedQuantities)
+        await limitOrders(prisma, sellerPreviews)
         const approvals = await findApprovedPreOrders(prisma, userId, sellerPreviews, now)
 
         res.send(buildCheckoutReview(userId, sellerPreviews, approvals))
