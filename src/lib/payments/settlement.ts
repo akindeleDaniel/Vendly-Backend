@@ -165,8 +165,8 @@ async function settleOnce(attemptId: number): Promise<SettlementResult> {
         // Record what the provider reported for each seller's share, so sellers see the real fee.
         const shares = Array.isArray(paymentAttempt.sellerShares) ? paymentAttempt.sellerShares as SellerShare[] : []
 
-        // Vendly may have kept part of some seller orders to recover what those sellers owe for earlier
-        // refunds. Paystack reports Vendly's share as one lump, so it is shared across those orders in
+        // StoreHatch may have kept part of some seller orders to recover what those sellers owe for earlier
+        // refunds. Paystack reports StoreHatch's share as one lump, so it is shared across those orders in
         // proportion to what each planned to give up; Flutterwave reports it for each seller.
         const plannedOrders = checkout.orders.filter((order) => order.liabilityDeduction.greaterThan(0))
         const lumpShares = paymentAttempt.vendlyShareKobo === null
@@ -181,7 +181,7 @@ async function settleOnce(attemptId: number): Promise<SettlementResult> {
             const share = shares.find((candidate) => candidate.subaccountCode === subaccountCode)
             const totalKobo = order.total.times(100).toNumber()
             const plannedKobo = order.liabilityDeduction.times(100).toNumber()
-            // What Vendly actually kept: the provider's per-seller figure, else this order's part of its
+            // What StoreHatch actually kept: the provider's per-seller figure, else this order's part of its
             // reported share, else what was planned if the provider reported nothing.
             const retainedKobo = plannedKobo === 0 ? 0 : (share?.retainedKobo ?? lumpShares?.get(order.id) ?? plannedKobo)
 

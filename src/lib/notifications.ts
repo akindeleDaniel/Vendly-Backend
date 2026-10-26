@@ -37,15 +37,19 @@ function lagosTime(date: Date): string {
     return date.toLocaleString("en-NG", { timeZone: "Africa/Lagos", dateStyle: "full", timeStyle: "short" })
 }
 
-function mail(to: string, subject: string, paragraphs: string[], action?: { label: string; path: string }): OutgoingEmail {
+function mail(to: string, subject: string, paragraphs: string[], action?: { label: string; path: string }, postscript?: string): OutgoingEmail {
     const lines = [...paragraphs]
 
     if (action) {
         lines.push(`${action.label}: ${config.frontendUrl}${action.path}`)
     }
 
-    return { to, subject, text: [...lines.flatMap((line) => [line, ""]), "The Vendly team"].join("\n") }
+    const signed = [...lines.flatMap((line) => [line, ""]), "The StoreHatch team"]
+    return { to, subject, text: (postscript ? [...signed, "", "---", postscript] : signed).join("\n") }
 }
+
+// Every buyer receipt invites the buyer to open a shop too, as Paystack's receipts do: each order recruits sellers.
+const openYourShop = () => `Sell online too? Open your own StoreHatch shop for free: ${config.frontendUrl}/seller/register`
 
 // One email failing must not stop the others in the same event.
 async function sendAll(emails: OutgoingEmail[]): Promise<void> {
@@ -73,12 +77,12 @@ export async function notifyWelcome(userId: number): Promise<void> {
 
     await sendAll([
         user.role === "SELLER"
-            ? mail(user.email, "Welcome to Vendly", [
-                `Welcome to Vendly, ${user.name}.`,
+            ? mail(user.email, "Welcome to StoreHatch", [
+                `Welcome to StoreHatch, ${user.name}.`,
                 "To start selling, set up your shop, add your payout bank account so customers' payments reach you, and add your first products."
             ], { label: "Set up your shop", path: "/seller/onboarding" })
-            : mail(user.email, "Welcome to Vendly", [
-                `Welcome to Vendly, ${user.name}.`,
+            : mail(user.email, "Welcome to StoreHatch", [
+                `Welcome to StoreHatch, ${user.name}.`,
                 "Browse shops near you, add what you like to your cart and pay securely. You can follow every order from your account."
             ], { label: "Start shopping", path: "/" })
     ])
@@ -91,7 +95,7 @@ export async function notifyPasswordChanged(userId: number, how: "changed" | "re
         return
     }
 
-    const what = how === "set" ? "A password was added to your Vendly account" : how === "reset" ? "Your Vendly password was reset" : "Your Vendly password was changed"
+    const what = how === "set" ? "A password was added to your StoreHatch account" : how === "reset" ? "Your StoreHatch password was reset" : "Your StoreHatch password was changed"
     const when = lagosTime(new Date())
 
     await sendAll([
@@ -100,7 +104,7 @@ export async function notifyPasswordChanged(userId: number, how: "changed" | "re
             how === "changed" || how === "set"
                 ? "You were logged out of your other devices."
                 : "Every device was logged out, so log in again with your new password.",
-            "If this was not you, reset your password straight away and contact Vendly support: someone else may have access to your email."
+            "If this was not you, reset your password straight away and contact StoreHatch support: someone else may have access to your email."
         ], { label: "Log in", path: "/login" })
     ])
 }
@@ -148,12 +152,12 @@ export async function notifyPaymentSettled(attemptId: number): Promise<void> {
             ...checkout.orders.map((order) =>
                 `From ${order.seller.sellerProfile?.businessName ?? "the seller"} (${naira(order.total)}):\n${itemLines(order.orderItems)}${order.fulfilmentType === "PRE_ORDER" && order.readyAt ? `\n  Pre-order, to be ready: ${lagosTime(order.readyAt)}` : ""}`),
             "The seller will now prepare your order. We will tell you when it ships."
-        ], { label: "See your order", path: `/orders/${checkout.id}` })
+        ], { label: "See your order", path: `/orders/${checkout.id}` }, openYourShop())
     ]
 
     for (const order of checkout.orders) {
         const kept = Number(order.liabilityDeduction.toString()) > 0
-            ? [`${naira(order.liabilityDeduction)} of this payment was kept by Vendly to recover money refunded to buyers for your earlier orders.`]
+            ? [`${naira(order.liabilityDeduction)} of this payment was kept by StoreHatch to recover money refunded to buyers for your earlier orders.`]
             : []
 
         emails.push(mail(order.seller.email, `New order: ${naira(order.total)}`, [
@@ -285,7 +289,7 @@ export async function notifyRefundProgress(refundId: number, status: "PROCESSING
     const email = refund.order?.checkout.user.email ?? refund.paymentAttempt.checkout.user.email
     const checkoutId = refund.order?.checkoutId ?? refund.paymentAttempt.checkout.id
     const forOrder = refund.order ? `order #${refund.order.id}` : "your payment"
-    const note = refund.customerNote ? [`Note from Vendly: ${refund.customerNote}`] : []
+    const note = refund.customerNote ? [`Note from StoreHatch: ${refund.customerNote}`] : []
     const amount = naira(refund.amount)
 
     const subject = {
@@ -297,14 +301,14 @@ export async function notifyRefundProgress(refundId: number, status: "PROCESSING
     const body = {
         PROCESSING: `We have started refunding ${amount} for ${forOrder} to your original payment method. Banks usually take a few working days to show it.`,
         SUCCEEDED: `The refund of ${amount} for ${forOrder} has been sent to your original payment method. Banks usually take a few working days to show it.`,
-        FAILED: `The refund of ${amount} for ${forOrder} could not be completed by the payment provider. Vendly has been told and will deal with it; you do not need to do anything.`,
-        NEEDS_ATTENTION: `The payment provider needs more time to refund ${amount} for ${forOrder}. Vendly is following it up and will tell you if we need anything from you.`
+        FAILED: `The refund of ${amount} for ${forOrder} could not be completed by the payment provider. StoreHatch has been told and will deal with it; you do not need to do anything.`,
+        NEEDS_ATTENTION: `The payment provider needs more time to refund ${amount} for ${forOrder}. StoreHatch is following it up and will tell you if we need anything from you.`
     }[status]
 
     await sendAll([mail(email, subject, [body, ...note], { label: "See your order", path: `/orders/${checkoutId}` })])
 }
 
-// The seller is told, with the reason, that Vendly refunded a buyer and will take the money back from later sales.
+// The seller is told, with the reason, that StoreHatch refunded a buyer and will take the money back from later sales.
 export async function notifySellerCharged(refundId: number): Promise<void> {
     const refund = await prisma.refund.findUnique({
         where: { id: refundId },
@@ -316,10 +320,10 @@ export async function notifySellerCharged(refundId: number): Promise<void> {
     }
 
     await sendAll([
-        mail(refund.order.seller.email, `Vendly refunded a buyer for order #${refund.order.id}`, [
-            `Vendly refunded ${naira(refund.amount)} to the buyer of order #${refund.order.id}.`,
+        mail(refund.order.seller.email, `StoreHatch refunded a buyer for order #${refund.order.id}`, [
+            `StoreHatch refunded ${naira(refund.amount)} to the buyer of order #${refund.order.id}.`,
             `Reason: ${refund.reason}`,
-            "As agreed in the payout terms, this amount is now owed to Vendly. It is taken from your later orders (at most half of each payment) until it is repaid.",
+            "As agreed in the payout terms, this amount is now owed to StoreHatch. It is taken from your later orders (at most half of each payment) until it is repaid.",
             "You can see what you owe, and every deduction, on your page."
         ], { label: "See what you owe", path: "/seller/liabilities" })
     ])
@@ -369,11 +373,11 @@ export async function notifyComplaintActivity(disputeId: number): Promise<void> 
     const statusLine = dispute.status === "OPEN"
         ? "It is waiting for the seller's answer."
         : dispute.status === "SELLER_AGREED"
-            ? "The seller agreed, and it is waiting for Vendly to approve the refund."
+            ? "The seller agreed, and it is waiting for StoreHatch to approve the refund."
             : dispute.status === "UNDER_REVIEW"
-                ? "It is with Vendly for a decision."
+                ? "It is with StoreHatch for a decision."
                 : dispute.status === "RESOLVED"
-                    ? dispute.outcome === "REFUNDED" ? "It is resolved: a refund was approved." : "It is resolved: Vendly did not approve a refund."
+                    ? dispute.outcome === "REFUNDED" ? "It is resolved: a refund was approved." : "It is resolved: StoreHatch did not approve a refund."
                     : "It has been closed."
 
     const emails: OutgoingEmail[] = []
@@ -383,24 +387,24 @@ export async function notifyComplaintActivity(disputeId: number): Promise<void> 
             ? mail(sellerEmail, `New complaint about ${orderLabel}: please answer`, [
                 `A buyer has reported a problem with ${orderLabel}.`,
                 `They wrote: "${said}"`,
-                `Please answer by ${lagosTime(dispute.responseDueAt)}. If you do not, it goes to Vendly to decide.`
+                `Please answer by ${lagosTime(dispute.responseDueAt)}. If you do not, it goes to StoreHatch to decide.`
             ], sellerLink)
             : mail(sellerEmail, `New message about the complaint on ${orderLabel}`, [`The buyer wrote: "${said}"`, statusLine], sellerLink))
     } else if (latest.author === "SELLER") {
         emails.push(isFirst && dispute.openedBy === "SELLER"
             ? mail(buyerEmail, `The seller offered you a refund for ${orderLabel}`, [
-                "The seller has offered to refund your order, and Vendly will review it.",
+                "The seller has offered to refund your order, and StoreHatch will review it.",
                 `They wrote: "${said}"`
             ], buyerLink)
             : mail(buyerEmail, `The seller replied about ${orderLabel}`, [`The seller wrote: "${said}"`, statusLine], buyerLink))
     } else if (latest.author === "ADMIN") {
         const subject = dispute.status === "RESOLVED"
-            ? dispute.outcome === "REFUNDED" ? `Vendly approved a refund for ${orderLabel}` : `Vendly's decision on the complaint about ${orderLabel}`
-            : `Vendly wrote in the complaint about ${orderLabel}`
-        const paragraphs = [`Vendly wrote: "${said}"`, statusLine]
+            ? dispute.outcome === "REFUNDED" ? `StoreHatch approved a refund for ${orderLabel}` : `StoreHatch's decision on the complaint about ${orderLabel}`
+            : `StoreHatch wrote in the complaint about ${orderLabel}`
+        const paragraphs = [`StoreHatch wrote: "${said}"`, statusLine]
         emails.push(mail(buyerEmail, subject, paragraphs, buyerLink), mail(sellerEmail, subject, paragraphs, sellerLink))
     } else {
-        const subject = dispute.status === "WITHDRAWN" ? `The complaint about ${orderLabel} was withdrawn` : `The complaint about ${orderLabel} was passed to Vendly`
+        const subject = dispute.status === "WITHDRAWN" ? `The complaint about ${orderLabel} was withdrawn` : `The complaint about ${orderLabel} was passed to StoreHatch`
         const paragraphs = [said, statusLine]
         emails.push(mail(buyerEmail, subject, paragraphs, buyerLink), mail(sellerEmail, subject, paragraphs, sellerLink))
     }
@@ -440,7 +444,7 @@ export async function notifyNewReviews(productReviewIds: number[], shopReviewId:
         mail(sellerEmail, "A buyer reviewed your order", [
             "A buyer whose order was delivered has left a review:",
             lines.join("\n"),
-            "If a review breaks the rules, you can report it and Vendly will look at it."
+            "If a review breaks the rules, you can report it and StoreHatch will look at it."
         ], { label: "See your reviews", path: "/seller/reviews" })
     ])
 }
@@ -534,7 +538,7 @@ export async function notifySellerWarned(sellerId: number, strikes: number): Pro
     await sendAll([
         mail(seller.email, "A warning about complaints against your shop", [
             `${strikes} complaints against your shop ended in a refund in the last 90 days, and you did not agree to them.`,
-            "If this reaches 4, new orders from your shop will be blocked and your shop will be hidden until Vendly reviews it.",
+            "If this reaches 4, new orders from your shop will be blocked and your shop will be hidden until StoreHatch reviews it.",
             "Answer complaints on time and look at what buyers say, so fewer of them end in a refund."
         ], { label: "See your complaints", path: "/seller/disputes" })
     ])
@@ -550,7 +554,7 @@ export async function notifySellerBlocked(sellerId: number): Promise<void> {
     await sendAll([
         mail(seller.email, "Your shop is blocked from new orders", [
             "Your shop is hidden and cannot take new orders. Orders already placed carry on as normal, and you should still ship them and answer any complaints.",
-            "Contact Vendly if you think this is a mistake. Vendly can lift the block after reviewing it."
+            "Contact StoreHatch if you think this is a mistake. StoreHatch can lift the block after reviewing it."
         ], { label: "See your standing", path: "/seller/standing" })
     ])
 }
@@ -564,7 +568,7 @@ export async function notifySellerUnblocked(sellerId: number): Promise<void> {
 
     await sendAll([
         mail(seller.email, "Your shop can take orders again", [
-            "Vendly lifted the block on your shop. It is visible again and can take new orders.",
+            "StoreHatch lifted the block on your shop. It is visible again and can take new orders.",
             "Your count of lost complaints starts again from today."
         ], { label: "See your standing", path: "/seller/standing" })
     ])
@@ -580,10 +584,10 @@ export async function notifyAdminChange(userId: number, change: "GRANTED" | "REV
     }
 
     const text: Record<typeof change, [string, string[]]> = {
-        GRANTED: ["You are now a Vendly administrator", ["A Vendly super administrator gave you administrator access.", "You will be asked for an emailed code each time you sign in."]],
-        SUPER_GRANTED: ["You are now a Vendly super administrator", ["A Vendly super administrator gave you super administrator access, so you can manage the team and see the platform figures."]],
+        GRANTED: ["You are now a StoreHatch administrator", ["A StoreHatch super administrator gave you administrator access.", "You will be asked for an emailed code each time you sign in."]],
+        SUPER_GRANTED: ["You are now a StoreHatch super administrator", ["A StoreHatch super administrator gave you super administrator access, so you can manage the team and see the platform figures."]],
         SUPER_REMOVED: ["Your super administrator access was removed", ["You are still an administrator, but you can no longer manage the team or see the platform figures."]],
-        REVOKED: ["Your administrator access was removed", ["You no longer have administrator access to Vendly. If you think this is a mistake, speak to a super administrator."]]
+        REVOKED: ["Your administrator access was removed", ["You no longer have administrator access to StoreHatch. If you think this is a mistake, speak to a super administrator."]]
     }
 
     await sendAll([mail(user.email, text[change][0], text[change][1])])

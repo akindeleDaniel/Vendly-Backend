@@ -354,7 +354,7 @@ export const reportReview = async (req: Request, res: Response) => {
         }
     }
 
-    res.send({ message: "Thank you. Vendly will look at this review." })
+    res.send({ message: "Thank you. StoreHatch will look at this review." })
 }
 
 // ---------------------------------------------------------------------------

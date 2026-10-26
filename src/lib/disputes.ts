@@ -11,7 +11,7 @@ export const maximumDisputeMessages = 50
 export const maximumEvidenceLinks = 5
 export const minimumMessageLength = 10
 export const maximumMessageLength = 2000
-// After Vendly rejects a complaint the buyer has this long to appeal it, once.
+// After StoreHatch rejects a complaint the buyer has this long to appeal it, once.
 export const appealWindowDays = 7
 
 const dayMs = 24 * 60 * 60 * 1000
@@ -244,7 +244,7 @@ export async function openDispute(input: OpenDisputeInput): Promise<number> {
         if (!offeredBySeller && existing.some((dispute) => dispute.outcome === "REJECTED")) {
             throw new DisputeRequestError(
                 409,
-                "Vendly has already reviewed and rejected a complaint about this order",
+                "StoreHatch has already reviewed and rejected a complaint about this order",
                 "DISPUTE_ALREADY_DECIDED"
             )
         }
@@ -462,7 +462,7 @@ export async function escalateOverdueDisputes(now = new Date()): Promise<number>
                     data: {
                         disputeId: id,
                         author: "SYSTEM",
-                        body: "The seller did not answer in time, so this has been passed to Vendly for a decision."
+                        body: "The seller did not answer in time, so this has been passed to StoreHatch for a decision."
                     }
                 })
             }
@@ -479,7 +479,7 @@ export async function escalateOverdueDisputes(now = new Date()): Promise<number>
     return escalated
 }
 
-// Whether the buyer can still appeal a complaint, and until when. Only a rejection by Vendly can be appealed, once,
+// Whether the buyer can still appeal a complaint, and until when. Only a rejection by StoreHatch can be appealed, once,
 // within a week of the decision.
 export function appealStatus(dispute: { status: DisputeStatus; outcome: string | null; appealedAt: Date | null; resolvedAt: Date | null }): { canAppeal: boolean; appealed: boolean; deadline: Date | null } {
     const rejected = dispute.status === "RESOLVED" && dispute.outcome === "REJECTED" && dispute.resolvedAt !== null
@@ -492,7 +492,7 @@ export function appealStatus(dispute: { status: DisputeStatus; outcome: string |
     }
 }
 
-// The buyer appeals Vendly's rejection with a new message (and evidence). The complaint goes back to an administrator,
+// The buyer appeals StoreHatch's rejection with a new message (and evidence). The complaint goes back to an administrator,
 // who decides again; that second decision is final.
 export async function appealDispute(input: { disputeId: number; buyerId: number; message: string; evidenceUrls: string[] }): Promise<void> {
     const dispute = await prisma.dispute.findFirst({
@@ -505,7 +505,7 @@ export async function appealDispute(input: { disputeId: number; buyerId: number;
     }
 
     if (dispute.status !== "RESOLVED" || dispute.outcome !== "REJECTED") {
-        throw new DisputeRequestError(409, "Only a complaint that Vendly rejected can be appealed", "DISPUTE_NOT_APPEALABLE")
+        throw new DisputeRequestError(409, "Only a complaint that StoreHatch rejected can be appealed", "DISPUTE_NOT_APPEALABLE")
     }
 
     if (dispute.appealedAt !== null) {
@@ -536,7 +536,7 @@ export async function appealDispute(input: { disputeId: number; buyerId: number;
 }
 
 // An administrator reopens a complaint that was rejected, for example after new information. It goes back to
-// "with Vendly" for a new decision. Only rejections can be reopened; a refund that was approved cannot be undone this way.
+// "with StoreHatch" for a new decision. Only rejections can be reopened; a refund that was approved cannot be undone this way.
 export async function reopenDispute(input: { disputeId: number; adminId: number; note: string }): Promise<void> {
     const dispute = await prisma.dispute.findUnique({ where: { id: input.disputeId }, select: { id: true, status: true, outcome: true } })
 
@@ -560,7 +560,7 @@ export async function reopenDispute(input: { disputeId: number; adminId: number;
         }
 
         await tx.disputeMessage.create({
-            data: { disputeId: dispute.id, author: "ADMIN", authorId: input.adminId, body: `Vendly reopened this complaint: ${input.note}` }
+            data: { disputeId: dispute.id, author: "ADMIN", authorId: input.adminId, body: `StoreHatch reopened this complaint: ${input.note}` }
         })
     })
 

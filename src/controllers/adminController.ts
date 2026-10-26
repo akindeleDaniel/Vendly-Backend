@@ -417,7 +417,7 @@ function toLiabilityResponse(liability: Prisma.SellerLiabilityGetPayload<{ inclu
     }
 }
 
-// What sellers owe Vendly for refunds, with each deduction taken so far.
+// What sellers owe StoreHatch for refunds, with each deduction taken so far.
 export const listLiabilities = async (req: Request, res: Response) => {
     const status = parseFilter(req.query.status, liabilityStatuses)
     const sellerId = req.query.sellerId === undefined ? undefined : parseId(req.query.sellerId)

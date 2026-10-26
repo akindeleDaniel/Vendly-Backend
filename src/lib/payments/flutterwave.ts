@@ -49,7 +49,7 @@ function readSellerShares(data: Record<string, unknown>): SellerShare[] | null {
                     subaccountCode,
                     receivedKobo: Math.round(Number((value as { subaccount_earning?: unknown })?.subaccount_earning) * 100),
                     feeKobo: null,
-                    // The part of this seller's order Vendly kept, in kobo.
+                    // The part of this seller's order StoreHatch kept, in kobo.
                     retainedKobo: commission === undefined || commission === null ? null : Math.round(Number(commission) * 100)
                 }
             })
@@ -59,7 +59,7 @@ function readSellerShares(data: Record<string, unknown>): SellerShare[] | null {
     }
 }
 
-// What Flutterwave reports Vendly itself kept from the split (its commission), in kobo.
+// What Flutterwave reports StoreHatch itself kept from the split (its commission), in kobo.
 function readVendlyShareKobo(shares: SellerShare[] | null): number | null {
     if (!shares || shares.some((share) => share.retainedKobo === undefined || share.retainedKobo === null)) {
         return null
@@ -134,9 +134,9 @@ export const flutterwaveAdapter: PaymentProviderAdapter = {
     },
 
     async initializePayment(input) {
-        // A ratio split of what each seller receives, with a flat commission for the part Vendly keeps
+        // A ratio split of what each seller receives, with a flat commission for the part StoreHatch keeps
         // (0 normally), takes Flutterwave's fee off the settled amount before splitting, so the sellers
-        // bear it and Vendly's commission arrives in full (confirmed in test mode). The ratios are
+        // bear it and StoreHatch's commission arrives in full (confirmed in test mode). The ratios are
         // reduced to their smallest whole numbers.
         const divisor = input.splits.reduce((gcd, split) => greatestCommonDivisor(gcd, split.amountKobo), 0) || 1
         const body = await flutterwaveRequest("/payments", {
@@ -240,7 +240,7 @@ export const flutterwaveAdapter: PaymentProviderAdapter = {
     },
 
     async createSubaccount(input) {
-        // split_value is Vendly's commission, which is zero.
+        // split_value is StoreHatch's commission, which is zero.
         const body = await flutterwaveRequest("/subaccounts", {
             method: "POST",
             body: {

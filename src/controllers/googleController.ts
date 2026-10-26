@@ -98,7 +98,7 @@ export const googleSignIn = async (req: Request, res: Response) => {
 
         res.send({
             linkRequired: true,
-            message: "You already have a Vendly account with this email. Enter the code we emailed you to link Google to it.",
+            message: "You already have a StoreHatch account with this email. Enter the code we emailed you to link Google to it.",
             email: sameEmail.email
         })
         return
@@ -161,7 +161,7 @@ export const googleLink = async (req: Request, res: Response) => {
         await finishLogin(req, res, linked)
     } catch (error) {
         if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2002") {
-            res.status(400).send({ message: "That Google account is already linked to another Vendly account" })
+            res.status(400).send({ message: "That Google account is already linked to another StoreHatch account" })
             return
         }
 

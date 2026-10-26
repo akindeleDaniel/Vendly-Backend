@@ -2,7 +2,7 @@ import { OAuth2Client } from "google-auth-library"
 import { maximumNameLength, normaliseEmail } from "./accountRules.js"
 
 export type GoogleIdentity = { googleId: string; email: string; name: string }
-// Returns who Google says the person is, or null when the sign-in token is not valid for Vendly.
+// Returns who Google says the person is, or null when the sign-in token is not valid for StoreHatch.
 export type GoogleVerifier = (credential: string) => Promise<GoogleIdentity | null>
 
 let verifierOverride: GoogleVerifier | null = null
@@ -18,7 +18,7 @@ export function googleSignInAvailable(): boolean {
 }
 
 // Checks the sign-in token the browser got from Google: its signature (against Google's public keys), that it
-// was issued for Vendly's own client id, that it has not expired, and that Google has verified the email.
+// was issued for StoreHatch's own client id, that it has not expired, and that Google has verified the email.
 export async function verifyGoogleCredential(credential: string): Promise<GoogleIdentity | null> {
     if (verifierOverride) {
         return verifierOverride(credential)
@@ -40,7 +40,7 @@ export async function verifyGoogleCredential(credential: string): Promise<Google
             return null
         }
 
-        const name = (payload.name?.trim() || email.split("@")[0] || "Vendly user").slice(0, maximumNameLength)
+        const name = (payload.name?.trim() || email.split("@")[0] || "StoreHatch user").slice(0, maximumNameLength)
         return { googleId: payload.sub, email, name }
     } catch {
         return null

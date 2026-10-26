@@ -24,8 +24,8 @@ async function main() {
     try {
         await sendEmail({
             to: recipient,
-            subject: "Vendly test email",
-            text: "If you can read this, Vendly can send real emails.\n\nThe Vendly team"
+            subject: "StoreHatch test email",
+            text: "If you can read this, StoreHatch can send real emails.\n\nThe StoreHatch team"
         })
         console.log(`Sent a test email to ${recipient}. Check that inbox (and its spam folder).`)
     } catch (error) {

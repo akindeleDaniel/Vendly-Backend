@@ -72,7 +72,7 @@ export function toDisputeDetail(dispute: DetailRecord, viewer: DisputeViewer) {
     return {
         ...toDisputeSummary({ ...dispute, messages: dispute.messages.slice(-1).map((message) => ({ createdAt: message.createdAt, author: message.author })) }),
         decisionNote: dispute.decisionNote,
-        // A rejection by Vendly can be appealed once, within 7 days: canAppeal and until when.
+        // A rejection by StoreHatch can be appealed once, within 7 days: canAppeal and until when.
         appeal: appealStatus(dispute),
         sellerRespondedAt: dispute.sellerRespondedAt,
         escalatedAt: dispute.escalatedAt,

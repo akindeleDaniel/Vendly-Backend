@@ -48,7 +48,7 @@ export async function sendProviderRequest(request: ProviderRequest): Promise<Rec
     }
 
     // 4xx responses mean the provider refused this request, except rate limiting and
-    // authentication failures, which are Vendly-side problems rather than bad input.
+    // authentication failures, which are StoreHatch-side problems rather than bad input.
     const rejected = response.status >= 400 &&
         response.status < 500 &&
         ![401, 403, 429].includes(response.status)

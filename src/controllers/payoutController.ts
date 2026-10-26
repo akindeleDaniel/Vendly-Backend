@@ -463,7 +463,7 @@ export const changePayoutBankAccount = async (req: Request, res: Response) => {
 
 
 // Records that the seller accepts the current payout terms, for example after the wording changed.
-// Vendly only recovers refunds from the future payments of sellers who have accepted the current terms.
+// StoreHatch only recovers refunds from the future payments of sellers who have accepted the current terms.
 export const acceptPayoutTerms = async (req: Request, res: Response) => {
     if (req.body.feeTermsVersion !== payoutFeeTerms.version) {
         res.status(409).send({
@@ -486,7 +486,7 @@ export const acceptPayoutTerms = async (req: Request, res: Response) => {
     res.send({ acceptedFeeTermsVersion: payoutFeeTerms.version })
 }
 
-// What the seller owes Vendly for refunds, and each deduction taken from their sales so far, so a
+// What the seller owes StoreHatch for refunds, and each deduction taken from their sales so far, so a
 // seller can always see why money was deducted. Nothing is deducted until they accept the terms.
 export const getMyLiabilities = async (req: Request, res: Response) => {
     const profile = await prisma.sellerProfile.findUnique({

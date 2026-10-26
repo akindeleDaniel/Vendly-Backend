@@ -7,7 +7,7 @@ import { syncPayment } from "./paymentController.js"
 
 // Receives a provider's webhooks. The body arrives as raw bytes so the signature can be checked
 // against exactly what was sent. A payment event is never trusted on its own: it only prompts
-// Vendly to verify the reference with the provider and settle through the shared path. Each
+// StoreHatch to verify the reference with the provider and settle through the shared path. Each
 // event is recorded once; a redelivered event that was already processed is acknowledged
 // without repeating any work. Answering 500 asks the provider to deliver the event again.
 export function handlePaymentWebhook(provider: PaymentProvider) {
@@ -34,7 +34,7 @@ export function handlePaymentWebhook(provider: PaymentProvider) {
             return
         }
 
-        // A refund event only prompts Vendly to ask the provider about that payment's open refunds.
+        // A refund event only prompts StoreHatch to ask the provider about that payment's open refunds.
         // That check is safe to repeat, so these events are not recorded or deduplicated.
         if (event.isRefundEvent) {
             if (event.reference) {
@@ -102,7 +102,7 @@ export function handlePaymentWebhook(provider: PaymentProvider) {
             })
 
             if (current.status === "FAILED") {
-                // A success reported for an attempt Vendly already closed needs manual recovery.
+                // A success reported for an attempt StoreHatch already closed needs manual recovery.
                 console.error("Payment webhook reported success for a closed payment", {
                     provider,
                     reference: event.reference

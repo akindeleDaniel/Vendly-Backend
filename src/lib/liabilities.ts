@@ -1,7 +1,7 @@
 import { Prisma } from "../generated/prisma/client.js"
 import { payoutFeeTerms } from "./payoutTerms.js"
 
-// Vendly never takes more than this share of one order's total to recover what a seller owes, so a
+// StoreHatch never takes more than this share of one order's total to recover what a seller owes, so a
 // seller is not left with nothing from a sale.
 export const liabilityDeductionCapPercent = 50
 
@@ -15,7 +15,7 @@ function fromKobo(kobo: number): Prisma.Decimal {
     return new Prisma.Decimal(kobo).dividedBy(100)
 }
 
-// Decides how much of each seller order Vendly keeps, in kobo, to recover what that seller owes for
+// Decides how much of each seller order StoreHatch keeps, in kobo, to recover what that seller owes for
 // earlier refunds. Only sellers who accepted the current terms are charged, an order gives up at most
 // the cap, and what other unpaid checkouts have already planned to take is counted so the same
 // liability is never collected twice. Runs inside the payment-start transaction, which holds the
@@ -101,7 +101,7 @@ export function allocateProportionally(totalKobo: number, weights: Array<{ key: 
     return result
 }
 
-// Applies money Vendly kept from one of a seller's orders to that seller's open liabilities, oldest
+// Applies money StoreHatch kept from one of a seller's orders to that seller's open liabilities, oldest
 // first. A liability that is fully recovered is closed. Returns how much was applied, in kobo.
 export async function applyRecoveredAmount(
     tx: Prisma.TransactionClient,
@@ -152,7 +152,7 @@ export async function applyRecoveredAmount(
     }
 
     if (remainingKobo > 0) {
-        console.error("Vendly kept more than the seller owed", { sellerId, orderId, excessKobo: remainingKobo })
+        console.error("StoreHatch kept more than the seller owed", { sellerId, orderId, excessKobo: remainingKobo })
     }
 
     return recoveredKobo - remainingKobo

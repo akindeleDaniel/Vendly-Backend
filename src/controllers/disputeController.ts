@@ -215,7 +215,7 @@ export const postBuyerMessage = async (req: Request, res: Response) => {
     }
 }
 
-// The buyer appeals a rejection by Vendly, once, within 7 days, with a new message and any new evidence.
+// The buyer appeals a rejection by StoreHatch, once, within 7 days, with a new message and any new evidence.
 export const appealMyDispute = async (req: Request, res: Response) => {
     const disputeId = parseId(req.params.id)
     const thread = readThreadInput(req.body)

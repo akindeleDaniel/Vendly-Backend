@@ -196,7 +196,7 @@ export async function issueRefund(input: IssueRefundInput): Promise<Refund> {
         input
     )
 
-    // Both providers refund from Vendly's own balance, so warn before a refund that it cannot cover.
+    // Both providers refund from StoreHatch's own balance, so warn before a refund that it cannot cover.
     let balanceKobo: number | null = null
 
     try {
@@ -211,7 +211,7 @@ export async function issueRefund(input: IssueRefundInput): Promise<Refund> {
     if (balanceKobo !== null && balanceKobo < preview.amountKobo && !input.acknowledgeLowBalance) {
         throw new RefundRequestError(
             409,
-            "Vendly's balance at the payment provider is lower than this refund. Add funds, or confirm to queue it anyway.",
+            "StoreHatch's balance at the payment provider is lower than this refund. Add funds, or confirm to queue it anyway.",
             "REFUND_BALANCE_LOW",
             { availableBalance: formatNaira(balanceKobo), required: formatNaira(preview.amountKobo) }
         )
@@ -264,7 +264,7 @@ export async function issueRefund(input: IssueRefundInput): Promise<Refund> {
             transactionId: target.attempt.providerTransactionId,
             amountKobo: toKobo(refund.amount),
             customerNote: refund.customerNote,
-            merchantNote: `Vendly refund ${refund.reference}`
+            merchantNote: `StoreHatch refund ${refund.reference}`
         })
     } catch (error) {
         const reason = error instanceof PaymentProviderError ? error.providerMessage ?? error.message : undefined
@@ -344,7 +344,7 @@ async function applyProviderRefund(refundId: number, providerRefund: ProviderRef
             return
         }
 
-        // Once Vendly's money has gone to the buyer, the seller owes it back.
+        // Once StoreHatch's money has gone to the buyer, the seller owes it back.
         if (refund.chargeSeller && refund.order) {
             const created = await tx.sellerLiability.createMany({
                 data: [{ sellerId: refund.order.sellerId, refundId, amount: refund.amount }],
@@ -416,7 +416,7 @@ async function resolveDisputesForRefund(tx: Prisma.TransactionClient, refund: Re
         if (moved.count === 1) {
             resolved += 1
             await tx.disputeMessage.create({
-                data: { disputeId: id, author: "SYSTEM", body: `Vendly approved a refund of ₦${refund.amount.toFixed(2)}.` }
+                data: { disputeId: id, author: "SYSTEM", body: `StoreHatch approved a refund of ₦${refund.amount.toFixed(2)}.` }
             })
         }
     }

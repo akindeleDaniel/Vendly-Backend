@@ -73,9 +73,9 @@ function emailsTo(address: string) {
 }
 
 function codeSentTo(address: string): string {
-    const email = emailsTo(address).findLast((candidate) => /Your Vendly code is \d{6}/.test(candidate.text))
+    const email = emailsTo(address).findLast((candidate) => /Your StoreHatch code is \d{6}/.test(candidate.text))
     assert.ok(email, `No email with a code was sent to ${address}`)
-    const match = /Your Vendly code is (\d{6})/.exec(email.text)
+    const match = /Your StoreHatch code is (\d{6})/.exec(email.text)
     assert.ok(match?.[1], "The email has no code in it")
     return match[1]
 }
@@ -5264,7 +5264,7 @@ test("records needs-attention and waiting-for-funds states from the provider", a
     })
 })
 
-test("a signed refund webhook makes Vendly check the provider, and a failure asks for redelivery", async (t) => {
+test("a signed refund webhook makes StoreHatch check the provider, and a failure asks for redelivery", async (t) => {
     process.env.PAYSTACK_SECRET_KEY ||= "sk_test_integration_webhook_secret"
     t.mock.method(console, "error", () => {})
 
@@ -5335,7 +5335,7 @@ test("a seller's liability is recovered from later payments, never more than hal
         const [nextOrder] = await prisma.order.findMany({ where: { checkoutId: nextCheckoutId } })
         assert.equal(nextOrder!.liabilityDeduction.toFixed(2), "1500.00")
 
-        // Paystack reports Vendly's share as one lump, after Vendly's part of the fee.
+        // Paystack reports StoreHatch's share as one lump, after StoreHatch's part of the fee.
         const reference = started.body.payment.reference as string
         fakes.behaviors.PAYSTACK.verify = async () => ({
             ...paystackVerification("success", reference),
@@ -5404,7 +5404,7 @@ test("a liability smaller than the cap is cleared in one payment, with Flutterwa
         const [nextOrder] = await prisma.order.findMany({ where: { checkoutId: nextCheckoutId } })
         assert.equal(nextOrder!.liabilityDeduction.toFixed(2), "1000.00")
         assert.equal(nextOrder!.sellerReceives?.toFixed(2), "1980.00")
-        // Flutterwave reports no fee, so it is what is left after the seller's payout and Vendly's part.
+        // Flutterwave reports no fee, so it is what is left after the seller's payout and StoreHatch's part.
         assert.equal(nextOrder!.providerFee?.toFixed(2), "20.00")
 
         const liability = await prisma.sellerLiability.findUniqueOrThrow({ where: { refundId: issued.body.refund.id } })
@@ -5605,11 +5605,11 @@ test("the real adapters send refunds, balance checks and retained shares the way
 
     // Paystack: refund, list, balance
     nextResponse = { status: true, data: { id: 3018284, status: "pending", amount: 150000, fully_deducted: false, expected_at: "2026-11-01T00:00:00.000Z", createdAt: "2026-10-20T10:00:00.000Z" } }
-    const created = await paystackAdapter.createRefund({ transactionReference: "VND-9-abc", transactionId: "555", amountKobo: 150000, customerNote: "Sorry", merchantNote: "Vendly refund RFD-1" })
+    const created = await paystackAdapter.createRefund({ transactionReference: "VND-9-abc", transactionId: "555", amountKobo: 150000, customerNote: "Sorry", merchantNote: "StoreHatch refund RFD-1" })
     assert.deepEqual(requests.at(-1), {
         url: "https://api.paystack.co/refund",
         method: "POST",
-        body: { transaction: "VND-9-abc", amount: 150000, currency: "NGN", customer_note: "Sorry", merchant_note: "Vendly refund RFD-1" }
+        body: { transaction: "VND-9-abc", amount: 150000, currency: "NGN", customer_note: "Sorry", merchant_note: "StoreHatch refund RFD-1" }
     })
     assert.equal(created.providerRefundId, "3018284")
     assert.equal(created.outcome, "processing")
@@ -5640,7 +5640,7 @@ test("the real adapters send refunds, balance checks and retained shares the way
     nextResponse = { status: true, data: [{ currency: "GHS", balance: 5 }, { currency: "NGN", balance: 23446800 }] }
     assert.equal(await paystackAdapter.getBalanceKobo(), 23446800)
 
-    // Paystack: a retained share is whatever the sellers' shares leave over, and Vendly's share is read back.
+    // Paystack: a retained share is whatever the sellers' shares leave over, and StoreHatch's share is read back.
     nextResponse = { status: true, data: { authorization_url: "https://checkout.paystack.com/x" } }
     await paystackAdapter.initializePayment({
         reference: "VND-9-abc", amountKobo: 3000000, email: "buyer@example.test", callbackUrl: "http://localhost:5173/checkout/payment-return",
@@ -5665,11 +5665,11 @@ test("the real adapters send refunds, balance checks and retained shares the way
 
     // Flutterwave: refund by transaction ID, in naira
     nextResponse = { status: "success", data: { id: 8612, amount_refunded: 1500, status: "completed", created_at: "2026-10-20T10:00:00.000Z" } }
-    const flwRefund = await flutterwaveAdapter.createRefund({ transactionReference: "VND-9-abc", transactionId: "908790", amountKobo: 150000, customerNote: null, merchantNote: "Vendly refund RFD-2" })
+    const flwRefund = await flutterwaveAdapter.createRefund({ transactionReference: "VND-9-abc", transactionId: "908790", amountKobo: 150000, customerNote: null, merchantNote: "StoreHatch refund RFD-2" })
     assert.deepEqual(requests.at(-1), {
         url: "https://api.flutterwave.com/v3/transactions/908790/refund",
         method: "POST",
-        body: { amount: 1500, comments: "Vendly refund RFD-2" }
+        body: { amount: 1500, comments: "StoreHatch refund RFD-2" }
     })
     assert.equal(flwRefund.outcome, "succeeded")
     assert.equal(flwRefund.amountKobo, 150000)
@@ -6416,7 +6416,7 @@ test("signing up with an address that already has an account looks the same, cha
             const unchanged = await prisma.user.findUniqueOrThrow({ where: { id: context.userId } })
             assert.equal(unchanged.role, "CONSUMER")
             assert.ok(await bcrypt.compare(context.password, unchanged.passwordHash))
-            assert.equal(emailsTo(context.email).at(-1)?.subject, "You already have a Vendly account")
+            assert.equal(emailsTo(context.email).at(-1)?.subject, "You already have a StoreHatch account")
             assert.equal(await prisma.emailOtp.count({ where: { userId: context.userId, purpose: "VERIFY_EMAIL" } }), 0)
         } finally {
             await deleteRegistered([freshEmail])
@@ -7112,12 +7112,12 @@ test("accounts never confirmed within a week are removed, and old codes and devi
 })
 
 test("email settings: console mode for development, SMTP needs its settings, production must really send", () => {
-    assert.deepEqual(loadEmailConfig({}), { mode: "console", from: "Vendly <no-reply@vendly.local>" })
+    assert.deepEqual(loadEmailConfig({}), { mode: "console", from: "StoreHatch <no-reply@storehatch.local>" })
     assert.throws(() => loadEmailConfig({ EMAIL_MODE: "carrier-pigeon" }), /EMAIL_MODE must be console or smtp/)
     assert.throws(() => loadEmailConfig({ EMAIL_MODE: "smtp" }), /SMTP_HOST, SMTP_USER, SMTP_PASSWORD/)
     assert.throws(() => loadEmailConfig({ EMAIL_MODE: "smtp", SMTP_HOST: "h", SMTP_USER: "u", SMTP_PASSWORD: "p", SMTP_PORT: "99999" }), /SMTP_PORT/)
 
-    const smtp = { EMAIL_MODE: "smtp", EMAIL_FROM: "Vendly <hello@example.test>", SMTP_HOST: "smtp.example.test", SMTP_USER: "u", SMTP_PASSWORD: "p" }
+    const smtp = { EMAIL_MODE: "smtp", EMAIL_FROM: "StoreHatch <hello@example.test>", SMTP_HOST: "smtp.example.test", SMTP_USER: "u", SMTP_PASSWORD: "p" }
     const config = loadEmailConfig(smtp)
     assert.equal(config.mode, "smtp")
     assert.equal(config.mode === "smtp" ? config.smtp.port : 0, 587)
@@ -8093,19 +8093,19 @@ test("a welcome email is sent once the email is confirmed, and a notice when the
             await register(baseUrl, { name: "Ada Obi", email, password: goodPassword, role: "CONSUMER" })
             await register(baseUrl, { name: "Seller Sam", email: sellerEmail, password: goodPassword, role: "SELLER" })
             await waitForNotifications()
-            assert.equal(subjectsTo(email).some((subject) => subject === "Welcome to Vendly"), false)
+            assert.equal(subjectsTo(email).some((subject) => subject === "Welcome to StoreHatch"), false)
 
             const confirmed = await postJson(baseUrl, "/users/verify-email", { email, code: codeSentTo(email) })
             await postJson(baseUrl, "/users/verify-email", { email: sellerEmail, code: codeSentTo(sellerEmail) })
             await waitForNotifications()
-            const welcome = emailsTo(email).find((mail) => mail.subject === "Welcome to Vendly")
+            const welcome = emailsTo(email).find((mail) => mail.subject === "Welcome to StoreHatch")
             assert.ok(welcome)
-            assert.match(welcome.text, /Welcome to Vendly, Ada Obi/)
+            assert.match(welcome.text, /Welcome to StoreHatch, Ada Obi/)
             assert.match(welcome.text, new RegExp(config.frontendUrl.replace(/[.]/g, "\\.")))
-            assert.match(emailsTo(sellerEmail).find((mail) => mail.subject === "Welcome to Vendly")?.text ?? "", /set up your shop/i)
+            assert.match(emailsTo(sellerEmail).find((mail) => mail.subject === "Welcome to StoreHatch")?.text ?? "", /set up your shop/i)
 
             // Only once.
-            assert.equal(emailsTo(email).filter((mail) => mail.subject === "Welcome to Vendly").length, 1)
+            assert.equal(emailsTo(email).filter((mail) => mail.subject === "Welcome to StoreHatch").length, 1)
 
             // Changing the password tells the owner, and the notice never contains the passwords.
             const access = cookiesFrom(confirmed).token?.value
@@ -8140,7 +8140,10 @@ test("a payment, shipping, delivery and its confirmation each email the right pe
         assert.ok(receipt)
         assert.match(receipt.text, /2 × order-emails listing/)
         assert.match(receipt.text, new RegExp(`/orders/${checkoutId}`))
+        // The receipt invites the buyer to open a shop too, after the sign-off; the seller's alert does not.
+        assert.match(receipt.text, /The StoreHatch team\n\n---\nSell online too\? Open your own StoreHatch shop for free: .*\/seller\/register$/)
         const alert = emailsTo(seller).find((mail) => mail.subject === "New order: ₦3,000.00")
+        assert.equal(alert?.text.includes("Sell online too"), false)
         assert.ok(alert)
         assert.match(alert.text, new RegExp(`/seller/orders/${orderId}`))
         // The seller is told where it goes, but never who the buyer is.
@@ -8195,19 +8198,19 @@ test("complaints email the other side at each step, with a short excerpt and a l
         await waitForNotifications()
         const replied = emailsTo(buyer).find((mail) => mail.subject === `The seller replied about order #${orderId}`)
         assert.ok(replied)
-        assert.match(replied.text, /agreed, and it is waiting for Vendly to approve/)
+        assert.match(replied.text, /agreed, and it is waiting for StoreHatch to approve/)
         assert.match(replied.text, new RegExp(`/disputes/${id}`))
         assert.equal(replied.text.includes(seller), false)
 
         await request("POST", `/admin/disputes/${id}/messages`, { message: "We are checking the photos you sent." }, adminToken)
         await waitForNotifications()
-        assert.ok(emailsTo(buyer).some((mail) => mail.subject === `Vendly wrote in the complaint about order #${orderId}`))
-        assert.ok(emailsTo(seller).some((mail) => mail.subject === `Vendly wrote in the complaint about order #${orderId}`))
+        assert.ok(emailsTo(buyer).some((mail) => mail.subject === `StoreHatch wrote in the complaint about order #${orderId}`))
+        assert.ok(emailsTo(seller).some((mail) => mail.subject === `StoreHatch wrote in the complaint about order #${orderId}`))
 
         await request("POST", `/admin/disputes/${id}/reject`, { note: "The photos do not show damage, so this is not approved." }, adminToken)
         await waitForNotifications()
         for (const address of [buyer, seller]) {
-            const decision = emailsTo(address).find((mail) => mail.subject === `Vendly's decision on the complaint about order #${orderId}`)
+            const decision = emailsTo(address).find((mail) => mail.subject === `StoreHatch's decision on the complaint about order #${orderId}`)
             assert.ok(decision, address)
             assert.match(decision.text, /did not approve a refund/)
             assert.match(decision.text, /do not show damage/)
@@ -8236,8 +8239,8 @@ test("a withdrawn complaint, a seller's refund offer and an escalation are each 
         await prisma.dispute.update({ where: { id }, data: { responseDueAt: new Date(Date.now() - 1000) } })
         await escalateOverdueDisputes()
         await waitForNotifications()
-        assert.ok(emailsTo(buyer).some((mail) => mail.subject === `The complaint about order #${orderId} was passed to Vendly`))
-        assert.ok(emailsTo(seller).some((mail) => mail.subject === `The complaint about order #${orderId} was passed to Vendly`))
+        assert.ok(emailsTo(buyer).some((mail) => mail.subject === `The complaint about order #${orderId} was passed to StoreHatch`))
+        assert.ok(emailsTo(seller).some((mail) => mail.subject === `The complaint about order #${orderId} was passed to StoreHatch`))
     })
 })
 
@@ -8253,7 +8256,7 @@ test("a refund emails the buyer as it starts and as it completes, and tells the 
         const started = emailsTo(buyer).find((mail) => mail.subject === "Your refund of ₦1,000.00 has started")
         assert.ok(started)
         assert.match(started.text, new RegExp(`order #${orderId}`))
-        const charged = emailsTo(seller).find((mail) => mail.subject === `Vendly refunded a buyer for order #${orderId}`)
+        const charged = emailsTo(seller).find((mail) => mail.subject === `StoreHatch refunded a buyer for order #${orderId}`)
         assert.ok(charged)
         assert.match(charged.text, /₦1,000\.00/)
         assert.match(charged.text, /Goodwill refund for a late delivery/)
@@ -8275,7 +8278,7 @@ test("a refund emails the buyer as it starts and as it completes, and tells the 
         await request("POST", `/admin/refunds/${refunded.body.refund.id}/sync`, {}, adminToken)
         await waitForNotifications()
         assert.equal(emailsTo(buyer).filter((mail) => mail.subject === "Your refund of ₦1,000.00 is complete").length, 1)
-        assert.equal(emailsTo(seller).filter((mail) => mail.subject.startsWith("Vendly refunded a buyer")).length, 1)
+        assert.equal(emailsTo(seller).filter((mail) => mail.subject.startsWith("StoreHatch refunded a buyer")).length, 1)
     })
 })
 
@@ -9095,7 +9098,7 @@ test("the public listings come a page at a time, newest first", async () => {
 
 // ---- Appeals and reopening ----
 
-test("a buyer can appeal Vendly's rejection once, within a week, and the second decision is final", async () => {
+test("a buyer can appeal StoreHatch's rejection once, within a week, and the second decision is final", async () => {
     await withPaymentCheckout("dispute-appeal", async (context) => {
         const { fixture, request, adminToken } = context
         const seller = (await prisma.user.findUniqueOrThrow({ where: { id: fixture.sellerId } })).email
@@ -9144,7 +9147,7 @@ test("a buyer can appeal Vendly's rejection once, within a week, and the second 
         assert.equal((await request("GET", "/admin/disputes", undefined, adminToken)).body.disputes.some((item: { id: number }) => item.id === id), true)
         const twice = await appeal(appealText)
         assert.equal(twice.status, 409)
-        assert.match(twice.body.message, /Only a complaint that Vendly rejected/)
+        assert.match(twice.body.message, /Only a complaint that StoreHatch rejected/)
 
         // The second rejection is final for the buyer.
         await request("POST", `/admin/disputes/${id}/reject`, { note: "We looked again and the decision stands." }, adminToken)
@@ -9210,12 +9213,12 @@ test("an administrator can reopen a rejected complaint, but not one that ended i
         assert.equal(dispute.decisionNote, null)
         const last = dispute.messages.at(-1)
         assert.equal(last.author, "ADMIN")
-        assert.match(last.body, /^Vendly reopened this complaint: The courier has sent us a damage report\./)
+        assert.match(last.body, /^StoreHatch reopened this complaint: The courier has sent us a damage report\./)
         // Reopening is not the buyer's appeal, so the buyer's one appeal is still there for later.
         assert.equal(dispute.appeal.appealed, false)
         await waitForNotifications()
         for (const address of [buyer, seller]) {
-            assert.ok(emailsTo(address).some((mail) => /Vendly wrote in the complaint/.test(mail.subject) && /reopened this complaint/.test(mail.text)), address)
+            assert.ok(emailsTo(address).some((mail) => /StoreHatch wrote in the complaint/.test(mail.subject) && /reopened this complaint/.test(mail.text)), address)
         }
         assert.equal((await reopen({ note: "Reopening an open one again." })).status, 409)
 
@@ -9251,7 +9254,7 @@ test("lost complaints are strikes: a warning at 2, a block at 4, and an administ
             }
         })
 
-        // A real complaint that Vendly approves is the first strike. One strike is not a warning.
+        // A real complaint that StoreHatch approves is the first strike. One strike is not a warning.
         const id = (await complain(context, orderId)).body.dispute.id as number
         assert.equal((await request("POST", `/admin/disputes/${id}/approve`, { note: "Approved after review of the photos." }, adminToken)).status, 201)
         await waitForNotifications()
@@ -9619,7 +9622,7 @@ test("super administrators manage the administrator team with their password, an
         // The two people involved are told.
         await waitForNotifications()
         const subjects = subjectsTo(targetEmail)
-        for (const subject of ["You are now a Vendly administrator", "You are now a Vendly super administrator", "Your super administrator access was removed", "Your administrator access was removed"]) {
+        for (const subject of ["You are now a StoreHatch administrator", "You are now a StoreHatch super administrator", "Your super administrator access was removed", "Your administrator access was removed"]) {
             assert.ok(subjects.includes(subject), subject)
         }
 

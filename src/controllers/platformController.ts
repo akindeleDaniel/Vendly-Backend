@@ -9,8 +9,8 @@ function money(value: Prisma.Decimal | null | undefined): string {
     return new Prisma.Decimal(value ?? 0).toFixed(2)
 }
 
-// Money that went through Vendly in a period: what buyers paid, what was refunded back, and the difference. This is
-// the value of sales on the platform, not Vendly's own income: Vendly takes no commission on orders, so a seller's
+// Money that went through StoreHatch in a period: what buyers paid, what was refunded back, and the difference. This is
+// the value of sales on the platform, not StoreHatch's own income: StoreHatch takes no commission on orders, so a seller's
 // share goes to the seller and the provider's fee comes out of it.
 async function salesSince(since: Date | null) {
     const [paid, refunded] = await Promise.all([
@@ -108,7 +108,7 @@ export const getPlatformSummary = async (_req: Request, res: Response) => {
             last7Days: orders7,
             last30Days: orders30
         },
-        // The value of sales through Vendly (not Vendly's own income, which is nothing while it takes no commission).
+        // The value of sales through StoreHatch (not StoreHatch's own income, which is nothing while it takes no commission).
         sales: { allTime: salesAll, last30Days: sales30, last7Days: sales7, today: salesToday },
         refunds: {
             pending: refundCount("PENDING"),

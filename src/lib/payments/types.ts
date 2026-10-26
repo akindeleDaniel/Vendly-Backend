@@ -20,8 +20,8 @@ export type InitializePaymentInput = {
     email: string
     callbackUrl: string
     // One entry per seller order. amountKobo is what the seller receives; retainedKobo is the part of
-    // their order Vendly keeps to recover what they owe for earlier refunds (usually 0). The two add up
-    // to the seller order's total, and the retained parts together make up Vendly's own share.
+    // their order StoreHatch keeps to recover what they owe for earlier refunds (usually 0). The two add up
+    // to the seller order's total, and the retained parts together make up StoreHatch's own share.
     splits: Array<{ subaccountCode: string; amountKobo: number; retainedKobo: number }>
 }
 
@@ -31,7 +31,7 @@ export type SellerShare = {
     subaccountCode: string
     receivedKobo: number
     feeKobo: number | null
-    // The part of this seller's order Vendly kept, when the provider reports it per seller (Flutterwave).
+    // The part of this seller's order StoreHatch kept, when the provider reports it per seller (Flutterwave).
     retainedKobo?: number | null
 }
 
@@ -48,12 +48,12 @@ export type PaymentVerification =
         transactionId: string | null
         // Null when the provider did not report the split.
         sellerShares?: SellerShare[] | null
-        // What the provider reports Vendly itself received from the split, in kobo (null if not reported).
+        // What the provider reports StoreHatch itself received from the split, in kobo (null if not reported).
         vendlyShareKobo?: number | null
     }
 
 export type CreateRefundInput = {
-    // Vendly's own reference for the payment, plus the provider's transaction ID when it has one.
+    // StoreHatch's own reference for the payment, plus the provider's transaction ID when it has one.
     transactionReference: string
     transactionId: string | null
     amountKobo: number
@@ -67,27 +67,27 @@ export type ProviderRefund = {
     outcome: "processing" | "succeeded" | "failed" | "needs_attention"
     providerStatus: string
     amountKobo: number
-    // True while the provider is waiting for Vendly's balance to cover the refund.
+    // True while the provider is waiting for StoreHatch's balance to cover the refund.
     awaitingFunds: boolean
     expectedAt: Date | null
     createdAt: Date | null
 }
 
-// A webhook event reduced to what Vendly needs. The payload itself is never trusted: a payment
-// event only prompts Vendly to verify the reference with the provider.
+// A webhook event reduced to what StoreHatch needs. The payload itself is never trusted: a payment
+// event only prompts StoreHatch to verify the reference with the provider.
 export type WebhookEvent = {
     // Unique per event, used to recognise redeliveries.
     eventKey: string
     eventType: string
     reference: string | null
     isPaymentEvent: boolean
-    // A refund status change. Like payment events, it only prompts Vendly to ask the provider.
+    // A refund status change. Like payment events, it only prompts StoreHatch to ask the provider.
     isRefundEvent: boolean
 }
 
 export type WebhookHeaders = Record<string, string | string[] | undefined>
 
-// The provider calls Vendly makes. Each provider implements this; tests use a fake.
+// The provider calls StoreHatch makes. Each provider implements this; tests use a fake.
 export interface PaymentProviderAdapter {
     readonly provider: PaymentProvider
     // Checks the webhook signature against the exact bytes received.
@@ -100,7 +100,7 @@ export interface PaymentProviderAdapter {
     // The provider's refunds for one payment. When providerRefundId is known, that refund is looked up
     // directly where the provider allows it.
     findRefunds(input: { transactionReference: string; transactionId: string | null; providerRefundId: string | null }): Promise<ProviderRefund[]>
-    // Vendly's available balance at the provider, in kobo, or null when the provider does not say.
+    // StoreHatch's available balance at the provider, in kobo, or null when the provider does not say.
     getBalanceKobo(): Promise<number | null>
     resolveAccount(input: ResolveAccountInput): Promise<{ accountName: string }>
     createSubaccount(input: CreateSubaccountInput): Promise<ProviderSubaccount>

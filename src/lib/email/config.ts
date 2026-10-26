@@ -2,7 +2,7 @@ export type EmailConfig =
     | { mode: "console"; from: string }
     | { mode: "smtp"; from: string; smtp: { host: string; port: number; user: string; password: string } }
 
-const defaultFrom = "Vendly <no-reply@vendly.local>"
+const defaultFrom = "StoreHatch <no-reply@storehatch.local>"
 
 // EMAIL_MODE=console prints emails instead of sending them (development). EMAIL_MODE=smtp sends through any
 // provider that offers SMTP (Gmail app password for development, or a transactional service for launch).

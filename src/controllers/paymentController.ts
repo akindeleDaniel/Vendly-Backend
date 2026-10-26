@@ -94,7 +94,7 @@ function sendPaymentRequestError(error: unknown, res: Response): boolean {
 }
 
 // Records what the provider reported for a PENDING attempt. Success is accepted only when the
-// reference, amount and currency all match what Vendly asked for. Every write is conditional on
+// reference, amount and currency all match what StoreHatch asked for. Every write is conditional on
 // the attempt still being PENDING, so repeated or concurrent checks cannot change a final result.
 // Completing the checkout and its orders (settlement) is a separate step.
 async function applyVerification(attempt: PaymentAttempt, verification: PaymentVerification): Promise<void> {
@@ -390,7 +390,7 @@ export async function createCheckoutPayment(req: Request, res: Response) {
                 )
             }
 
-            // Part of a seller's order may be kept by Vendly to recover what they owe for earlier refunds.
+            // Part of a seller's order may be kept by StoreHatch to recover what they owe for earlier refunds.
             // The customer still pays the same total; only how it is split changes.
             const deductions = await planLiabilityDeductions(tx, checkout.id, checkout.orders.map((order) => ({
                 id: order.id,

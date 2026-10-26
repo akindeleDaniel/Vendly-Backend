@@ -19,7 +19,7 @@ const commonPasswords = new Set([
     "administrator", "adminadmin", "admin12345", "admin123456", "administrator1", "superuser12",
     "football123", "baseball123", "dragon12345", "monkey12345", "sunshine123", "princess123", "trustno1234", "master12345",
     "internet123", "computer123", "whatever123", "freedom1234", "starwars123", "shadow12345", "michael1234", "jennifer123",
-    "nigeria123", "nigeria1234", "lagos12345", "naija12345", "vendly1234", "vendly12345", "marketplace1"
+    "nigeria123", "nigeria1234", "lagos12345", "naija12345", "vendly1234", "vendly12345", "storehatch1", "storehatch123", "storehatch1234", "marketplace1"
 ])
 
 export function validateName(value: unknown): string | null {

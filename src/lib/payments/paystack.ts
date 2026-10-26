@@ -33,13 +33,13 @@ function readSellerShares(data: Record<string, unknown>): SellerShare[] | null {
         : null
 }
 
-// Paystack reports Vendly's own share, after its part of the fee, as split.shares.integration (kobo).
+// Paystack reports StoreHatch's own share, after its part of the fee, as split.shares.integration (kobo).
 function readVendlyShareKobo(data: Record<string, unknown>): number | null {
     const share = Number((data.split as { shares?: { integration?: unknown } } | null | undefined)?.shares?.integration)
     return Number.isSafeInteger(share) ? share : null
 }
 
-// A Paystack refund. fully_deducted says whether Vendly's balance has covered it; only the list and
+// A Paystack refund. fully_deducted says whether StoreHatch's balance has covered it; only the list and
 // fetch responses report that reliably, so the create response never claims the refund awaits funds.
 function toProviderRefund(data: Record<string, unknown>, reportsFunding: boolean): ProviderRefund {
     const providerStatus = String(data.status ?? "")
@@ -128,9 +128,9 @@ export const paystackAdapter: PaymentProviderAdapter = {
     },
 
     async initializePayment(input) {
-        // A flat split gives each seller their share and sends whatever is left to Vendly: ₦0 normally,
+        // A flat split gives each seller their share and sends whatever is left to StoreHatch: ₦0 normally,
         // or the amount kept to recover a seller's earlier refund. All-proportional makes every party,
-        // Vendly included, bear the fee in proportion to its share (confirmed in test mode).
+        // StoreHatch included, bear the fee in proportion to its share (confirmed in test mode).
         const body = await paystackRequest("/transaction/initialize", {
             method: "POST",
             body: {
@@ -228,7 +228,7 @@ export const paystackAdapter: PaymentProviderAdapter = {
     },
 
     async createSubaccount(input) {
-        // percentage_charge is Vendly's cut. Vendly takes no commission, and each payment's
+        // percentage_charge is StoreHatch's cut. StoreHatch takes no commission, and each payment's
         // split sets the sellers' shares explicitly.
         const body = await paystackRequest("/subaccount", {
             method: "POST",
