@@ -12,7 +12,7 @@ import {
     respondToMyDispute,
     withdrawSellerOffer
 } from "../controllers/disputeController.js"
-import { getMyEarnings } from "../controllers/sellerEarningsController.js"
+import { getMyEarnings, getMySalesSummary } from "../controllers/sellerEarningsController.js"
 import { getMyStanding } from "../controllers/sellerStandingController.js"
 import { getMyShippingRates, setMyShippingRates } from "../controllers/shippingRatesController.js"
 import { authMiddleware } from "../middleware/authMiddleware.js"
@@ -34,6 +34,7 @@ router.put("/payout/accounts", authMiddleware, requireRole("SELLER"), changePayo
 router.post("/payout/terms", authMiddleware, requireRole("SELLER"), acceptPayoutTerms)
 router.get("/liabilities", authMiddleware, requireRole("SELLER"), getMyLiabilities)
 router.get("/earnings", authMiddleware, requireRole("SELLER"), getMyEarnings)
+router.get("/summary", authMiddleware, requireRole("SELLER"), getMySalesSummary)
 router.get("/standing", authMiddleware, requireRole("SELLER"), getMyStanding)
 router.get("/shipping-rates", authMiddleware, requireRole("SELLER"), getMyShippingRates)
 router.put("/shipping-rates", authMiddleware, requireRole("SELLER"), setMyShippingRates)

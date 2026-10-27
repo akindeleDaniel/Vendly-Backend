@@ -10809,3 +10809,65 @@ test("a shopper who leaves items in their cart for a day gets one reminder, and 
         assert.equal(remindersTo().length, 3)
     })
 })
+
+// ---- The seller's sales summary ----
+
+test("the sales summary shows a period's sales, the period before, top products, each day and what needs attention", async () => {
+    await withPaymentCheckout("sales-summary", async (context) => {
+        const { fixture, request } = context
+        const summary = async (query = "") => (await request("GET", `/seller/summary${query}`, undefined, fixture.sellerToken)).body
+        const dayMs = 24 * 60 * 60 * 1000
+        const lagosDay = (offsetDays = 0) => new Date(Date.now() + 60 * 60 * 1000 + offsetDays * dayMs).toISOString().slice(0, 10)
+        const today = lagosDay()
+
+        // Nothing sold yet: the last 30 days, all zero.
+        const empty = await summary()
+        assert.deepEqual([empty.from, empty.to, empty.days.length], [lagosDay(-29), today, 30])
+        assert.deepEqual(empty.totals, { orders: 0, sales: "0.00", refunded: "0.00", netSales: "0.00", itemsSold: 0, customers: 0, averageOrder: null })
+        assert.deepEqual(empty.topProducts, [])
+
+        // One paid order of 2 × ₦1,500, bought as an option of a product: it counts towards the product.
+        const orderId = await payForCheckout(context)
+        const product = (await request("POST", "/listings", {
+            title: "Summary hoodie", description: "Soft", price: 1500, category: "Electronics",
+            imageUrls: ["https://img.example.test/summary-hoodie.jpg"],
+            options: [{ label: "Blue", price: 1500, stockQuantity: 5 }]
+        }, fixture.sellerToken)).body
+        await prisma.orderItem.updateMany({ where: { orderId }, data: { listingId: product.options[0].listingId } })
+        // Paid at 00:30 Nigerian time today (23:30 UTC yesterday): it counts on today's date.
+        await prisma.order.update({ where: { id: orderId }, data: { createdAt: new Date(`${lagosDay(-1)}T23:30:00.000Z`) } })
+
+        const sold = await summary()
+        assert.deepEqual(sold.totals, { orders: 1, sales: "3000.00", refunded: "0.00", netSales: "3000.00", itemsSold: 2, customers: 1, averageOrder: "3000.00" })
+        assert.deepEqual(sold.topProducts, [{ listingId: product.id, title: "Summary hoodie", imageUrl: "https://img.example.test/summary-hoodie.jpg", onSale: true, quantity: 2, sales: "3000.00" }])
+        assert.deepEqual(sold.days.at(-1), { date: today, orders: 1, sales: "3000.00" })
+        assert.deepEqual(sold.days.at(-2), { date: lagosDay(-1), orders: 0, sales: "0.00" })
+        assert.deepEqual(sold.needsAttention, { ordersToShip: 1, awaitingBuyerConfirmation: 0, complaintsToAnswer: 0, openComplaints: 0, preOrdersToAnswer: 0 })
+        assert.equal(sold.previous.orders, 0)
+
+        // Refunds come off the net sales.
+        await prisma.order.update({ where: { id: orderId }, data: { refundedAmount: 1000 } })
+        assert.deepEqual([(await summary()).totals.refunded, (await summary()).totals.netSales], ["1000.00", "2000.00"])
+
+        // An order from before the period shows in "previous", for comparing.
+        await prisma.order.update({ where: { id: orderId }, data: { createdAt: new Date(Date.now() - 40 * dayMs) } })
+        const later = await summary()
+        assert.deepEqual([later.totals.orders, later.previous.orders, later.previous.sales], [0, 1, "3000.00"])
+        assert.deepEqual([later.previous.from, later.previous.to], [lagosDay(-59), lagosDay(-30)])
+
+        // A chosen period, and the date checks.
+        const oneDay = await summary(`?from=${today}&to=${today}`)
+        assert.deepEqual([oneDay.days.length, oneDay.previous.from, oneDay.previous.to], [1, lagosDay(-1), lagosDay(-1)])
+        for (const [query, message] of [
+            ["?from=2026-13-01", /YYYY-MM-DD/],
+            ["?from=2026-10-10&to=2026-10-01", /start date/],
+            ["?from=2025-01-01&to=2026-01-02", /at most 366 days/]
+        ] as const) {
+            const refused = await request("GET", `/seller/summary${query}`, undefined, fixture.sellerToken)
+            assert.equal(refused.status, 400, query)
+            assert.match(refused.body.message, message)
+        }
+        assert.equal((await request("GET", "/seller/summary", undefined, fixture.token)).status, 403)
+        await prisma.orderItem.updateMany({ where: { orderId }, data: { listingId: fixture.listingId } })
+    })
+})
