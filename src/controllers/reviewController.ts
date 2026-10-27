@@ -13,6 +13,7 @@ import {
     parseReportReason,
     recalculateRating,
     ReviewRequestError,
+    reviewSummary,
     reviewsPageSize,
     type ReviewKind
 } from "../lib/reviews.js"
@@ -305,31 +306,46 @@ export const listMyReviews = async (req: Request, res: Response) => {
 
     const paging = { orderBy: [{ createdAt: "desc" as const }, { id: "desc" as const }], skip: (page - 1) * reviewsPageSize, take: reviewsPageSize }
     const select = { id: true, rating: true, comment: true, photoUrls: true, createdAt: true, reportedAt: true, hiddenAt: true, buyer: { select: { name: true } } }
+    const profile = await prisma.sellerProfile.findUnique({ where: { userId: req.user!.id }, select: { id: true } })
 
-    if (type === "shop") {
-        const profile = await prisma.sellerProfile.findUnique({ where: { userId: req.user!.id }, select: { id: true, ratingCount: true, ratingSum: true } })
-
-        if (!profile) {
-            res.status(404).send({ message: "Store profile not found" })
-            return
-        }
-
-        const where = { sellerProfileId: profile.id }
-        const [total, rows] = await Promise.all([prisma.shopReview.count({ where }), prisma.shopReview.findMany({ where, select, ...paging })])
-        res.send({ page, pageSize: reviewsPageSize, total, reviews: rows.map(toSellerReview) })
+    if (type === "shop" && !profile) {
+        res.status(404).send({ message: "Store profile not found" })
         return
     }
 
-    const where = { listing: { userId: req.user!.id } }
-    const [total, rows] = await Promise.all([
-        prisma.productReview.count({ where }),
-        prisma.productReview.findMany({ where, select: { ...select, listing: { select: { id: true, title: true } } }, ...paging })
+    // Reviews of the seller's shop, and of all their products (including archived ones; an option's reviews belong
+    // to its product). The lists and counts include hidden and reported reviews; the summary, like the public
+    // rating, counts only visible ones.
+    const shopWhere = { sellerProfileId: profile?.id ?? -1 }
+    const productWhere = { listing: { userId: req.user!.id } }
+    // The number on both tabs, whichever one is open.
+    const countsPromise = Promise.all([
+        profile ? prisma.shopReview.count({ where: shopWhere }) : Promise.resolve(0),
+        prisma.productReview.count({ where: productWhere })
+    ]).then(([shop, product]) => ({ shop, product }))
+
+    if (type === "shop") {
+        const [counts, summary, rows] = await Promise.all([
+            countsPromise,
+            reviewSummary("shop", shopWhere),
+            prisma.shopReview.findMany({ where: shopWhere, select, ...paging })
+        ])
+        res.send({ page, pageSize: reviewsPageSize, total: counts.shop, reviews: rows.map(toSellerReview), summary, counts })
+        return
+    }
+
+    const [counts, summary, rows] = await Promise.all([
+        countsPromise,
+        reviewSummary("product", productWhere),
+        prisma.productReview.findMany({ where: productWhere, select: { ...select, listing: { select: { id: true, title: true } } }, ...paging })
     ])
     res.send({
         page,
         pageSize: reviewsPageSize,
-        total,
-        reviews: rows.map((row) => ({ ...toSellerReview(row), listing: row.listing }))
+        total: counts.product,
+        reviews: rows.map((row) => ({ ...toSellerReview(row), listing: row.listing })),
+        summary,
+        counts
     })
 }
 
