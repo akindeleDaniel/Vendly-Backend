@@ -5819,7 +5819,9 @@ test("a buyer opens a complaint about a shipped order, and the buyer and seller 
 
         // Order pages point to the complaint.
         const buyerOrder = await request("GET", `/orders/${checkoutId}`)
-        assert.deepEqual(buyerOrder.body.sellerOrders[0].dispute, { id: dispute.id, status: "OPEN", outcome: null, reason: "DAMAGED" })
+        const { requestedAmount, responseDueAt, createdAt, ...orderDispute } = buyerOrder.body.sellerOrders[0].dispute
+        assert.deepEqual(orderDispute, { id: dispute.id, status: "OPEN", outcome: null, reason: "DAMAGED" })
+        assert.deepEqual([requestedAmount, typeof responseDueAt, typeof createdAt], ["3000.00", "string", "string"])
         const sellerOrder = await request("GET", `/seller/orders/${orderId}`, undefined, fixture.sellerToken)
         assert.equal(sellerOrder.body.dispute.id, dispute.id)
 
@@ -10177,6 +10179,19 @@ test("my orders can be filtered by tab, and every tab shows its count", async ()
         // A complaint is an issue until it is withdrawn.
         assert.equal((await complain(context, orderId)).status, 201)
         await expectTabs({ all: 1, progress: 1, delivered: 0, issues: 1 })
+        // The complaint's amount, reply deadline and opening time, on both order endpoints.
+        const saved = await prisma.dispute.findFirstOrThrow({ where: { orderId } })
+        for (const dispute of [
+            (await list()).orders[0].sellerOrders[0].dispute,
+            (await request("GET", `/orders/${checkoutId}`)).body.sellerOrders[0].dispute
+        ]) {
+            assert.equal(dispute.id, saved.id)
+            assert.equal(dispute.requestedAmount, saved.requestedAmount.toFixed(2))
+            assert.match(dispute.requestedAmount, /^\d+\.\d{2}$/)
+            assert.equal(dispute.responseDueAt, saved.responseDueAt.toISOString())
+            assert.equal(dispute.createdAt, saved.createdAt.toISOString())
+            assert.ok(saved.responseDueAt > saved.createdAt)
+        }
         await prisma.dispute.updateMany({ where: { orderId }, data: { status: "WITHDRAWN" } })
         await expectTabs({ all: 1, progress: 1, delivered: 0, issues: 0 })
 
@@ -10212,7 +10227,7 @@ test("my orders show each item's photo and option, and the shop's logo and colou
             [listing.imageUrl, null, null, null]
         )
         assert.equal(plain.items[0].title, listing.title)
-        assert.deepEqual(Object.keys(plain.seller).sort(), ["brandColor", "businessName", "logoUrl", "slug"])
+        assert.deepEqual(Object.keys(plain.seller).sort(), ["brandColor", "businessName", "location", "logoUrl", "slug"])
         assert.equal(plain.seller.logoUrl, profile.logoUrl || null)
         assert.equal(plain.seller.brandColor.key, "forest")
         assert.equal(typeof plain.seller.brandColor.background, "string")
@@ -10241,5 +10256,15 @@ test("my orders show each item's photo and option, and the shop's logo and colou
             assert.equal("logoUrl" in sellerOrder.seller, true)
         }
         await prisma.orderItem.updateMany({ where: { orderId }, data: { listingId: fixture.listingId } })
+
+        // The shop's area on both order endpoints, or null when it is empty.
+        const sellersOf = async () => [
+            (await request("GET", "/orders")).body.orders[0].sellerOrders[0].seller,
+            (await request("GET", `/orders/${checkoutId}`)).body.sellerOrders[0].seller
+        ]
+        await prisma.sellerProfile.update({ where: { id: profile.id }, data: { location: "Yaba, Lagos" } })
+        assert.deepEqual((await sellersOf()).map((seller) => seller.location), ["Yaba, Lagos", "Yaba, Lagos"])
+        await prisma.sellerProfile.update({ where: { id: profile.id }, data: { location: "" } })
+        assert.deepEqual((await sellersOf()).map((seller) => seller.location), [null, null])
     })
 })

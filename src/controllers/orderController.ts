@@ -145,18 +145,28 @@ const latestDisputeSelect = {
     where: { status: { not: "WITHDRAWN" as const } },
     orderBy: { id: "desc" as const },
     take: 1,
-    select: { id: true, status: true, outcome: true, reason: true }
+    select: { id: true, status: true, outcome: true, reason: true, requestedAmount: true, responseDueAt: true, createdAt: true }
 }
 
-function toLatestDispute(disputes: Array<{ id: number; status: string; outcome: string | null; reason: string }>) {
-    return disputes[0] ?? null
+// responseDueAt is when the seller must reply by; it only matters while the complaint is OPEN.
+function toLatestDispute(disputes: Array<{ id: number; status: string; outcome: string | null; reason: string; requestedAmount: Prisma.Decimal; responseDueAt: Date; createdAt: Date }>) {
+    const dispute = disputes[0]
+    return dispute ? { ...dispute, requestedAmount: money(dispute.requestedAmount) } : null
 }
 
-const sellerNameSelect = { select: { sellerProfile: { select: { businessName: true, slug: true, logoUrl: true, brandColor: true } } } }
+const sellerNameSelect = { select: { sellerProfile: { select: { businessName: true, slug: true, logoUrl: true, brandColor: true, location: true } } } }
 
 // The shop as order pages show it, with its colour as the resolved preset (the same as the cart).
-function toOrderSeller(profile: { businessName: string; slug: string; logoUrl: string; brandColor: string } | null) {
-    return profile ? { businessName: profile.businessName, slug: profile.slug, logoUrl: profile.logoUrl || null, brandColor: brandColorFor(profile.brandColor) } : null
+function toOrderSeller(profile: { businessName: string; slug: string; logoUrl: string; brandColor: string; location: string } | null) {
+    return profile
+        ? {
+            businessName: profile.businessName,
+            slug: profile.slug,
+            logoUrl: profile.logoUrl || null,
+            brandColor: brandColorFor(profile.brandColor),
+            location: profile.location.trim() || null
+        }
+        : null
 }
 
 // The tabs on "My orders". A checkout belongs to a tab when any of its seller orders does.
