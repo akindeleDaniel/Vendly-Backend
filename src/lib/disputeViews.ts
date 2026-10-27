@@ -1,5 +1,6 @@
 import type { Prisma } from "../generated/prisma/client.js"
 import { appealStatus, disputeReasonLabels } from "./disputes.js"
+import { itemListingSelect, itemListingView, shopCardSelect, shopCardView } from "./itemViews.js"
 
 export type DisputeViewer = "BUYER" | "SELLER" | "ADMIN"
 
@@ -13,9 +14,9 @@ const orderSummarySelect = {
     status: true,
     total: true,
     deliveryName: true,
-    seller: { select: { email: true, sellerProfile: { select: { businessName: true, slug: true } } } },
+    seller: { select: { email: true, sellerProfile: { select: shopCardSelect } } },
     checkout: { select: { user: { select: { name: true, email: true } } } },
-    orderItems: { orderBy: { id: "asc" as const }, select: { title: true, quantity: true, unitPrice: true } }
+    orderItems: { orderBy: { id: "asc" as const }, select: { title: true, quantity: true, unitPrice: true, listing: { select: itemListingSelect } } }
 }
 
 // What a complaint list needs: the order it is about and when the thread last moved.
@@ -39,6 +40,7 @@ type DetailRecord = Prisma.DisputeGetPayload<{ include: typeof disputeDetailIncl
 
 export function toDisputeSummary(dispute: ListRecord) {
     const lastMessage = dispute.messages[0]
+    const shop = dispute.order.seller.sellerProfile
 
     return {
         id: dispute.id,
@@ -53,8 +55,8 @@ export function toDisputeSummary(dispute: ListRecord) {
         requestedAmount: money(dispute.requestedAmount),
         approvedAmount: dispute.approvedAmount ? money(dispute.approvedAmount) : null,
         orderTotal: money(dispute.order.total),
-        items: dispute.order.orderItems.map((item) => ({ title: item.title, quantity: item.quantity })),
-        seller: { businessName: dispute.order.seller.sellerProfile?.businessName ?? null },
+        items: dispute.order.orderItems.map((item) => ({ title: item.title, quantity: item.quantity, ...itemListingView(item.listing) })),
+        seller: shop ? shopCardView(shop) : { businessName: null, slug: null, logoUrl: null, brandColor: null, location: null },
         buyerName: dispute.order.deliveryName,
         responseDueAt: dispute.responseDueAt,
         createdAt: dispute.createdAt,
@@ -81,12 +83,13 @@ export function toDisputeDetail(dispute: DetailRecord, viewer: DisputeViewer) {
             checkoutId: order.checkoutId,
             status: order.status,
             total: money(order.total),
-            seller: order.seller.sellerProfile ? { businessName: order.seller.sellerProfile.businessName, slug: order.seller.sellerProfile.slug } : null,
+            seller: order.seller.sellerProfile ? shopCardView(order.seller.sellerProfile) : null,
             items: order.orderItems.map((item) => ({
                 title: item.title,
                 quantity: item.quantity,
                 unitPrice: money(item.unitPrice),
-                lineTotal: money(item.unitPrice.times(item.quantity))
+                lineTotal: money(item.unitPrice.times(item.quantity)),
+                ...itemListingView(item.listing)
             }))
         },
         messages: dispute.messages.map((message) => ({

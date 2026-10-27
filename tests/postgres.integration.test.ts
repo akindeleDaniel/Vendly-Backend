@@ -8819,7 +8819,7 @@ test("a buyer asks for a pre-order, the seller approves, and the paid order carr
         const preOrder = asked.body.preOrder
         assert.equal(preOrder.status, "REQUESTED")
         assert.equal(preOrder.subtotal, "3000.00")
-        assert.deepEqual(preOrder.items, [{ listingId: fixture.listingId, title: "preorder-flow listing", quantity: 2, unitPrice: "1500.00" }])
+        assert.deepEqual(preOrder.items, [{ listingId: fixture.listingId, title: "preorder-flow listing", quantity: 2, unitPrice: "1500.00", imageUrl: "https://example.test/listing.png", optionLabel: null, sizeLabel: null }])
         assert.equal(preOrder.note, "For my daughter's birthday")
         assert.equal(preOrder.seller.businessName, "preorder-flow Shop")
         const answerWithin = (new Date(preOrder.respondBy).getTime() - Date.now()) / 3_600_000
@@ -10266,5 +10266,162 @@ test("my orders show each item's photo and option, and the shop's logo and colou
         assert.deepEqual((await sellersOf()).map((seller) => seller.location), ["Yaba, Lagos", "Yaba, Lagos"])
         await prisma.sellerProfile.update({ where: { id: profile.id }, data: { location: "" } })
         assert.deepEqual((await sellersOf()).map((seller) => seller.location), [null, null])
+    })
+})
+
+// ---- Complaints and pre-orders: photos, shop cards, tabs ----
+
+// A product with one option ("Blue") whose photo is left empty, so pages must fall back to the product's photo.
+async function optionWithoutPhoto(context: PaymentTestContext, title: string) {
+    const product = await context.request("POST", "/listings", {
+        title, description: "Soft", price: 1500, category: "Electronics",
+        imageUrls: ["https://img.example.test/parent-photo.jpg"],
+        options: [{ label: "Blue", price: 1500, stockQuantity: 5 }]
+    }, context.fixture.sellerToken)
+    assert.equal(product.status, 201, JSON.stringify(product.body))
+    const choiceId = product.body.options[0].listingId as number
+    await prisma.listing.update({ where: { id: choiceId }, data: { imageUrl: "" } })
+    return choiceId
+}
+
+test("complaint lists have open and closed tabs with counts, and show photos and the shop's card", async () => {
+    await withPaymentCheckout("dispute-tabs", async (context) => {
+        const { fixture, request, adminToken } = context
+        const orderId = await payAndShip(context)
+        assert.equal((await complain(context, orderId)).status, 201)
+        const dispute = await prisma.dispute.findFirstOrThrow({ where: { orderId } })
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+
+        const lists = [
+            { path: "/disputes", token: fixture.token },
+            { path: "/seller/disputes", token: fixture.sellerToken }
+        ]
+        const expectTabs = async (counts: { all: number; open: number; closed: number }) => {
+            for (const { path, token } of lists) {
+                const all = (await request("GET", path, undefined, token)).body
+                assert.deepEqual(all.counts, counts, path)
+                assert.equal(all.total, counts.all, path)
+                for (const group of ["open", "closed"] as const) {
+                    const tab = (await request("GET", `${path}?group=${group}`, undefined, token)).body
+                    assert.equal(tab.total, counts[group], `${path} ${group}`)
+                    assert.deepEqual(tab.disputes.map((item: { id: number }) => item.id), counts[group] ? [dispute.id] : [], `${path} ${group}`)
+                    assert.deepEqual(tab.counts, counts, `${path} ${group}`)
+                }
+            }
+        }
+
+        await expectTabs({ all: 1, open: 1, closed: 0 })
+        await prisma.dispute.update({ where: { id: dispute.id }, data: { status: "UNDER_REVIEW" } })
+        await expectTabs({ all: 1, open: 1, closed: 0 })
+        await prisma.dispute.update({ where: { id: dispute.id }, data: { status: "WITHDRAWN" } })
+        await expectTabs({ all: 1, open: 0, closed: 1 })
+        await prisma.dispute.update({ where: { id: dispute.id }, data: { status: "RESOLVED" } })
+        await expectTabs({ all: 1, open: 0, closed: 1 })
+        // ?status= still works on its own.
+        assert.equal((await request("GET", "/disputes?status=RESOLVED")).body.total, 1)
+        assert.equal((await request("GET", "/disputes?status=OPEN")).body.total, 0)
+
+        for (const { path, token } of lists) {
+            const unknown = await request("GET", `${path}?group=pending`, undefined, token)
+            assert.equal(unknown.status, 400)
+            assert.equal(unknown.body.message, "Group must be open or closed")
+            const both = await request("GET", `${path}?group=open&status=OPEN`, undefined, token)
+            assert.equal(both.status, 400)
+        }
+        // The administrator list is unchanged.
+        assert.equal("counts" in (await request("GET", "/admin/disputes", undefined, adminToken)).body, false)
+
+        // Photos: an option with no photo shows the product's, on the list and the detail.
+        const choiceId = await optionWithoutPhoto(context, "Complaint hoodie")
+        await prisma.orderItem.updateMany({ where: { orderId }, data: { listingId: choiceId } })
+        await prisma.sellerProfile.update({ where: { id: profile.id }, data: { logoUrl: "", location: "" } })
+        const listed = (await request("GET", "/disputes")).body.disputes[0]
+        const detail = (await request("GET", `/disputes/${dispute.id}`)).body.dispute
+        for (const item of [listed.items[0], detail.order.items[0]]) {
+            assert.deepEqual([item.imageUrl, item.optionLabel, item.sizeLabel], ["https://img.example.test/parent-photo.jpg", "Blue", null])
+        }
+        assert.equal(detail.order.items[0].unitPrice, "1500.00")
+        // The shop's card, with no logo or area set.
+        for (const seller of [listed.seller, detail.order.seller]) {
+            assert.deepEqual([seller.businessName, seller.slug, seller.logoUrl, seller.location], [profile.businessName, profile.slug, null, null])
+            assert.equal(seller.brandColor.key, "forest")
+        }
+        await prisma.orderItem.updateMany({ where: { orderId }, data: { listingId: fixture.listingId } })
+    })
+})
+
+test("pre-order lists have tabs with counts and a waiting-for-payment number, and show photos and the shop's card", async () => {
+    await withPaymentCheckout("preorder-tabs", async (context) => {
+        const { fixture, request } = context
+        await makeFoodShop(context, "PRE_ORDER")
+        const asked = await askForPreOrder(context)
+        assert.equal(asked.status, 201)
+        const id = asked.body.preOrder.id as number
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+
+        const lists = [
+            { path: "/pre-orders", token: fixture.token },
+            { path: "/seller/pre-orders", token: fixture.sellerToken }
+        ]
+        const groups = { waiting: "waiting", "to-pay": "toPay", paid: "paid", ended: "ended" } as const
+        const expectTabs = async (counts: Record<"all" | "waiting" | "toPay" | "paid" | "ended", number>, awaitingPayment: number) => {
+            for (const { path, token } of lists) {
+                const all = (await request("GET", path, undefined, token)).body
+                assert.deepEqual(all.counts, counts, path)
+                // Only the buyer gets the waiting-for-payment number.
+                if (path === "/pre-orders") {
+                    assert.equal(all.awaitingPayment, awaitingPayment)
+                } else {
+                    assert.equal("awaitingPayment" in all, false)
+                }
+                for (const [group, key] of Object.entries(groups)) {
+                    const tab = (await request("GET", `${path}?group=${group}`, undefined, token)).body
+                    assert.equal(tab.total, counts[key], `${path} ${group}`)
+                    assert.deepEqual(tab.preOrders.map((item: { id: number }) => item.id), counts[key] ? [id] : [], `${path} ${group}`)
+                    assert.deepEqual(tab.counts, counts, `${path} ${group}`)
+                }
+            }
+        }
+        const setStatus = (data: Record<string, unknown>) => prisma.preOrderRequest.update({ where: { id }, data })
+
+        await expectTabs({ all: 1, waiting: 1, toPay: 0, paid: 0, ended: 0 }, 0)
+        await setStatus({ status: "APPROVED", payBy: new Date(Date.now() + 60 * 60 * 1000) })
+        await expectTabs({ all: 1, waiting: 0, toPay: 1, paid: 0, ended: 0 }, 1)
+        // Past its pay-by time it no longer counts as waiting for payment.
+        await setStatus({ payBy: new Date(Date.now() - 60 * 1000) })
+        await expectTabs({ all: 1, waiting: 0, toPay: 1, paid: 0, ended: 0 }, 0)
+        await setStatus({ status: "USED" })
+        await expectTabs({ all: 1, waiting: 0, toPay: 0, paid: 1, ended: 0 }, 0)
+        for (const status of ["DECLINED", "EXPIRED", "CANCELLED"]) {
+            await setStatus({ status })
+            await expectTabs({ all: 1, waiting: 0, toPay: 0, paid: 0, ended: 1 }, 0)
+        }
+        // ?status= still works on its own.
+        assert.equal((await request("GET", "/pre-orders?status=CANCELLED")).body.total, 1)
+
+        for (const { path, token } of lists) {
+            const unknown = await request("GET", `${path}?group=open`, undefined, token)
+            assert.equal(unknown.status, 400)
+            assert.equal(unknown.body.message, "Group must be waiting, to-pay, paid or ended")
+            assert.equal((await request("GET", `${path}?group=ended&status=CANCELLED`, undefined, token)).status, 400)
+        }
+
+        // Photos and options, read from the listing; an option with no photo shows the product's.
+        const plain = (await request("GET", "/pre-orders")).body.preOrders[0].items[0]
+        const listing = await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })
+        assert.deepEqual([plain.imageUrl, plain.optionLabel, plain.sizeLabel], [listing.imageUrl, null, null])
+        const choiceId = await optionWithoutPhoto(context, "Pre-order hoodie")
+        await setStatus({ items: [{ listingId: choiceId, quantity: 1, unitPrice: "1500.00" }] })
+        await prisma.sellerProfile.update({ where: { id: profile.id }, data: { logoUrl: "", location: "" } })
+        for (const view of [
+            (await request("GET", "/pre-orders")).body.preOrders[0],
+            (await request("GET", `/pre-orders/${id}`)).body.preOrder,
+            (await request("GET", "/seller/pre-orders", undefined, fixture.sellerToken)).body.preOrders[0],
+            (await request("GET", `/seller/pre-orders/${id}`, undefined, fixture.sellerToken)).body.preOrder
+        ]) {
+            assert.deepEqual([view.items[0].imageUrl, view.items[0].optionLabel, view.items[0].sizeLabel], ["https://img.example.test/parent-photo.jpg", "Blue", null])
+            assert.deepEqual([view.seller.businessName, view.seller.slug, view.seller.logoUrl, view.seller.location], [profile.businessName, profile.slug, null, null])
+            assert.equal(view.seller.brandColor.key, "forest")
+        }
     })
 })

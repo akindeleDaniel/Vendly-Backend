@@ -16,6 +16,16 @@ import {
 
 const statuses: PreOrderStatus[] = ["REQUESTED", "APPROVED", "DECLINED", "EXPIRED", "CANCELLED", "USED"]
 
+// The tabs on the buyer's and the seller's pre-order lists, and the key each one's count goes under.
+const preOrderGroups = {
+    waiting: { statuses: ["REQUESTED"], countKey: "waiting" },
+    "to-pay": { statuses: ["APPROVED"], countKey: "toPay" },
+    paid: { statuses: ["USED"], countKey: "paid" },
+    ended: { statuses: ["DECLINED", "EXPIRED", "CANCELLED"], countKey: "ended" }
+} satisfies Record<string, { statuses: PreOrderStatus[]; countKey: string }>
+
+type PreOrderGroup = keyof typeof preOrderGroups
+
 function parseId(value: unknown): number | null {
     const id = Number(value)
     return Number.isSafeInteger(id) && id > 0 ? id : null
@@ -42,6 +52,9 @@ function sendPreOrderError(error: unknown, res: Response): boolean {
 async function listFor(req: Request, res: Response, where: Prisma.PreOrderRequestWhereInput, viewer: "BUYER" | "SELLER") {
     const page = parsePage(req.query.page)
     const status = req.query.status === undefined ? undefined : statuses.find((candidate) => candidate === req.query.status) ?? null
+    const group = req.query.group === undefined
+        ? undefined
+        : (Object.keys(preOrderGroups) as PreOrderGroup[]).find((candidate) => candidate === req.query.group) ?? null
 
     if (page === null) {
         res.status(400).send({ message: "Page must be a positive whole number" })
@@ -53,9 +66,36 @@ async function listFor(req: Request, res: Response, where: Prisma.PreOrderReques
         return
     }
 
-    const filter = { ...where, ...(status ? { status } : {}) }
-    const [total, records] = await Promise.all([
+    if (group === null) {
+        res.status(400).send({ message: "Group must be waiting, to-pay, paid or ended" })
+        return
+    }
+
+    if (group && status) {
+        res.status(400).send({ message: "Send either group or status, not both" })
+        return
+    }
+
+    const filter: Prisma.PreOrderRequestWhereInput = {
+        ...where,
+        ...(status ? { status } : group ? { status: { in: preOrderGroups[group].statuses } } : {})
+    }
+    // The number on every tab, whichever one is open.
+    const countsPromise = Promise.all([
+        prisma.preOrderRequest.count({ where }),
+        ...Object.values(preOrderGroups).map((tab) => prisma.preOrderRequest.count({ where: { ...where, status: { in: tab.statuses } } }))
+    ]).then(([all, ...tabs]) => ({
+        all,
+        ...Object.fromEntries(Object.values(preOrderGroups).map((tab, index) => [tab.countKey, tabs[index] ?? 0]))
+    }))
+    // For the buyer's "waiting for payment" bar: approved requests they can still pay for.
+    const awaitingPaymentPromise = viewer === "BUYER"
+        ? prisma.preOrderRequest.count({ where: { ...where, status: "APPROVED", payBy: { gt: new Date() } } })
+        : Promise.resolve(null)
+    const [total, counts, awaitingPayment, records] = await Promise.all([
         prisma.preOrderRequest.count({ where: filter }),
+        countsPromise,
+        awaitingPaymentPromise,
         prisma.preOrderRequest.findMany({
             where: filter,
             include: preOrderViewInclude,
@@ -65,7 +105,14 @@ async function listFor(req: Request, res: Response, where: Prisma.PreOrderReques
         })
     ])
 
-    res.send({ page, pageSize: preOrderPageSize, total, preOrders: await toPreOrderViews(records, viewer) })
+    res.send({
+        page,
+        pageSize: preOrderPageSize,
+        total,
+        counts,
+        ...(awaitingPayment === null ? {} : { awaitingPayment }),
+        preOrders: await toPreOrderViews(records, viewer)
+    })
 }
 
 async function showFor(req: Request, res: Response, where: Prisma.PreOrderRequestWhereInput, viewer: "BUYER" | "SELLER") {

@@ -1,6 +1,7 @@
 import { Prisma, type PreOrderRequest } from "../generated/prisma/client.js"
 import prisma from "./prisma.js"
 import { notifyPreOrderUpdate, queueNotification } from "./notifications.js"
+import { itemListingSelect, itemListingView, shopCardSelect, shopCardView } from "./itemViews.js"
 
 // Pre-orders for food shops. A buyer with food in their cart asks a shop to have it ready at a time of their
 // choosing; the seller approves or declines; an approved request lets the buyer pay for exactly those items, and the
@@ -247,26 +248,27 @@ export async function expirePreOrders(now = new Date()): Promise<number> {
 // ---- views ----
 
 type ViewRecord = PreOrderRequest & {
-    seller: { sellerProfile: { businessName: string; slug: string } | null }
+    seller: { sellerProfile: { businessName: string; slug: string; logoUrl: string; brandColor: string; location: string } | null }
     buyer: { name: string }
 }
 
 export const preOrderViewInclude = {
-    seller: { select: { sellerProfile: { select: { businessName: true, slug: true } } } },
+    seller: { select: { sellerProfile: { select: shopCardSelect } } },
     buyer: { select: { name: true } }
 } satisfies Prisma.PreOrderRequestInclude
 
 export async function toPreOrderViews(records: ViewRecord[], viewer: "BUYER" | "SELLER") {
     const listingIds = [...new Set(records.flatMap((record) => readItems(record.items).map((item) => item.listingId)))]
-    const listings = await prisma.listing.findMany({ where: { id: { in: listingIds } }, select: { id: true, title: true } })
-    const titles = new Map(listings.map((listing) => [listing.id, listing.title]))
+    const listings = await prisma.listing.findMany({ where: { id: { in: listingIds } }, select: { id: true, title: true, ...itemListingSelect } })
+    const byId = new Map(listings.map((listing) => [listing.id, listing]))
 
     return records.map((record) => {
         const items = readItems(record.items).map((item) => ({
             listingId: item.listingId,
-            title: titles.get(item.listingId) ?? "Item",
+            title: byId.get(item.listingId)?.title ?? "Item",
             quantity: item.quantity,
-            unitPrice: item.unitPrice
+            unitPrice: item.unitPrice,
+            ...itemListingView(byId.get(item.listingId))
         }))
         const subtotal = items.reduce((sum, item) => sum.plus(new Prisma.Decimal(item.unitPrice).times(item.quantity)), new Prisma.Decimal(0))
 
@@ -282,7 +284,7 @@ export async function toPreOrderViews(records: ViewRecord[], viewer: "BUYER" | "
             createdAt: record.createdAt,
             items,
             subtotal: subtotal.toFixed(2),
-            seller: record.seller.sellerProfile ? { businessName: record.seller.sellerProfile.businessName, slug: record.seller.sellerProfile.slug } : null,
+            seller: record.seller.sellerProfile ? shopCardView(record.seller.sellerProfile) : null,
             ...(viewer === "SELLER" ? { buyerName: record.buyer.name.trim().split(/\s+/)[0] ?? "A buyer" } : {})
         }
     })

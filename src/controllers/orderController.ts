@@ -2,7 +2,7 @@ import type { Request, Response } from "express"
 import prisma from "../lib/prisma.js"
 import type { OrderStatus, Prisma } from "../generated/prisma/client.js"
 import { notifyDeliveryConfirmed, notifyDeliveryReported, notifyShipped, queueNotification } from "../lib/notifications.js"
-import { brandColorFor } from "../lib/shopBranding.js"
+import { itemListingSelect, itemListingView, shopCardSelect, shopCardView } from "../lib/itemViews.js"
 
 const pageSize = 20
 const maximumShippingNoteLength = 200
@@ -30,9 +30,7 @@ function toItemResponse(item: OrderItemRow) {
         quantity: item.quantity,
         unitPrice: money(item.unitPrice),
         lineTotal: money(item.unitPrice.times(item.quantity)),
-        imageUrl: item.listing.imageUrl || item.listing.parent?.imageUrl || null,
-        optionLabel: item.listing.optionLabel,
-        sizeLabel: item.listing.sizeLabel,
+        ...itemListingView(item.listing),
         productTitle: item.listing.parent?.title ?? null
     }
 }
@@ -101,7 +99,7 @@ const orderItemSelect = {
         title: true,
         unitPrice: true,
         quantity: true,
-        listing: { select: { imageUrl: true, optionLabel: true, sizeLabel: true, parent: { select: { title: true, imageUrl: true } } } }
+        listing: { select: itemListingSelect }
     }
 }
 
@@ -154,19 +152,11 @@ function toLatestDispute(disputes: Array<{ id: number; status: string; outcome: 
     return dispute ? { ...dispute, requestedAmount: money(dispute.requestedAmount) } : null
 }
 
-const sellerNameSelect = { select: { sellerProfile: { select: { businessName: true, slug: true, logoUrl: true, brandColor: true, location: true } } } }
+const sellerNameSelect = { select: { sellerProfile: { select: shopCardSelect } } }
 
 // The shop as order pages show it, with its colour as the resolved preset (the same as the cart).
 function toOrderSeller(profile: { businessName: string; slug: string; logoUrl: string; brandColor: string; location: string } | null) {
-    return profile
-        ? {
-            businessName: profile.businessName,
-            slug: profile.slug,
-            logoUrl: profile.logoUrl || null,
-            brandColor: brandColorFor(profile.brandColor),
-            location: profile.location.trim() || null
-        }
-        : null
+    return profile ? shopCardView(profile) : null
 }
 
 // The tabs on "My orders". A checkout belongs to a tab when any of its seller orders does.

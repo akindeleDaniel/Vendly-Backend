@@ -72,9 +72,22 @@ export async function loadDisputeDetail(id: number, viewer: DisputeViewer) {
 }
 
 // Lists complaints matching `where`, newest first. With no ?status=, only defaultStatuses are listed when given.
+// The tabs on the buyer's and the seller's complaint lists.
+const disputeGroups = {
+    open: ["OPEN", "SELLER_AGREED", "UNDER_REVIEW"],
+    closed: ["RESOLVED", "WITHDRAWN"]
+} satisfies Record<string, DisputeStatus[]>
+
+type DisputeGroup = keyof typeof disputeGroups
+
 export async function listDisputes(req: Request, res: Response, where: Prisma.DisputeWhereInput, defaultStatuses?: DisputeStatus[], reader?: ReadingParty) {
     const page = parsePage(req.query.page)
     const status = req.query.status === undefined ? undefined : disputeStatuses.find((candidate) => candidate === req.query.status) ?? null
+    // Tabs are for buyers and sellers only; the administrator list is unchanged.
+    const grouped = reader !== undefined
+    const group = !grouped || req.query.group === undefined
+        ? undefined
+        : (Object.keys(disputeGroups) as DisputeGroup[]).find((candidate) => candidate === req.query.group) ?? null
 
     if (page === null) {
         res.status(400).send({ message: "Page must be a positive whole number" })
@@ -86,12 +99,35 @@ export async function listDisputes(req: Request, res: Response, where: Prisma.Di
         return
     }
 
+    if (group === null) {
+        res.status(400).send({ message: "Group must be open or closed" })
+        return
+    }
+
+    if (group && status) {
+        res.status(400).send({ message: "Send either group or status, not both" })
+        return
+    }
+
     const filter: Prisma.DisputeWhereInput = {
         ...where,
-        ...(status ? { status } : defaultStatuses ? { status: { in: defaultStatuses } } : {})
+        ...(status
+            ? { status }
+            : group
+                ? { status: { in: disputeGroups[group] } }
+                : defaultStatuses ? { status: { in: defaultStatuses } } : {})
     }
-    const [total, disputes] = await Promise.all([
+    // The number on every tab, whichever one is open.
+    const countsPromise = grouped
+        ? Promise.all([
+            prisma.dispute.count({ where }),
+            prisma.dispute.count({ where: { ...where, status: { in: disputeGroups.open } } }),
+            prisma.dispute.count({ where: { ...where, status: { in: disputeGroups.closed } } })
+        ]).then(([all, open, closed]) => ({ all, open, closed }))
+        : Promise.resolve(null)
+    const [total, counts, disputes] = await Promise.all([
         prisma.dispute.count({ where: filter }),
+        countsPromise,
         prisma.dispute.findMany({
             where: filter,
             include: disputeListInclude,
@@ -108,6 +144,7 @@ export async function listDisputes(req: Request, res: Response, where: Prisma.Di
         page,
         pageSize,
         total,
+        ...(counts ? { counts } : {}),
         disputes: disputes.map((dispute) => unread ? { ...toDisputeSummary(dispute), unread: unread.has(dispute.id) } : toDisputeSummary(dispute))
     })
 }
