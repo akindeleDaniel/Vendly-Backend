@@ -3237,6 +3237,7 @@ test("uses local-development defaults when deployment settings are not configure
     assert.deepEqual(loadConfig({}), {
         port: 3000,
         frontendUrl: "http://localhost:5173",
+        publicApiUrl: "http://localhost:3000",
         cookieSameSite: "lax",
         cookieSecure: false,
         trustProxy: false,
@@ -3261,6 +3262,7 @@ test("reads valid deployment settings from the environment", () => {
     }), {
         port: 8080,
         frontendUrl: "https://vendly.example",
+        publicApiUrl: "http://localhost:8080",
         cookieSameSite: "strict",
         cookieSecure: false,
         trustProxy: false,
@@ -9985,5 +9987,82 @@ test("a seller can brand their shop with a banner, a preset colour, an about tex
         const cleared = (await patch({ bannerUrl: null, instagram: "", whatsappNumber: null, about: "" })).body.branding
         assert.deepEqual([cleared.bannerUrl, cleared.social.instagram, cleared.whatsapp, cleared.about, cleared.brandColor.key], [null, null, null, null, "cream"])
         assert.equal(cleared.social.tiktok.handle, "adas.kloset")
+    })
+})
+
+// ---- Share links and sitemap ----
+
+test("share links give WhatsApp and Facebook a title, picture and description, and send people on to the app", async () => {
+    await withPaymentCheckout("share-links", async (context) => {
+        const { fixture, request, baseUrl } = context
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+        const listing = await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })
+        const page = async (path: string) => {
+            const response = await fetch(`${baseUrl}${path}`)
+            return { status: response.status, type: response.headers.get("content-type") ?? "", html: await response.text() }
+        }
+        const meta = (html: string, property: string) => new RegExp(`<meta (?:property|name)="${property}" content="([^"]*)"`).exec(html)?.[1]
+
+        // A shop: its name, about text and banner (resized to 1200 by 630 when it is a Cloudinary picture).
+        await request("PATCH" as "GET", "/seller/profile", { about: 'Best "Ankara" <b>deals</b> in Lagos', bannerUrl: "https://res.cloudinary.com/demo/image/upload/v1/banner.jpg" }, fixture.sellerToken)
+        const shop = await page(`/share/shop/${profile.slug}`)
+        assert.equal(shop.status, 200)
+        assert.match(shop.type, /text\/html/)
+        assert.equal(meta(shop.html, "og:title"), `${profile.businessName} on StoreHatch`)
+        assert.equal(meta(shop.html, "og:description"), "Best &quot;Ankara&quot; &lt;b&gt;deals&lt;/b&gt; in Lagos")
+        assert.equal(shop.html.includes("<b>"), false)
+        assert.equal(meta(shop.html, "og:image"), "https://res.cloudinary.com/demo/image/upload/c_pad,b_white,w_1200,h_630,f_jpg,q_auto/v1/banner.jpg")
+        assert.equal(meta(shop.html, "og:url"), `${config.publicApiUrl}/share/shop/${profile.slug}`)
+        assert.match(shop.html, new RegExp(`<meta http-equiv="refresh" content="0; url=${config.frontendUrl}/shop/${profile.slug}">`))
+        assert.equal((await request("GET", `/seller/shop/${profile.slug}`)).body.profile.shareUrl, `${config.publicApiUrl}/share/shop/${profile.slug}`)
+
+        // A product: its title and price, the shop's name, and its photo.
+        const product = await page(`/share/product/${listing.id}`)
+        assert.equal(product.status, 200)
+        assert.equal(meta(product.html, "og:type"), "product")
+        assert.match(meta(product.html, "og:title") ?? "", new RegExp(`₦`))
+        assert.ok((meta(product.html, "og:title") ?? "").startsWith(listing.title.replace(/&/g, "&amp;")))
+        assert.ok((meta(product.html, "og:description") ?? "").startsWith(`${profile.businessName} on StoreHatch.`))
+        assert.equal(meta(product.html, "og:image"), listing.imageUrl)
+        assert.match(product.html, new RegExp(`url=${config.frontendUrl}/product/${listing.id}"`))
+        assert.equal((await request("GET", `/listings/${listing.id}`)).body.shareUrl, `${config.publicApiUrl}/share/product/${listing.id}`)
+
+        // A product with options shares as the product, priced "from" its lowest option.
+        const withOptions = (await request("POST", "/listings", { title: "Share hoodie", description: "Soft", price: 5000, category: "Electronics", imageUrls: ["https://img.example.test/h.jpg"], options: [{ label: "Blue", price: 5000, stockQuantity: 2 }, { label: "Red", price: 7000, stockQuantity: 2 }] }, fixture.sellerToken)).body
+        const optionPage = await page(`/share/product/${withOptions.options[1].listingId}`)
+        assert.equal(meta(optionPage.html, "og:title"), "Share hoodie · from ₦5,000")
+        assert.equal(meta(optionPage.html, "og:url"), `${config.publicApiUrl}/share/product/${withOptions.id}`)
+
+        // Anything that cannot be shared gives a tidy page that goes to the home page.
+        for (const path of ["/share/product/999999999", "/share/product/abc", "/share/shop/no-such-shop"]) {
+            const missing = await page(path)
+            assert.equal(missing.status, 404, path)
+            assert.match(missing.html, new RegExp(`url=${config.frontendUrl}/"`))
+        }
+        await prisma.listing.update({ where: { id: withOptions.id }, data: { archivedAt: new Date() } })
+        assert.equal((await page(`/share/product/${withOptions.id}`)).status, 404)
+    })
+})
+
+test("the sitemap lists shops and products that are on sale, and leaves out blocked shops", async () => {
+    await withPaymentCheckout("sitemap", async (context) => {
+        const { fixture, baseUrl } = context
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+        const sitemap = async () => {
+            const response = await fetch(`${baseUrl}/sitemap.xml`)
+            return { type: response.headers.get("content-type") ?? "", xml: await response.text() }
+        }
+
+        const first = await sitemap()
+        assert.match(first.type, /application\/xml/)
+        assert.ok(first.xml.startsWith('<?xml version="1.0" encoding="UTF-8"?>'))
+        assert.ok(first.xml.includes(`<loc>${config.frontendUrl}/</loc>`))
+        assert.ok(first.xml.includes(`<loc>${config.frontendUrl}/shop/${profile.slug}</loc>`))
+        assert.match(first.xml, new RegExp(`<loc>${config.frontendUrl}/product/${fixture.listingId}</loc><lastmod>\\d{4}-\\d{2}-\\d{2}</lastmod>`))
+
+        await prisma.sellerProfile.update({ where: { id: profile.id }, data: { blockedAt: new Date(), blockReason: "test" } })
+        const blocked = (await sitemap()).xml
+        assert.equal(blocked.includes(`/shop/${profile.slug}<`), false)
+        assert.equal(blocked.includes(`/product/${fixture.listingId}<`), false)
     })
 })

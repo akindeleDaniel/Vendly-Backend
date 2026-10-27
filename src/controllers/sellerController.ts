@@ -12,6 +12,7 @@ import { imagesInclude, withImages } from "../lib/listingImages.js"
 import { loadChoices, withOptionSummary } from "../lib/listingOptions.js"
 import { confirmedDeliveriesFor, shopTrustFor, type ShopTrust } from "../lib/trust.js"
 import { ratesView } from "../lib/shippingRates.js"
+import { shopShareUrl } from "./shareController.js"
 import { brandColorFor, brandingSelect, brandingView, hasBrandingFields, readBranding } from "../lib/shopBranding.js"
 import { averageRating } from "../lib/reviews.js"
 
@@ -417,7 +418,7 @@ export const getPublicShop = async (req: Request, res: Response) => {
 
         res.send({
             // trust: numbers the server works out from real orders (confirmed deliveries, complaints, verified payout account).
-            profile: { ...withShopRating(profileFields), shippingRates: ratesView(shippingRates), branding: brandingView(profile), trust: trust.get(profile.userId) ?? null },
+            profile: { ...withShopRating(profileFields), shippingRates: ratesView(shippingRates), branding: brandingView(profile), trust: trust.get(profile.userId) ?? null, shareUrl: shopShareUrl(profile.slug) },
             listings: listings.map((listing) => ({ ...withOptionSummary(withImages(listing), choices.get(listing.id)), deliveredCount: delivered.get(listing.id) ?? 0 }))
         })
     }catch(error){

@@ -3,6 +3,8 @@ export type CookieSameSite = "lax" | "strict" | "none"
 export type AppConfig = {
     port: number
     frontendUrl: string
+    // This server's own public address, used to build share links (for example https://api.storehatch.shop).
+    publicApiUrl: string
     cookieSameSite: CookieSameSite
     cookieSecure: boolean
     // How many proxies (a load balancer, the host's router) sit in front of the server. Tells Express which
@@ -59,12 +61,26 @@ export function loadConfig(env: NodeJS.ProcessEnv): AppConfig {
         throw new Error("TRUST_PROXY must be the number of proxies in front of the server (0 for none, usually 1 on a host), not true or an address")
     }
 
+    const publicApiUrlValue = env.PUBLIC_API_URL?.trim() || `http://localhost:${port}`
+    let publicApiUrl: URL
+
+    try {
+        publicApiUrl = new URL(publicApiUrlValue)
+    } catch {
+        throw new Error("PUBLIC_API_URL must be a valid http or https URL, for example https://api.storehatch.shop")
+    }
+
+    if ((publicApiUrl.protocol !== "http:" && publicApiUrl.protocol !== "https:") || publicApiUrl.pathname !== "/" || publicApiUrl.search || publicApiUrl.hash) {
+        throw new Error("PUBLIC_API_URL must be this server's origin only, for example https://api.storehatch.shop")
+    }
+
     const maximumOrderValue = readNairaLimit(env.MAX_ORDER_VALUE, "MAX_ORDER_VALUE", 100000)
     const sellerDebtLimit = readNairaLimit(env.SELLER_DEBT_LIMIT, "SELLER_DEBT_LIMIT", 50000)
 
     return {
         port,
         frontendUrl: frontendUrl.origin,
+        publicApiUrl: publicApiUrl.origin,
         cookieSameSite,
         trustProxy: Number(trustProxyValue) || false,
         // Browsers reject SameSite=None cookies that are not Secure.

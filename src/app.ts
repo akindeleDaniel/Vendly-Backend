@@ -19,6 +19,8 @@ import helmet from "helmet"
 import healthRoutes from "./routes/healthRoutes.js"
 import { generalLimiter } from "./middleware/rateLimits.js"
 import { requireTrustedOrigin } from "./middleware/sameOrigin.js"
+import shareRoutes from "./routes/shareRoutes.js"
+import { sitemap } from "./controllers/shareController.js"
 
 const app = express()
 
@@ -50,6 +52,9 @@ app.use("/admin", adminRoutes)
 app.use("/disputes", disputeRoutes)
 app.use("/reviews", reviewRoutes)
 app.use("/pre-orders", preOrderRoutes)
+// Link-preview pages for shared shop and product links, and the sitemap for search engines.
+app.use("/share", shareRoutes)
+app.get("/sitemap.xml", sitemap)
 app.use(notFoundHandler)
 app.use(errorHandler)
 

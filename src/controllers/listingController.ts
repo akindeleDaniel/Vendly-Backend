@@ -5,6 +5,7 @@ import { categories, getCanonicalCategory } from "../lib/categories.js"
 import { heldReservationConditions } from "../lib/inventoryReservations.js"
 import { imagesInclude, readListingImages, withImages } from "../lib/listingImages.js"
 import { confirmedDeliveriesFor, shopTrustFor } from "../lib/trust.js"
+import { productShareUrl } from "./shareController.js"
 import { countChoices, loadChoices, optionTree, propagateToOptions, readOptions, ReservedStockConflict, syncListingOptions, withOptionSummary } from "../lib/listingOptions.js"
 import {
     isHttpsUrl,
@@ -194,6 +195,8 @@ export const getListingById  = async (req:Request, res:Response) =>{
         ...listing,
         deliveredCount: delivered.get(specificData.id) ?? 0,
         shopTrust: trust.get(specificData.userId) ?? null,
+        // A link that shows a picture and title when pasted into WhatsApp, Instagram or Facebook.
+        shareUrl: productShareUrl(specificData.id),
         selectedListingId: found?.parentId ? found.id : null,
         sellerSlug: user.sellerProfile?.slug ?? null,
         sellerName: user.sellerProfile?.businessName ?? null
