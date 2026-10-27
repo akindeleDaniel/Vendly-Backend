@@ -2,6 +2,7 @@ import type { Request, Response } from "express"
 import prisma from "../lib/prisma.js"
 import type { OrderStatus, Prisma } from "../generated/prisma/client.js"
 import { notifyDeliveryConfirmed, notifyDeliveryReported, notifyShipped, queueNotification } from "../lib/notifications.js"
+import { brandColorFor } from "../lib/shopBranding.js"
 
 const pageSize = 20
 const maximumShippingNoteLength = 200
@@ -12,14 +13,27 @@ function money(amount: Prisma.Decimal | null): string | null {
     return amount === null ? null : amount.toFixed(2)
 }
 
-// Each line's price as saved at checkout, with the line total (unit price × quantity).
-function toItemResponse(item: { listingId: number; title: string; unitPrice: Prisma.Decimal; quantity: number }) {
+type OrderItemRow = {
+    listingId: number
+    title: string
+    unitPrice: Prisma.Decimal
+    quantity: number
+    listing: { imageUrl: string; optionLabel: string | null; sizeLabel: string | null; parent: { title: string; imageUrl: string } | null }
+}
+
+// Each line's price as saved at checkout, with the line total (unit price × quantity). The photo, option and
+// product name come from the listing: a chosen option without its own photo shows the product's.
+function toItemResponse(item: OrderItemRow) {
     return {
         listingId: item.listingId,
         title: item.title,
         quantity: item.quantity,
         unitPrice: money(item.unitPrice),
-        lineTotal: money(item.unitPrice.times(item.quantity))
+        lineTotal: money(item.unitPrice.times(item.quantity)),
+        imageUrl: item.listing.imageUrl || item.listing.parent?.imageUrl || null,
+        optionLabel: item.listing.optionLabel,
+        sizeLabel: item.listing.sizeLabel,
+        productTitle: item.listing.parent?.title ?? null
     }
 }
 
@@ -82,7 +96,13 @@ const successfulPaymentSelect = {
 
 const orderItemSelect = {
     orderBy: { id: "asc" as const },
-    select: { listingId: true, title: true, unitPrice: true, quantity: true }
+    select: {
+        listingId: true,
+        title: true,
+        unitPrice: true,
+        quantity: true,
+        listing: { select: { imageUrl: true, optionLabel: true, sizeLabel: true, parent: { select: { title: true, imageUrl: true } } } }
+    }
 }
 
 // What a buyer sees of a refund: how much, where it stands and the note written for them.
@@ -132,7 +152,42 @@ function toLatestDispute(disputes: Array<{ id: number; status: string; outcome: 
     return disputes[0] ?? null
 }
 
-const sellerNameSelect = { select: { sellerProfile: { select: { businessName: true, slug: true } } } }
+const sellerNameSelect = { select: { sellerProfile: { select: { businessName: true, slug: true, logoUrl: true, brandColor: true } } } }
+
+// The shop as order pages show it, with its colour as the resolved preset (the same as the cart).
+function toOrderSeller(profile: { businessName: string; slug: string; logoUrl: string; brandColor: string } | null) {
+    return profile ? { businessName: profile.businessName, slug: profile.slug, logoUrl: profile.logoUrl || null, brandColor: brandColorFor(profile.brandColor) } : null
+}
+
+// The tabs on "My orders". A checkout belongs to a tab when any of its seller orders does.
+const myOrderFilters = {
+    all: {},
+    // Paid or on its way, including shipped orders reported delivered and waiting for the buyer to confirm.
+    progress: { orders: { some: { status: { in: ["PAID", "SHIPPED"] } } } },
+    delivered: { orders: { some: { status: "DELIVERED" } } },
+    // A refund of any kind, or a complaint that was not withdrawn.
+    issues: {
+        orders: {
+            some: {
+                OR: [
+                    { refunds: { some: {} } },
+                    { refundedAmount: { gt: 0 } },
+                    { disputes: { some: { status: { not: "WITHDRAWN" } } } }
+                ]
+            }
+        }
+    }
+} satisfies Record<string, Prisma.CheckoutWhereInput>
+
+type MyOrderFilter = keyof typeof myOrderFilters
+
+function parseMyOrderFilter(value: unknown): MyOrderFilter | null {
+    if (value === undefined) {
+        return "all"
+    }
+
+    return (Object.keys(myOrderFilters) as MyOrderFilter[]).find((filter) => filter === value) ?? null
+}
 
 function toPaymentSummary(payments: Array<{ reference: string; provider: string; verifiedAt: Date | null }>) {
     const payment = payments[0]
@@ -147,9 +202,23 @@ export const listMyOrders = async (req: Request, res: Response) => {
         return
     }
 
-    const where = paidCheckoutWhere(req.user!.id)
-    const [total, checkouts] = await Promise.all([
+    const filter = parseMyOrderFilter(req.query.status)
+
+    if (filter === null) {
+        res.status(400).send({ message: "Status must be all, progress, delivered or issues" })
+        return
+    }
+
+    const paid = paidCheckoutWhere(req.user!.id)
+    const whereFor = (name: MyOrderFilter): Prisma.CheckoutWhereInput => ({ AND: [paid, myOrderFilters[name]] })
+    const where = whereFor(filter)
+    // The number on every tab, whichever one is open.
+    const countsPromise = Promise.all((Object.keys(myOrderFilters) as MyOrderFilter[]).map(async (name) =>
+        [name, await prisma.checkout.count({ where: whereFor(name) })] as const
+    ))
+    const [total, counts, checkouts] = await Promise.all([
         prisma.checkout.count({ where }),
+        countsPromise.then((entries) => Object.fromEntries(entries) as Record<MyOrderFilter, number>),
         prisma.checkout.findMany({
             where,
             orderBy: [{ createdAt: "desc" }, { id: "desc" }],
@@ -189,6 +258,7 @@ export const listMyOrders = async (req: Request, res: Response) => {
         page,
         pageSize,
         total,
+        counts,
         orders: checkouts.map((checkout) => ({
             id: checkout.id,
             status: checkout.status,
@@ -199,7 +269,7 @@ export const listMyOrders = async (req: Request, res: Response) => {
                 id: order.id,
                 status: order.status,
                 total: money(order.total),
-                seller: order.seller.sellerProfile,
+                seller: toOrderSeller(order.seller.sellerProfile),
                 itemCount: order.orderItems.reduce((count, item) => count + item.quantity, 0),
                 items: order.orderItems.map(toItemResponse),
                 refundedAmount: money(order.refundedAmount),
@@ -243,7 +313,7 @@ function toMyOrderResponse(checkout: NonNullable<Awaited<ReturnType<typeof findM
         sellerOrders: checkout.orders.map((order) => ({
             id: order.id,
             status: order.status,
-            seller: order.seller.sellerProfile,
+            seller: toOrderSeller(order.seller.sellerProfile),
             subtotal: money(order.subtotal),
             shipping: money(order.shippingCost),
             total: money(order.total),

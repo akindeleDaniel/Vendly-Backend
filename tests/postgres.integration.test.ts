@@ -10149,3 +10149,97 @@ test("a buyer can become a seller on the same account and keep their cart and or
         assert.equal((await request("GET", "/seller/payout/banks", undefined, buyer.token)).status === 403, false)
     })
 })
+
+// ---- My orders: photos, shop branding, tabs ----
+
+test("my orders can be filtered by tab, and every tab shows its count", async () => {
+    await withPaymentCheckout("my-orders-tabs", async (context) => {
+        const { fixture, checkoutId, request } = context
+        const orderId = await payForCheckout(context)
+        const list = async (query = "") => (await request("GET", `/orders${query}`)).body
+        const expectTabs = async (counts: Record<string, number>) => {
+            const all = await list()
+            assert.deepEqual(all.counts, counts)
+            for (const [name, count] of Object.entries(counts)) {
+                const tab = await list(`?status=${name}`)
+                assert.equal(tab.total, count, name)
+                assert.deepEqual(tab.orders.map((order: { id: number }) => order.id), count ? [checkoutId] : [], name)
+                // The counts never change with the open tab.
+                assert.deepEqual(tab.counts, counts, name)
+            }
+        }
+
+        // Paid, then shipped and reported delivered: in progress either way.
+        await expectTabs({ all: 1, progress: 1, delivered: 0, issues: 0 })
+        await prisma.order.update({ where: { id: orderId }, data: { status: "SHIPPED", shippedAt: new Date(), deliveryReportedAt: new Date() } })
+        await expectTabs({ all: 1, progress: 1, delivered: 0, issues: 0 })
+
+        // A complaint is an issue until it is withdrawn.
+        assert.equal((await complain(context, orderId)).status, 201)
+        await expectTabs({ all: 1, progress: 1, delivered: 0, issues: 1 })
+        await prisma.dispute.updateMany({ where: { orderId }, data: { status: "WITHDRAWN" } })
+        await expectTabs({ all: 1, progress: 1, delivered: 0, issues: 0 })
+
+        // Delivered, and then partly refunded.
+        await prisma.order.update({ where: { id: orderId }, data: { status: "DELIVERED", deliveryConfirmedAt: new Date() } })
+        await expectTabs({ all: 1, progress: 0, delivered: 1, issues: 0 })
+        await prisma.order.update({ where: { id: orderId }, data: { refundedAmount: 500 } })
+        await expectTabs({ all: 1, progress: 0, delivered: 1, issues: 1 })
+
+        for (const bad of ["paid", "ALL", ""]) {
+            const refused = await request("GET", `/orders?status=${bad}`)
+            assert.equal(refused.status, 400, bad)
+            assert.equal(refused.body.message, "Status must be all, progress, delivered or issues")
+        }
+
+        // Someone else's orders are not counted.
+        const other = await fixture.addConsumer(1)
+        assert.deepEqual((await request("GET", "/orders", undefined, other.token)).body.counts, { all: 0, progress: 0, delivered: 0, issues: 0 })
+    })
+})
+
+test("my orders show each item's photo and option, and the shop's logo and colour", async () => {
+    await withPaymentCheckout("my-orders-photos", async (context) => {
+        const { fixture, checkoutId, request } = context
+        const orderId = await payForCheckout(context)
+        const listing = await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+
+        // An ordinary product: its own photo, no option.
+        const plain = (await request("GET", "/orders")).body.orders[0].sellerOrders[0]
+        assert.deepEqual(
+            [plain.items[0].imageUrl, plain.items[0].optionLabel, plain.items[0].sizeLabel, plain.items[0].productTitle],
+            [listing.imageUrl, null, null, null]
+        )
+        assert.equal(plain.items[0].title, listing.title)
+        assert.deepEqual(Object.keys(plain.seller).sort(), ["brandColor", "businessName", "logoUrl", "slug"])
+        assert.equal(plain.seller.logoUrl, profile.logoUrl || null)
+        assert.equal(plain.seller.brandColor.key, "forest")
+        assert.equal(typeof plain.seller.brandColor.background, "string")
+
+        // A chosen option with no photo of its own shows the product's photo.
+        const product = (await request("POST", "/listings", {
+            title: "Orders hoodie", description: "Soft", price: 1500, category: "Electronics",
+            imageUrls: ["https://img.example.test/orders-hoodie.jpg"],
+            options: [{ label: "Blue", price: 1500, sizes: [{ label: "M", stockQuantity: 5 }] }]
+        }, fixture.sellerToken))
+        assert.equal(product.status, 201, JSON.stringify(product.body))
+        const choiceId = product.body.options[0].sizes[0].listingId as number
+        await prisma.listing.update({ where: { id: choiceId }, data: { imageUrl: "" } })
+        await prisma.orderItem.updateMany({ where: { orderId }, data: { listingId: choiceId } })
+
+        for (const sellerOrder of [
+            (await request("GET", "/orders")).body.orders[0].sellerOrders[0],
+            (await request("GET", `/orders/${checkoutId}`)).body.sellerOrders[0]
+        ]) {
+            const [item] = sellerOrder.items
+            assert.deepEqual(
+                [item.imageUrl, item.optionLabel, item.sizeLabel, item.productTitle],
+                ["https://img.example.test/orders-hoodie.jpg", "Blue", "M", "Orders hoodie"]
+            )
+            assert.equal(sellerOrder.seller.brandColor.key, "forest")
+            assert.equal("logoUrl" in sellerOrder.seller, true)
+        }
+        await prisma.orderItem.updateMany({ where: { orderId }, data: { listingId: fixture.listingId } })
+    })
+})
