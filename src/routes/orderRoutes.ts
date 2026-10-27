@@ -4,17 +4,17 @@ import { openBuyerDispute } from "../controllers/disputeController.js"
 import { authMiddleware } from "../middleware/authMiddleware.js"
 import { complaintLimiter, reviewLimiter } from "../middleware/rateLimits.js"
 import { createMyOrderReviews, getMyOrderReviews } from "../controllers/reviewController.js"
-import { requireRole } from "../middleware/requireRole.js"
+import { requireBuyer } from "../middleware/requireRole.js"
 
 const router = Router()
 
-router.get("/", authMiddleware, requireRole("CONSUMER"), listMyOrders)
+router.get("/", authMiddleware, requireBuyer, listMyOrders)
 // Must come before "/:id", which would otherwise treat "awaiting-confirmation" as an order ID.
-router.get("/awaiting-confirmation", authMiddleware, requireRole("CONSUMER"), countOrdersAwaitingConfirmation)
-router.get("/:id", authMiddleware, requireRole("CONSUMER"), getMyOrder)
-router.post("/:id/seller-orders/:orderId/confirm-delivery", authMiddleware, requireRole("CONSUMER"), confirmOrderDelivery)
-router.get("/:id/seller-orders/:orderId/reviews", authMiddleware, requireRole("CONSUMER"), getMyOrderReviews)
-router.post("/:id/seller-orders/:orderId/reviews", authMiddleware, requireRole("CONSUMER"), reviewLimiter, createMyOrderReviews)
-router.post("/:id/seller-orders/:orderId/disputes", authMiddleware, requireRole("CONSUMER"), complaintLimiter, openBuyerDispute)
+router.get("/awaiting-confirmation", authMiddleware, requireBuyer, countOrdersAwaitingConfirmation)
+router.get("/:id", authMiddleware, requireBuyer, getMyOrder)
+router.post("/:id/seller-orders/:orderId/confirm-delivery", authMiddleware, requireBuyer, confirmOrderDelivery)
+router.get("/:id/seller-orders/:orderId/reviews", authMiddleware, requireBuyer, getMyOrderReviews)
+router.post("/:id/seller-orders/:orderId/reviews", authMiddleware, requireBuyer, reviewLimiter, createMyOrderReviews)
+router.post("/:id/seller-orders/:orderId/disputes", authMiddleware, requireBuyer, complaintLimiter, openBuyerDispute)
 
 export default router

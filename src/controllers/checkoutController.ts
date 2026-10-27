@@ -117,6 +117,7 @@ type CheckoutErrorCode =
     | "CHECKOUT_PREORDER_NOT_AVAILABLE"
     | "CHECKOUT_ORDER_TOO_LARGE"
     | "CHECKOUT_DELIVERY_UNAVAILABLE"
+    | "CHECKOUT_OWN_LISTING"
 
 class CheckoutRequestError extends Error {
     constructor(
@@ -271,6 +272,7 @@ async function limitOrders(client: Prisma.TransactionClient | typeof prisma, sel
 }
 
 function priceCheckoutItems(
+    buyerId: number,
     cartItems: CheckoutCartItem[],
     reservedQuantities: Map<number, number>,
     deliveryState: string | null = null
@@ -298,6 +300,16 @@ function priceCheckoutItems(
                 409,
                 `Listing ${cartItem.listingId} is unavailable in the requested quantity`,
                 "CHECKOUT_ITEMS_UNAVAILABLE",
+                { listingId: cartItem.listingId }
+            )
+        }
+
+        // A seller can shop like anyone else, but never from their own shop.
+        if (listing.user.id === buyerId) {
+            throw new CheckoutRequestError(
+                409,
+                "You cannot buy from your own shop. Remove your own products from your cart.",
+                "CHECKOUT_OWN_LISTING",
                 { listingId: cartItem.listingId }
             )
         }
@@ -743,6 +755,7 @@ export async function createCheckout(req: Request, res: Response) {
             }
 
             const { sellerPreviews, subtotal, shipping, total } = priceCheckoutItems(
+                userId,
                 cart.cartItems,
                 reservedQuantities,
                 delivery.state
@@ -1169,7 +1182,7 @@ export async function getCheckoutPreview(req: Request, res: Response) {
             )
         }
 
-        const { sellerPreviews } = priceCheckoutItems(cart.cartItems, reservedQuantities, deliveryState)
+        const { sellerPreviews } = priceCheckoutItems(userId, cart.cartItems, reservedQuantities, deliveryState)
         await limitOrders(prisma, sellerPreviews)
         const approvals = await findApprovedPreOrders(prisma, userId, sellerPreviews, now)
 

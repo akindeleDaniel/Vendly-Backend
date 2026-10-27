@@ -170,6 +170,11 @@ export async function openDispute(input: OpenDisputeInput): Promise<number> {
         throw new DisputeRequestError(404, "Order not found")
     }
 
+    // Checkout already refuses a seller's own products; this keeps complaints safe even so.
+    if (actor.party === "BUYER" && order.sellerId === actor.userId) {
+        throw new DisputeRequestError(409, "You cannot open a complaint against your own shop", "DISPUTE_NOT_ALLOWED")
+    }
+
     if (order.status === "REFUNDED") {
         throw new DisputeRequestError(409, "This order has already been refunded", "DISPUTE_NOT_ALLOWED")
     }

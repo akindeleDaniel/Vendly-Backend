@@ -55,10 +55,15 @@ function cartListingView({ parent, user, ...listing }: CartItemListing) {
 class CartRequestError extends Error {
     constructor(
         readonly statusCode: number,
-        message: string
+        message: string,
+        readonly code?: "CART_OWN_LISTING"
     ) {
         super(message);
     }
+}
+
+function sendCartRequestError(error: CartRequestError, res: Response): void {
+    res.status(error.statusCode).send({ message: error.message, ...(error.code ? { code: error.code } : {}) });
 }
 
 async function getOtherReservedQuantities(
@@ -205,6 +210,7 @@ export async function addToCart(req: Request, res: Response) {
             const listing = await tx.listing.findUnique({
                 where: { id: listingId },
                 select: {
+                    userId: true,
                     stockQuantity: true,
                     archivedAt: true,
                     user: { select: { sellerProfile: { select: { blockedAt: true } } } },
@@ -217,18 +223,22 @@ export async function addToCart(req: Request, res: Response) {
                 throw new CartRequestError(404, "This Listing was not found");
             }
 
+            // A seller can shop like anyone else, but never from their own shop.
+            if (listing.userId === id) {
+                throw new CartRequestError(409, "You cannot buy from your own shop", "CART_OWN_LISTING");
+            }
+
             // A product with options is bought through one of its options, never itself.
             if (listing.options.length > 0) {
                 throw new CartRequestError(409, "Choose an option for this product");
             }
 
-            const cart = await tx.cart.findUnique({
-                where: { userId: id }
+            // Buyers get a cart when they register; a seller gets one the first time they add something.
+            const cart = await tx.cart.upsert({
+                where: { userId: id },
+                create: { userId: id },
+                update: {}
             });
-
-            if (!cart) {
-                throw new CartRequestError(500, "Cart not found");
-            }
 
             const cartItem = await tx.cartItem.findUnique({
                 where: {
@@ -285,7 +295,7 @@ export async function addToCart(req: Request, res: Response) {
 
     } catch (error) {
         if (error instanceof CartRequestError) {
-            res.status(error.statusCode).send({ message: error.message });
+            sendCartRequestError(error, res);
             return;
         }
 
@@ -399,7 +409,7 @@ export async function updateCartItem(req: Request, res: Response) {
         res.send(result);
     } catch (error) {
         if (error instanceof CartRequestError) {
-            res.status(error.statusCode).send({ message: error.message });
+            sendCartRequestError(error, res);
             return;
         }
 

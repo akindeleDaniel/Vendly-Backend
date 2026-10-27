@@ -106,6 +106,7 @@ async function loadBuyerOrder(checkoutId: number, orderId: number, buyerId: numb
         select: {
             id: true,
             status: true,
+            sellerId: true,
             orderItems: { select: { listingId: true, title: true, listing: { select: { parentId: true, parent: { select: { title: true } } } } } },
             seller: { select: { sellerProfile: { select: { id: true } } } }
         }
@@ -120,6 +121,11 @@ async function loadBuyerOrder(checkoutId: number, orderId: number, buyerId: numb
 
 export async function createOrderReviews(input: NewReviewInput) {
     const order = await loadBuyerOrder(input.checkoutId, input.orderId, input.buyerId)
+
+    // Checkout already refuses a seller's own products; this keeps reviews safe even so.
+    if (order.sellerId === input.buyerId) {
+        throw new ReviewRequestError(409, "You cannot review your own shop or products", "REVIEW_NOT_ALLOWED")
+    }
 
     if (order.status !== "DELIVERED") {
         throw new ReviewRequestError(409, "You can review an order once it has been delivered", "REVIEW_NOT_ALLOWED")

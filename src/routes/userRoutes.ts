@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { checkAuth, createUser, loginUser, logout, logoutEverywhere, refresh } from "../controllers/userController.js";
+import { becomeSeller, checkAuth, createUser, loginUser, logout, logoutEverywhere, refresh } from "../controllers/userController.js";
 import { changePassword, forgotPassword, resendCode, resetPassword, sendSetPasswordCode, setPassword, verifyEmail, verifyLogin } from "../controllers/accountController.js";
 import { googleLink, googleSignIn } from "../controllers/googleController.js";
 import { authMiddleware } from "../middleware/authMiddleware.js";
@@ -35,5 +35,6 @@ router.post("/logout", logout)
 router.post("/logout-all", authMiddleware, logoutEverywhere)
 router.post("/refresh", refreshLimiter, refresh)
 router.get("/check", authMiddleware, checkAuth)
+router.post("/become-seller", authMiddleware, becomeSeller)
 
 export default router

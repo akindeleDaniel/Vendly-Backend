@@ -4066,8 +4066,9 @@ test("refuses payment for other consumers' checkouts, unavailable providers and 
         const badId = await request("POST", "/checkout/abc/payments", { provider: "PAYSTACK" })
         assert.equal(badId.status, 400)
 
+        // Sellers can shop too, but not pay for someone else's checkout.
         const sellerToken = await request("POST", `/checkout/${checkoutId}/payments`, { provider: "PAYSTACK" }, fixture.sellerToken)
-        assert.equal(sellerToken.status, 403)
+        assert.equal(sellerToken.status, 404)
         assert.equal(fakes.calls.initialize.length, 0)
     })
 })
@@ -4712,7 +4713,7 @@ test("shows customers their paid orders only", async () => {
         assert.equal((await request("GET", `/orders/${checkoutId}`, undefined, other.token)).status, 404)
         assert.equal((await request("GET", "/orders", undefined, other.token)).body.total, 0)
         assert.equal((await request("GET", "/orders?page=0")).status, 400)
-        assert.equal((await request("GET", "/orders", undefined, fixture.sellerToken)).status, 403)
+        assert.equal((await request("GET", "/orders", undefined, fixture.sellerToken)).body.total, 0)
     })
 })
 
@@ -4879,7 +4880,7 @@ test("a seller's delivered report is not final: the buyer is asked to confirm an
         assert.ok(list.body.orders[0].sellerOrders[0].deliveryReportedAt)
         assert.equal(list.body.orders[0].sellerOrders[0].status, "SHIPPED")
 
-        assert.equal((await request("POST", confirmPath, undefined, fixture.sellerToken)).status, 403)
+        assert.equal((await request("POST", confirmPath, undefined, fixture.sellerToken)).status, 404)
         const other = await fixture.addConsumer(1)
         assert.equal((await request("POST", confirmPath, undefined, other.token)).status, 404)
         assert.equal((await request("POST", `/orders/${checkoutId + 1000}/seller-orders/${orderId}/confirm-delivery`)).status, 404)
@@ -5833,7 +5834,7 @@ test("a buyer opens a complaint about a shipped order, and the buyer and seller 
         const other = await fixture.addConsumer(1)
         assert.equal((await request("GET", `/disputes/${dispute.id}`, undefined, other.token)).status, 404)
         assert.equal((await request("GET", "/disputes", undefined, other.token)).body.total, 0)
-        assert.equal((await request("GET", `/disputes/${dispute.id}`, undefined, fixture.sellerToken)).status, 403)
+        assert.equal((await request("GET", `/disputes/${dispute.id}`, undefined, fixture.sellerToken)).status, 404)
         assert.equal((await request("GET", "/seller/disputes", undefined, fixture.token)).status, 403)
         await withStrangerSeller(async (strangerToken) => {
             assert.equal((await request("GET", `/seller/disputes/${dispute.id}`, undefined, strangerToken)).status, 404)
@@ -5990,7 +5991,7 @@ test("the buyer, seller and administrator share one thread, which closes with th
 
         assert.equal((await post(`/disputes/${id}/messages`, fixture.token, "short")).status, 400)
         assert.equal((await post(`/disputes/${id}/messages`, fixture.token, undefined, { evidenceUrls: ["ftp://nope.example.test/a"] })).status, 400)
-        assert.equal((await post(`/disputes/${id}/messages`, fixture.sellerToken)).status, 403)
+        assert.equal((await post(`/disputes/${id}/messages`, fixture.sellerToken)).status, 404)
         assert.equal((await post(`/admin/disputes/${id}/messages`, fixture.token)).status, 403)
         const other = await fixture.addConsumer(1)
         assert.equal((await post(`/disputes/${id}/messages`, other.token)).status, 404)
@@ -7873,7 +7874,7 @@ test("buyers and sellers are told which complaints have messages they have not o
         // Strangers see nothing, and the counts need the right role.
         const other = await fixture.addConsumer(1)
         assert.equal((await request("GET", "/disputes/unread", undefined, other.token)).body.count, 0)
-        assert.equal((await request("GET", "/disputes/unread", undefined, fixture.sellerToken)).status, 403)
+        assert.equal((await request("GET", "/disputes/unread", undefined, fixture.sellerToken)).body.count, 0)
         assert.equal((await request("GET", "/seller/disputes/unread", undefined, fixture.token)).status, 403)
     })
 })
@@ -8469,7 +8470,7 @@ test("only a buyer whose order was delivered can review it, and what is allowed 
         const other = await fixture.addConsumer(1)
         assert.equal((await review({ shop: { rating: 5 } }, other.token)).status, 404)
         assert.equal((await request("GET", path, undefined, other.token)).status, 404)
-        assert.equal((await review({ shop: { rating: 5 } }, fixture.sellerToken)).status, 403)
+        assert.equal((await review({ shop: { rating: 5 } }, fixture.sellerToken)).status, 404)
         assert.equal((await request("POST", `/orders/${checkoutId}/seller-orders/999999999/reviews`, { shop: { rating: 5 } })).status, 404)
 
         // Blank comments mean no comment; control characters are dropped.
@@ -8611,7 +8612,7 @@ test("a buyer can change or remove their review for a week, and the rating follo
         const other = await fixture.addConsumer(1)
         assert.equal((await patch(`/reviews/products/${productId}`, { rating: 1 }, other.token)).status, 404)
         assert.equal((await request("DELETE" as "GET", `/reviews/products/${productId}`, undefined, other.token)).status, 404)
-        assert.equal((await patch(`/reviews/products/${productId}`, { rating: 1 }, fixture.sellerToken)).status, 403)
+        assert.equal((await patch(`/reviews/products/${productId}`, { rating: 1 }, fixture.sellerToken)).status, 404)
 
         // Removing takes it out of the rating, and the product can be reviewed again.
         assert.equal((await request("DELETE" as "GET", `/reviews/products/${productId}`)).status, 200)
@@ -8805,7 +8806,7 @@ test("a buyer asks for a pre-order, the seller approves, and the paid order carr
         }
         assert.equal((await request("POST", "/pre-orders", { readyAt: inHours(48) })).status, 400)
         assert.equal((await request("POST", "/pre-orders", { sellerSlug: "no-such-shop", readyAt: inHours(48) })).status, 404)
-        assert.equal((await askForPreOrder(context, {}, fixture.sellerToken)).status, 403)
+        assert.equal((await askForPreOrder(context, {}, fixture.sellerToken)).status, 409)
         const empty = await fixture.addConsumer(1)
         await prisma.cartItem.deleteMany({ where: { cart: { userId: empty.id } } })
         assert.equal((await askForPreOrder(context, {}, empty.token)).body.code, "PREORDER_CART_EMPTY")
@@ -9127,7 +9128,7 @@ test("a buyer can appeal StoreHatch's rejection once, within a week, and the sec
         assert.equal((await appeal({ message: "short" })).status, 400)
         assert.equal((await appeal({ message: "A long enough message.", evidenceUrls: ["http://not-https.example.test/a.jpg"] })).status, 400)
         assert.equal((await appeal(appealText, (await fixture.addConsumer(1)).token)).status, 404)
-        assert.equal((await appeal(appealText, fixture.sellerToken)).status, 403)
+        assert.equal((await appeal(appealText, fixture.sellerToken)).status, 404)
         assert.equal((await request("POST", "/disputes/999999/appeal", appealText)).status, 404)
 
         const appealed = await appeal(appealText)
@@ -10080,5 +10081,71 @@ test("the sitemap lists shops and products that are on sale, and leaves out bloc
         const blocked = (await sitemap()).xml
         assert.equal(blocked.includes(`/shop/${profile.slug}<`), false)
         assert.equal(blocked.includes(`/product/${fixture.listingId}<`), false)
+    })
+})
+
+// ---- One account can buy and sell ----
+
+test("a seller can shop like a buyer, but never from their own shop", async () => {
+    await withPaymentCheckout("buy-and-sell", async (context) => {
+        const { fixture, request } = context
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+
+        // Another seller buys from this shop: a cart is made for them on the first add.
+        await withStrangerSeller(async (otherSeller) => {
+            assert.equal((await request("GET", "/cart", undefined, otherSeller)).body.cart, null)
+            assert.equal((await request("POST", "/cart/items", { listingId: fixture.listingId, quantity: 1 }, otherSeller)).status, 201)
+            assert.equal((await request("GET", "/cart", undefined, otherSeller)).body.cart.cartItems.length, 1)
+            assert.equal((await request("GET", "/checkout/preview", undefined, otherSeller)).status, 200)
+            for (const path of ["/orders", "/disputes", "/pre-orders"]) {
+                assert.equal((await request("GET", path, undefined, otherSeller)).status, 200, path)
+            }
+            const strangerCarts = { cart: { user: { email: { startsWith: "dispute-stranger-" } } } }
+            await prisma.cartItem.deleteMany({ where: strangerCarts })
+            await prisma.cart.deleteMany({ where: strangerCarts.cart })
+        })
+
+        // Their own products cannot go in the cart.
+        const own = await request("POST", "/cart/items", { listingId: fixture.listingId, quantity: 1 }, fixture.sellerToken)
+        assert.equal(own.status, 409)
+        assert.equal(own.body.code, "CART_OWN_LISTING")
+
+        // Nor be checked out, should one get into the cart some other way.
+        const cart = await prisma.cart.upsert({ where: { userId: fixture.sellerId }, create: { userId: fixture.sellerId }, update: {} })
+        await prisma.cartItem.create({ data: { cartId: cart.id, listingId: fixture.listingId, quantity: 1 } })
+        const preview = await request("GET", "/checkout/preview", undefined, fixture.sellerToken)
+        assert.equal(preview.status, 409)
+        assert.equal(preview.body.code, "CHECKOUT_OWN_LISTING")
+        assert.equal(preview.body.listingId, fixture.listingId)
+
+        // Nor pre-ordered.
+        const readyAt = new Date(Date.now() + 3 * 24 * 60 * 60 * 1000).toISOString()
+        const preOrder = await request("POST", "/pre-orders", { sellerSlug: profile.slug, readyAt }, fixture.sellerToken)
+        assert.equal(preOrder.status, 409)
+        assert.match(preOrder.body.message, /your own shop/)
+        await prisma.cartItem.deleteMany({ where: { cartId: cart.id } })
+        await prisma.cart.delete({ where: { id: cart.id } })
+    })
+})
+
+test("a buyer can become a seller on the same account and keep their cart and orders", async () => {
+    await withPaymentCheckout("become-seller", async (context) => {
+        const { fixture, request } = context
+        const buyer = await fixture.addConsumer(1)
+        const cartBefore = (await request("GET", "/cart", undefined, buyer.token)).body.cart
+
+        assert.equal((await fetch(`${context.baseUrl}/users/become-seller`, { method: "POST" })).status, 401)
+
+        const changed = await request("POST", "/users/become-seller", {}, buyer.token)
+        assert.equal(changed.status, 200)
+        assert.equal(changed.body.role, "SELLER")
+        assert.equal((await request("GET", "/users/check", undefined, buyer.token)).body.role, "SELLER")
+        // Asking again changes nothing.
+        assert.equal((await request("POST", "/users/become-seller", {}, buyer.token)).body.role, "SELLER")
+
+        // Still a shopper, and now allowed into the seller screens.
+        assert.deepEqual((await request("GET", "/cart", undefined, buyer.token)).body.cart, cartBefore)
+        assert.equal((await request("GET", "/orders", undefined, buyer.token)).status, 200)
+        assert.equal((await request("GET", "/seller/payout/banks", undefined, buyer.token)).status === 403, false)
     })
 })

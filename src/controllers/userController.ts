@@ -214,6 +214,27 @@ export const refresh = async (req: Request, res: Response) => {
     res.send({ message: "Session refreshed", role: user.role, isAdmin: user.isAdmin, isSuperAdmin: user.isSuperAdmin })
 }
 
+// Turns a buyer's account into a seller's, so they can open a shop without a second account. Their orders, cart and
+// history stay as they are, and they can still shop. There is no way back to a buyer-only account.
+export const becomeSeller = async (req: Request, res: Response) => {
+    const userId = req.user!.id
+
+    try {
+        await prisma.user.updateMany({ where: { id: userId, role: "CONSUMER" }, data: { role: "SELLER" } })
+        const user = await prisma.user.findUnique({ where: { id: userId }, select: { role: true } })
+
+        if (!user) {
+            res.status(401).send({ message: "You're logged out" })
+            return
+        }
+
+        res.send({ message: "You can now set up your shop", role: user.role })
+    } catch (error) {
+        console.error(error)
+        res.status(500).send({ message: "Sorry there is an issue on our end" })
+    }
+}
+
 export const checkAuth = async (req: Request, res: Response) => {
     const userId = req.user?.id;
 

@@ -101,6 +101,10 @@ export async function requestPreOrder(input: { buyerId: number; sellerSlug: stri
         throw new PreOrderRequestError(404, "Store not found")
     }
 
+    if (profile.userId === input.buyerId) {
+        throw new PreOrderRequestError(409, "You cannot pre-order from your own shop", "PREORDER_NOT_AVAILABLE")
+    }
+
     if (profile.foodOrderType === "NOW") {
         throw new PreOrderRequestError(409, "This shop does not take pre-orders", "PREORDER_NOT_AVAILABLE")
     }
