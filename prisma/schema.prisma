@@ -68,6 +68,8 @@ model User {
   // Super administrators manage the administrator team, see the audit log and the platform figures. Only
   // scripts/makeAdmin.ts --super creates the first one; a super administrator is always also an administrator.
   isSuperAdmin  Boolean        @default(false)
+  // Set when the person asked not to get "you left something in your cart" emails.
+  cartRemindersOff Boolean     @default(false)
   listings      Listing[]
   role          Role
   sellerProfile SellerProfile?
@@ -196,6 +198,9 @@ model Cart {
   userId    Int        @unique
   user      User       @relation(fields: [userId], references: [id])
   cartItems CartItem[]
+  // When something was last added or changed, and when the one reminder for that was sent (cleared on each change).
+  itemsChangedAt DateTime?
+  reminderSentAt DateTime?
 }
 
 model CartItem {

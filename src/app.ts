@@ -21,6 +21,7 @@ import { generalLimiter } from "./middleware/rateLimits.js"
 import { requireTrustedOrigin } from "./middleware/sameOrigin.js"
 import shareRoutes from "./routes/shareRoutes.js"
 import { sitemap } from "./controllers/shareController.js"
+import emailRoutes from "./routes/emailRoutes.js"
 
 const app = express()
 
@@ -36,6 +37,9 @@ app.use(cors({
 // Mounted before the JSON parser: webhooks need the raw request body to check signatures.
 app.use("/payments/webhooks", webhookRoutes)
 app.use(generalLimiter)
+// The "stop these emails" links in emails. They need no login (the link itself is signed) and their pages post to
+// themselves, so they are mounted before the check below, which only lets the frontend's own pages make changes.
+app.use("/email", emailRoutes)
 // Refuses changes asked for by another website using a visitor's cookies.
 app.use(requireTrustedOrigin)
 app.use(express.json())

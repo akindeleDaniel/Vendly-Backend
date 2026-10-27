@@ -28,6 +28,7 @@ import { startPaymentChecker } from "../src/lib/payments/paymentChecker.js"
 import { waitForNotifications } from "../src/lib/notifications.js"
 import { recalculateRating } from "../src/lib/reviews.js"
 import { findStockAlerts } from "../src/lib/stockAlerts.js"
+import { sendCartReminders } from "../src/lib/cartReminders.js"
 import { expirePreOrders } from "../src/lib/preOrders.js"
 import { remindAndCloseDeliveries } from "../src/lib/deliveryClosing.js"
 import { reviewSellerStanding } from "../src/lib/sellerStanding.js"
@@ -10727,5 +10728,84 @@ test("the seller's reviews come with a rating summary for the open tab and the c
         await withStrangerSeller(async (stranger) => {
             assert.equal((await request("GET", "/seller/reviews?type=shop", undefined, stranger)).status, 404)
         })
+    })
+})
+
+// ---- Cart reminders ----
+
+test("a shopper who leaves items in their cart for a day gets one reminder, and can stop them", async () => {
+    await withPaymentCheckout("cart-reminder", async (context) => {
+        const { fixture, request, baseUrl } = context
+        const hourMs = 60 * 60 * 1000
+        const buyer = await fixture.addConsumer(1)
+        const user = await prisma.user.update({ where: { id: buyer.id }, data: { emailVerifiedAt: new Date() } })
+        const listing = await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })
+        const remindersTo = () => emailsTo(user.email).filter((email) => email.subject === "You left something in your cart")
+        const runAt = async (hoursFromNow: number) => {
+            await sendCartReminders(new Date(Date.now() + hoursFromNow * hourMs))
+            await waitForNotifications()
+        }
+
+        // Changing the cart starts the clock; nothing is sent before a day has passed.
+        assert.equal((await request("PATCH" as "GET", `/cart/items/${listing.id}`, { quantity: 1 }, buyer.token)).status, 200)
+        await runAt(23)
+        assert.equal(remindersTo().length, 0)
+
+        // After a day: one email naming what is waiting, with a link to the cart and a way to stop them.
+        await runAt(25)
+        assert.equal(remindersTo().length, 1)
+        const email = remindersTo()[0]!
+        assert.match(email.text, new RegExp(`1 × ${listing.title} \\(₦1,500\\.00 each\\)`))
+        assert.match(email.text, /\/cart/)
+        const stopLink = /Stop them here: (\S+)/.exec(email.text)?.[1]
+        assert.ok(stopLink)
+
+        // Only once, until the cart changes again.
+        await runAt(30)
+        assert.equal(remindersTo().length, 1)
+        await request("PATCH" as "GET", `/cart/items/${listing.id}`, { quantity: 1 }, buyer.token)
+        await runAt(25)
+        assert.equal(remindersTo().length, 2)
+
+        // Not for a cart left alone for over a week, or one whose items can no longer be bought.
+        await prisma.cart.update({ where: { userId: buyer.id }, data: { itemsChangedAt: new Date(Date.now() - 8 * 24 * hourMs), reminderSentAt: null } })
+        await runAt(0)
+        await prisma.cart.update({ where: { userId: buyer.id }, data: { itemsChangedAt: new Date(Date.now() - 25 * hourMs) } })
+        await prisma.listing.update({ where: { id: listing.id }, data: { stockQuantity: 0 } })
+        await runAt(0)
+        assert.equal(remindersTo().length, 2)
+        await prisma.listing.update({ where: { id: listing.id }, data: { stockQuantity: 5 } })
+        await prisma.cart.update({ where: { userId: buyer.id }, data: { reminderSentAt: new Date() } })
+
+        // Not for someone in the middle of paying (the fixture's shopper has a checkout open).
+        const payingUser = await prisma.user.update({ where: { id: fixture.consumerId }, data: { emailVerifiedAt: new Date() } })
+        await prisma.cart.update({ where: { userId: fixture.consumerId }, data: { itemsChangedAt: new Date(Date.now() - 25 * hourMs), reminderSentAt: null } })
+        await runAt(0)
+        assert.equal(emailsTo(payingUser.email).filter((sent) => sent.subject === "You left something in your cart").length, 0)
+
+        // The stop link: opening it only shows a button; pressing it stops the reminders. A changed link is refused.
+        const stopPath = new URL(stopLink).pathname + new URL(stopLink).search
+        const opened = await fetch(`${baseUrl}${stopPath}`)
+        assert.equal(opened.status, 200)
+        assert.match(await opened.text(), /<form method="post">/)
+        assert.equal((await prisma.user.findUniqueOrThrow({ where: { id: buyer.id } })).cartRemindersOff, false)
+        const forged = await fetch(`${baseUrl}${stopPath.replace(/u=\d+/, `u=${fixture.consumerId}`)}`, { method: "POST" })
+        assert.equal(forged.status, 400)
+        const stopped = await fetch(`${baseUrl}${stopPath}`, { method: "POST", headers: { origin: config.publicApiUrl } })
+        assert.equal(stopped.status, 200)
+        assert.match(await stopped.text(), /not get cart reminders any more/)
+        assert.equal((await prisma.user.findUniqueOrThrow({ where: { id: buyer.id } })).cartRemindersOff, true)
+        assert.equal((await request("GET", "/users/check", undefined, buyer.token)).body.cartReminders, false)
+        await prisma.cart.update({ where: { userId: buyer.id }, data: { reminderSentAt: null } })
+        await runAt(0)
+        assert.equal(remindersTo().length, 2)
+
+        // A signed-in shopper can switch them back on (or off) in their settings.
+        assert.equal((await request("PATCH" as "GET", "/users/preferences", { cartReminders: "yes" }, buyer.token)).status, 400)
+        assert.deepEqual((await request("PATCH" as "GET", "/users/preferences", { cartReminders: true }, buyer.token)).body, { cartReminders: true })
+        assert.equal((await request("GET", "/users/check", undefined, buyer.token)).body.cartReminders, true)
+        await prisma.cart.update({ where: { userId: buyer.id }, data: { reminderSentAt: null } })
+        await runAt(0)
+        assert.equal(remindersTo().length, 3)
     })
 })

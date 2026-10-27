@@ -2,6 +2,7 @@ import config from "../config.js"
 import prisma from "./prisma.js"
 import { sendEmail, type OutgoingEmail } from "./email/index.js"
 import type { StockAlert } from "./stockAlerts.js"
+import { cartReminderStopUrl } from "./cartReminders.js"
 
 // Emails about what happens to a person's account, orders, refunds and complaints. Every notification is
 // queued after the change it describes has been saved, and a failure to send is only logged: an email that
@@ -527,6 +528,40 @@ export async function notifyPreOrderUpdate(requestId: number, event: PreOrderEve
 
 async function sellerContact(sellerId: number): Promise<{ email: string } | null> {
     return prisma.user.findUnique({ where: { id: sellerId }, select: { email: true } })
+}
+
+// The one reminder about a cart left alone. Only items that can still be bought are named.
+export async function notifyCartReminder(cartId: number): Promise<void> {
+    const cart = await prisma.cart.findUnique({
+        where: { id: cartId },
+        select: {
+            user: { select: { id: true, name: true, email: true } },
+            cartItems: {
+                where: { listing: { archivedAt: null, stockQuantity: { gt: 0 }, user: { sellerProfile: { is: { blockedAt: null } } } } },
+                orderBy: { id: "asc" },
+                select: { quantity: true, listing: { select: { title: true, price: true } } }
+            }
+        }
+    })
+
+    if (!cart || cart.cartItems.length === 0) {
+        return
+    }
+
+    const shown = cart.cartItems.slice(0, 5)
+    const more = cart.cartItems.length - shown.length
+    const first = cart.user.name.trim().split(/\s+/)[0] ?? ""
+
+    await sendAll([
+        mail(cart.user.email, "You left something in your cart", [
+            `Hi ${first}, these are still waiting in your StoreHatch cart:`,
+            [
+                ...shown.map((item) => `  ${item.quantity} × ${item.listing.title} (${naira(item.listing.price)} each)`),
+                ...(more > 0 ? [`  and ${more} more`] : [])
+            ].join("\n"),
+            "Stock can run out, and prices are confirmed at checkout. Your payment is protected: if an order does not arrive or is not as described, you can ask for a refund."
+        ], { label: "Go to your cart", path: "/cart" }, `Don't want these reminders? Stop them here: ${cartReminderStopUrl(cart.user.id)}`)
+    ])
 }
 
 // One email per seller for the items a sale took to their low-stock line or sold out.

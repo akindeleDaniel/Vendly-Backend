@@ -235,6 +235,19 @@ export const becomeSeller = async (req: Request, res: Response) => {
     }
 }
 
+// Email settings a signed-in person can change. Only cart reminders for now.
+export const updateEmailPreferences = async (req: Request, res: Response) => {
+    const { cartReminders } = req.body
+
+    if (typeof cartReminders !== "boolean") {
+        res.status(400).send({ message: "cartReminders must be true or false" })
+        return
+    }
+
+    const user = await prisma.user.update({ where: { id: req.user!.id }, data: { cartRemindersOff: !cartReminders }, select: { cartRemindersOff: true } })
+    res.send({ cartReminders: !user.cartRemindersOff })
+}
+
 export const checkAuth = async (req: Request, res: Response) => {
     const userId = req.user?.id;
 
@@ -253,7 +266,8 @@ export const checkAuth = async (req: Request, res: Response) => {
                 role: true,
                 isAdmin: true,
                 isSuperAdmin: true,
-                passwordHash: true
+                passwordHash: true,
+                cartRemindersOff: true
             }
         });
 
@@ -273,7 +287,9 @@ export const checkAuth = async (req: Request, res: Response) => {
             // Lets the frontend show the team, audit log and platform screens (super administrators only).
             isSuperAdmin: user.isSuperAdmin,
             // False for an account created with Google that has not set a password yet.
-            hasPassword: user.passwordHash !== null
+            hasPassword: user.passwordHash !== null,
+            // Whether they get one "you left something in your cart" email after leaving items there for a day.
+            cartReminders: !user.cartRemindersOff
         });
 
     } catch (error) {

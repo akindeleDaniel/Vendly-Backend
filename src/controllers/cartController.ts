@@ -267,6 +267,9 @@ export async function addToCart(req: Request, res: Response) {
                 );
             }
 
+            // A change allows one more reminder later, about a day after the last change.
+            await tx.cart.update({ where: { id: cart.id }, data: { itemsChangedAt: new Date(), reminderSentAt: null } });
+
             const created = cartItem === null;
             const updatedCartItem = cartItem
                 ? await tx.cartItem.update({
@@ -379,6 +382,8 @@ export async function updateCartItem(req: Request, res: Response) {
                     `Only ${available} units currently available`
                 );
             }
+
+            await tx.cart.update({ where: { id: cart.id }, data: { itemsChangedAt: new Date(), reminderSentAt: null } });
 
             const updatedCartItem = await tx.cartItem.update({
                 where: {
