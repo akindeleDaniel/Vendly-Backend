@@ -12,6 +12,7 @@ import { imagesInclude, withImages } from "../lib/listingImages.js"
 import { loadChoices, withOptionSummary } from "../lib/listingOptions.js"
 import { confirmedDeliveriesFor, shopTrustFor, type ShopTrust } from "../lib/trust.js"
 import { ratesView } from "../lib/shippingRates.js"
+import { brandColorFor, brandingSelect, brandingView, hasBrandingFields, readBranding } from "../lib/shopBranding.js"
 import { averageRating } from "../lib/reviews.js"
 
 function hasValidCoordinates<T extends { latitude: number | null; longitude: number | null }>(
@@ -127,6 +128,14 @@ export const createSeller = async(req: Request, res: Response) => {
         return
     }
 
+    // Optional at sign-up: banner, colour, about text, social handles, WhatsApp number.
+    const branding = readBranding(req.body)
+
+    if ("error" in branding) {
+        res.status(400).send({ message: branding.error })
+        return
+    }
+
     const coordinates = await geocodeLocation(location)
     
     let slug = makeSlug(businessName)
@@ -148,7 +157,8 @@ export const createSeller = async(req: Request, res: Response) => {
             latitude: coordinates?.latitude ?? null,
             longitude: coordinates?.longitude ?? null,
             shippingPolicy,
-            shippingCost: configuredShippingCost
+            shippingCost: configuredShippingCost,
+            ...branding
         }})
         res.status(201).send({message:"Seller profile created"})
     }catch(error){
@@ -170,7 +180,7 @@ export const getMySellerProfile = async (req: Request, res: Response) => {
             return
         }
 
-        res.send(withShopRating(profile))
+        res.send({ ...withShopRating(profile), branding: brandingView(profile) })
     }catch(error){
         res.status(500).send({message:"Sorry there is an issue on our end"})
     }
@@ -186,7 +196,8 @@ export const updateSeller = async(req: Request, res: Response) => {
         lga === undefined &&
         shippingPolicy === undefined &&
         shippingCost === undefined &&
-        foodOrderType === undefined
+        foodOrderType === undefined &&
+        !hasBrandingFields(req.body)
     ){
         res.status(400).send({message:"Provide at least one field to update"})
         return
@@ -219,6 +230,13 @@ export const updateSeller = async(req: Request, res: Response) => {
 
     if (lga !== undefined && !isNonBlankString(lga)) {
         res.status(400).send({ message: "LGA must be a non-empty string" })
+        return
+    }
+
+    const branding = readBranding(req.body)
+
+    if ("error" in branding) {
+        res.status(400).send({ message: branding.error })
         return
     }
 
@@ -318,11 +336,12 @@ export const updateSeller = async(req: Request, res: Response) => {
                 ...(shippingPolicy !== undefined ? { shippingPolicy: nextShippingPolicy } : {}),
                 ...(shippingCostData !== undefined ? { shippingCost: shippingCostData } : {}),
                 ...(foodOrderType !== undefined ? { foodOrderType } : {}),
+                ...branding,
                 ...coordinateData
             }
         })
 
-        res.send(withShopRating(updatedProfile))
+        res.send({ ...withShopRating(updatedProfile), branding: brandingView(updatedProfile) })
     }catch(error){
         res.status(500).send({message:"Sorry there is an issue on our end"})
     }
@@ -360,7 +379,8 @@ export const getPublicShop = async (req: Request, res: Response) => {
                 blockedAt:true,
                 // Delivery by the buyer's state, so shoppers see the fee for their state before adding anything.
                 deliversEverywhere:true,
-                shippingRates:{ select:{ state:true, cost:true } }
+                shippingRates:{ select:{ state:true, cost:true } },
+                ...brandingSelect
             }
         })
 
@@ -370,7 +390,11 @@ export const getPublicShop = async (req: Request, res: Response) => {
             return
         }
 
-        const { blockedAt: _blockedAt, shippingRates, ...profileFields } = profile
+        const {
+            blockedAt: _blockedAt, shippingRates, bannerUrl: _bannerUrl, brandColor: _brandColor, about: _about,
+            instagramHandle: _instagram, tiktokHandle: _tiktok, facebookHandle: _facebook, xHandle: _x, whatsappNumber: _whatsapp,
+            ...profileFields
+        } = profile
 
         const listings = await prisma.listing.findMany({
             where:{
@@ -393,7 +417,7 @@ export const getPublicShop = async (req: Request, res: Response) => {
 
         res.send({
             // trust: numbers the server works out from real orders (confirmed deliveries, complaints, verified payout account).
-            profile: { ...withShopRating(profileFields), shippingRates: ratesView(shippingRates), trust: trust.get(profile.userId) ?? null },
+            profile: { ...withShopRating(profileFields), shippingRates: ratesView(shippingRates), branding: brandingView(profile), trust: trust.get(profile.userId) ?? null },
             listings: listings.map((listing) => ({ ...withOptionSummary(withImages(listing), choices.get(listing.id)), deliveredCount: delivered.get(listing.id) ?? 0 }))
         })
     }catch(error){
@@ -517,13 +541,16 @@ export const getCategoryShops = async (req: Request, res: Response) => {
                 longitude: true,
                 foodOrderType: true,
                 ratingCount: true,
-                ratingSum: true
+                ratingSum: true,
+                bannerUrl: true,
+                brandColor: true
             },
             orderBy: [{ businessName: "asc" }, { id: "asc" }]
         })
         const trust = await shopTrustFor(shops.map((shop) => shop.userId))
-        const present = (list: typeof shops) => list.map(({ latitude: _latitude, longitude: _longitude, userId, ...shop }) => ({
+        const present = (list: typeof shops) => list.map(({ latitude: _latitude, longitude: _longitude, userId, bannerUrl, brandColor, ...shop }) => ({
             ...withShopRating(shop),
+            branding: { bannerUrl, brandColor: brandColorFor(brandColor) },
             trust: trust.get(userId) ?? (null as ShopTrust | null)
         }))
 

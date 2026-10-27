@@ -9913,3 +9913,77 @@ test("a seller can charge a different delivery fee per state, and checkout charg
         assert.deepEqual([(await preview("Lagos")).body.sellers[0].shipping, (await preview()).body.sellers[0].shippingVaries], ["0.00", false])
     })
 })
+
+// ---- Shop branding ----
+
+test("a seller can brand their shop with a banner, a preset colour, an about text, socials and a WhatsApp button", async () => {
+    await withPaymentCheckout("shop-branding", async (context) => {
+        const { fixture, request } = context
+        const seller = fixture.sellerToken
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+        const patch = (body: unknown, token = seller) => request("PATCH" as "GET", "/seller/profile", body, token)
+        const publicShop = async () => (await request("GET", `/seller/shop/${profile.slug}`)).body.profile
+
+        // A new shop is forest green with nothing else set.
+        const fresh = (await request("GET", "/seller/profile", undefined, seller)).body.branding
+        assert.equal(fresh.brandColor.key, "forest")
+        assert.deepEqual([fresh.bannerUrl, fresh.about, fresh.whatsapp, fresh.social.instagram], [null, null, null, null])
+
+        // Each field is checked.
+        for (const [body, message] of [
+            [{ bannerUrl: "http://img.example.test/banner.jpg" }, /https link/],
+            [{ brandColor: "pink" }, /one of: forest, navy, teal, indigo, plum, wine, terracotta, charcoal, brown, cream, beige/],
+            [{ about: "x".repeat(501) }, /500 characters or fewer/],
+            [{ about: "Order at https://elsewhere.example.test" }, /cannot contain links/],
+            [{ about: "Find us at mystore.com for cheaper prices" }, /cannot contain links/],
+            [{ instagram: "bad handle!" }, /Instagram username only/],
+            [{ tiktok: "@a" }, /TikTok username only/],
+            [{ x: "a_name_that_is_far_too_long" }, /X username only/],
+            [{ whatsappNumber: "12345" }, /Nigerian mobile number/]
+        ] as const) {
+            const refused = await patch(body)
+            assert.equal(refused.status, 400, JSON.stringify(body))
+            assert.match(refused.body.message, message)
+        }
+        assert.equal((await patch({ brandColor: "navy" }, fixture.token)).status, 403)
+
+        // Branding alone is a valid update. Handles lose their @, the number is stored in one form, blank lines are tidied.
+        const saved = await patch({
+            bannerUrl: "https://img.example.test/banner.jpg",
+            brandColor: "cream",
+            about: "Handmade Ankara pieces.\n\n\n\nCustom sizes in 5 days.",
+            instagram: "@adaskloset",
+            tiktok: "adas.kloset",
+            facebook: "adaskloset",
+            x: "ada_kloset",
+            whatsappNumber: "0801 234 5678"
+        })
+        assert.equal(saved.status, 200)
+        const branding = saved.body.branding
+        assert.deepEqual(branding.brandColor, { key: "cream", name: "Cream", background: "#F3EBDD", text: "#242923", tint: "#FBF8F3", light: true })
+        assert.equal(branding.about, "Handmade Ankara pieces.\n\nCustom sizes in 5 days.")
+        assert.deepEqual(branding.social.instagram, { handle: "adaskloset", url: "https://instagram.com/adaskloset" })
+        assert.deepEqual(branding.social.tiktok, { handle: "adas.kloset", url: "https://www.tiktok.com/@adas.kloset" })
+        assert.equal(branding.social.x.url, "https://x.com/ada_kloset")
+        assert.equal(branding.whatsapp.number, "+2348012345678")
+        assert.match(branding.whatsapp.url, /^https:\/\/wa\.me\/2348012345678\?text=Hi%20/)
+        assert.ok(decodeURIComponent(branding.whatsapp.url).endsWith("I found your shop on StoreHatch."))
+
+        // Shoppers see the same branding, and nothing private: no raw columns and no payout phone.
+        const shop = await publicShop()
+        assert.deepEqual(shop.branding, branding)
+        for (const key of ["whatsappNumber", "instagramHandle", "bannerUrl", "brandColor", "businessPhone"]) {
+            assert.equal(key in shop, false, key)
+        }
+        const listing = await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId }, select: { category: true } })
+        const cards = (await request("GET", `/seller/shops?category=${encodeURIComponent(listing.category)}`)).body as Array<{ slug: string; branding: { bannerUrl: string; brandColor: { key: string } } }>
+        const card = cards.find((candidate) => candidate.slug === profile.slug)
+        assert.deepEqual([card?.branding.bannerUrl, card?.branding.brandColor.key], ["https://img.example.test/banner.jpg", "cream"])
+
+        // Any form of a Nigerian number works; blank or null clears a field, and the colour stays.
+        assert.equal((await patch({ whatsappNumber: "+234 703 000 1111" })).body.branding.whatsapp.number, "+2347030001111")
+        const cleared = (await patch({ bannerUrl: null, instagram: "", whatsappNumber: null, about: "" })).body.branding
+        assert.deepEqual([cleared.bannerUrl, cleared.social.instagram, cleared.whatsapp, cleared.about, cleared.brandColor.key], [null, null, null, null, "cream"])
+        assert.equal(cleared.social.tiktok.handle, "adas.kloset")
+    })
+})

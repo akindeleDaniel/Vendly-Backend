@@ -105,6 +105,17 @@ model SellerProfile {
   location      String
   logoUrl       String
   slug          String  @unique
+  // Branding, all optional: a wide banner photo, one of the preset colours (lib/shopBranding.ts), a short "about"
+  // text, social handles, and a public WhatsApp number the seller chose to show (separate from the private
+  // businessPhone used for payouts).
+  bannerUrl       String?
+  brandColor      String  @default("forest")
+  about           String?
+  instagramHandle String?
+  tiktokHandle    String?
+  facebookHandle  String?
+  xHandle         String?
+  whatsappNumber  String?
   latitude      Float?
   longitude     Float?
 
