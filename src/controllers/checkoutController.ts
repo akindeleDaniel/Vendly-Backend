@@ -6,6 +6,7 @@ import { buildLocation } from "../lib/nigeriaLocation.js"
 import { heldReservationConditions } from "../lib/inventoryReservations.js"
 import { snapshotMatches } from "../lib/preOrders.js"
 import { assertOrderLimits, OrderLimitError } from "../lib/orderLimits.js"
+import { isNigerianState, shippingFor } from "../lib/shippingRates.js"
 
 const checkoutListingSelect = {
     id: true,
@@ -25,7 +26,9 @@ const checkoutListingSelect = {
                     shippingPolicy: true,
                     shippingCost: true,
                     foodOrderType: true,
-                    blockedAt: true
+                    blockedAt: true,
+                    deliversEverywhere: true,
+                    shippingRates: { select: { state: true, cost: true } }
                 }
             }
         }
@@ -65,6 +68,8 @@ type SellerPreview = {
     items: PreviewItem[]
     subtotal: Prisma.Decimal
     shipping: Prisma.Decimal
+    // True when the buyer's state is not known yet and this seller charges differently by state.
+    shippingVaries: boolean
 }
 
 // A pre-order the seller approved, still payable, for exactly what is in the cart from that seller.
@@ -90,8 +95,13 @@ type CheckoutReview = {
         items: PreviewItem[]
         subtotal: string
         shipping: string
+        // True when the delivery fee depends on the buyer's state and no state was given: ask for the state and
+        // preview again before paying.
+        shippingVaries: boolean
         total: string
     }>
+    // The delivery state the fees were worked out for, or null when none was given.
+    deliveryState: string | null
     subtotal: string
     shipping: string
     total: string
@@ -106,6 +116,7 @@ type CheckoutErrorCode =
     | "CHECKOUT_PREORDER_INVALID"
     | "CHECKOUT_PREORDER_NOT_AVAILABLE"
     | "CHECKOUT_ORDER_TOO_LARGE"
+    | "CHECKOUT_DELIVERY_UNAVAILABLE"
 
 class CheckoutRequestError extends Error {
     constructor(
@@ -187,7 +198,8 @@ function createReviewToken(
 function buildCheckoutReview(
     userId: number,
     sellers: SellerPreview[],
-    approvals: Map<number, ApprovedPreOrder> = new Map()
+    approvals: Map<number, ApprovedPreOrder> = new Map(),
+    deliveryState: string | null = null
 ): CheckoutReview {
     const sortedSellers = [...sellers].sort((left, right) => left.sellerId - right.sellerId)
     const sellerGroups = sortedSellers.map((seller) => {
@@ -200,6 +212,7 @@ function buildCheckoutReview(
             items: [...seller.items].sort((left, right) => left.listingId - right.listingId),
             subtotal: formatMoney(seller.subtotal),
             shipping: formatMoney(seller.shipping),
+            shippingVaries: seller.shippingVaries,
             total: formatMoney(total)
         }
     })
@@ -238,7 +251,8 @@ function buildCheckoutReview(
         sellers: sellerGroups,
         subtotal: formatMoney(subtotal),
         shipping: formatMoney(shipping),
-        total: formatMoney(subtotal.plus(shipping))
+        total: formatMoney(subtotal.plus(shipping)),
+        deliveryState
     }
 }
 
@@ -258,7 +272,8 @@ async function limitOrders(client: Prisma.TransactionClient | typeof prisma, sel
 
 function priceCheckoutItems(
     cartItems: CheckoutCartItem[],
-    reservedQuantities: Map<number, number>
+    reservedQuantities: Map<number, number>,
+    deliveryState: string | null = null
 ): CheckoutPricing {
     const sellers = new Map<number, SellerPreview>()
 
@@ -299,17 +314,19 @@ function priceCheckoutItems(
         let sellerPreview = sellers.get(listing.user.id)
 
         if (!sellerPreview) {
-            let shipping: Prisma.Decimal
+            // The fee for the buyer's state (or the default while the state is not known yet).
+            const fee = shippingFor(sellerProfile, deliveryState)
 
-            if (sellerProfile.shippingPolicy === "FREE") {
-                shipping = new Prisma.Decimal(0)
-            } else if (
-                sellerProfile.shippingPolicy === "FIXED" &&
-                sellerProfile.shippingCost !== null &&
-                sellerProfile.shippingCost.greaterThanOrEqualTo(0)
-            ) {
-                shipping = sellerProfile.shippingCost.toDecimalPlaces(2)
-            } else {
+            if (fee.kind === "unavailable") {
+                throw new CheckoutRequestError(
+                    409,
+                    `${sellerProfile.businessName} does not deliver to ${deliveryState}`,
+                    "CHECKOUT_DELIVERY_UNAVAILABLE",
+                    { seller: { businessName: sellerProfile.businessName, slug: sellerProfile.slug }, state: deliveryState }
+                )
+            }
+
+            if (fee.kind === "unknown") {
                 throw new CheckoutRequestError(
                     409,
                     `Shipping information is unavailable for ${sellerProfile.businessName}`,
@@ -317,6 +334,9 @@ function priceCheckoutItems(
                     { listingId: cartItem.listingId }
                 )
             }
+
+            const shipping = fee.cost
+            const shippingVaries = fee.varies
 
             sellerPreview = {
                 sellerId: listing.user.id,
@@ -327,7 +347,8 @@ function priceCheckoutItems(
                 foodOrderType: sellerProfile.foodOrderType,
                 items: [],
                 subtotal: new Prisma.Decimal(0),
-                shipping
+                shipping,
+                shippingVaries
             }
             sellers.set(listing.user.id, sellerPreview)
         }
@@ -723,7 +744,8 @@ export async function createCheckout(req: Request, res: Response) {
 
             const { sellerPreviews, subtotal, shipping, total } = priceCheckoutItems(
                 cart.cartItems,
-                reservedQuantities
+                reservedQuantities,
+                delivery.state
             )
 
             await limitOrders(tx, sellerPreviews)
@@ -731,7 +753,7 @@ export async function createCheckout(req: Request, res: Response) {
             // Food shops that take pre-orders: which of this checkout's orders are pre-orders.
             const approvals = await findApprovedPreOrders(tx, userId, sellerPreviews, now)
             const chosenPreOrders = choosePreOrders(sellerPreviews, approvals, preOrderIds)
-            const review = buildCheckoutReview(userId, sellerPreviews, approvals)
+            const review = buildCheckoutReview(userId, sellerPreviews, approvals, delivery.state)
             const cartSnapshot = sortCartItems(cart.cartItems)
             const hasSameCart = (checkout: typeof existingCheckouts[number]) => {
                 const savedItems = sortCartItems(checkout.checkoutItems)
@@ -1087,6 +1109,15 @@ export async function getCheckoutPreview(req: Request, res: Response) {
         return
     }
 
+    // ?state= is the buyer's delivery state; delivery fees can differ by state. Without it the default fees are shown.
+    const rawState = req.query.state
+    const deliveryState = rawState === undefined ? null : isNigerianState(rawState) ? rawState : undefined
+
+    if (deliveryState === undefined) {
+        res.status(400).send({ message: "State must be the name of a Nigerian state, for example Lagos" })
+        return
+    }
+
     try {
         await expireExpiredCheckouts(userId)
 
@@ -1138,11 +1169,11 @@ export async function getCheckoutPreview(req: Request, res: Response) {
             )
         }
 
-        const { sellerPreviews } = priceCheckoutItems(cart.cartItems, reservedQuantities)
+        const { sellerPreviews } = priceCheckoutItems(cart.cartItems, reservedQuantities, deliveryState)
         await limitOrders(prisma, sellerPreviews)
         const approvals = await findApprovedPreOrders(prisma, userId, sellerPreviews, now)
 
-        res.send(buildCheckoutReview(userId, sellerPreviews, approvals))
+        res.send(buildCheckoutReview(userId, sellerPreviews, approvals, deliveryState))
     } catch (error) {
         if (error instanceof CheckoutRequestError) {
             sendCheckoutRequestError(error, res)

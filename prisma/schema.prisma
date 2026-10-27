@@ -110,6 +110,10 @@ model SellerProfile {
 
   shippingPolicy SellerShippingPolicy
   shippingCost   Decimal?             @db.Decimal(12, 2)
+  // Delivery by the buyer's state: a fee per state (or "no delivery" there) overrides the default above. When
+  // deliversEverywhere is false, only the states listed in shippingRates (with a fee) can order.
+  deliversEverywhere Boolean            @default(true)
+  shippingRates      SellerShippingRate[]
 
   businessPhone         String?
   payoutTermsVersion    String?
@@ -799,4 +803,15 @@ model AdminAuditLog {
   createdAt    DateTime @default(now())
 
   @@index([createdAt])
+}
+
+// A seller's delivery fee for one Nigerian state. A null cost means the seller does not deliver there.
+model SellerShippingRate {
+  id              Int           @id @default(autoincrement())
+  sellerProfileId Int
+  state           String
+  cost            Decimal?      @db.Decimal(12, 2)
+  sellerProfile   SellerProfile @relation(fields: [sellerProfileId], references: [id], onDelete: Cascade)
+
+  @@unique([sellerProfileId, state])
 }

@@ -11,6 +11,7 @@ import { isHttpsUrl, maximumBusinessNameLength } from "../lib/inputRules.js"
 import { imagesInclude, withImages } from "../lib/listingImages.js"
 import { loadChoices, withOptionSummary } from "../lib/listingOptions.js"
 import { confirmedDeliveriesFor, shopTrustFor, type ShopTrust } from "../lib/trust.js"
+import { ratesView } from "../lib/shippingRates.js"
 import { averageRating } from "../lib/reviews.js"
 
 function hasValidCoordinates<T extends { latitude: number | null; longitude: number | null }>(
@@ -356,7 +357,10 @@ export const getPublicShop = async (req: Request, res: Response) => {
                 foodOrderType:true,
                 ratingCount:true,
                 ratingSum:true,
-                blockedAt:true
+                blockedAt:true,
+                // Delivery by the buyer's state, so shoppers see the fee for their state before adding anything.
+                deliversEverywhere:true,
+                shippingRates:{ select:{ state:true, cost:true } }
             }
         })
 
@@ -366,7 +370,7 @@ export const getPublicShop = async (req: Request, res: Response) => {
             return
         }
 
-        const { blockedAt: _blockedAt, ...profileFields } = profile
+        const { blockedAt: _blockedAt, shippingRates, ...profileFields } = profile
 
         const listings = await prisma.listing.findMany({
             where:{
@@ -389,7 +393,7 @@ export const getPublicShop = async (req: Request, res: Response) => {
 
         res.send({
             // trust: numbers the server works out from real orders (confirmed deliveries, complaints, verified payout account).
-            profile: { ...withShopRating(profileFields), trust: trust.get(profile.userId) ?? null },
+            profile: { ...withShopRating(profileFields), shippingRates: ratesView(shippingRates), trust: trust.get(profile.userId) ?? null },
             listings: listings.map((listing) => ({ ...withOptionSummary(withImages(listing), choices.get(listing.id)), deliveredCount: delivered.get(listing.id) ?? 0 }))
         })
     }catch(error){

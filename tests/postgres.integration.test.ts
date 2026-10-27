@@ -9837,3 +9837,79 @@ test("shops and products show trust numbers the server works out from real order
         assert.deepEqual([trust.confirmedDeliveries, trust.payoutVerified], [0, false])
     })
 })
+
+// ---- Delivery fee by state ----
+
+test("a seller can charge a different delivery fee per state, and checkout charges the buyer's state", async () => {
+    await withPaymentCheckout("shipping-by-state", async (context) => {
+        const { fixture, request } = context
+        const seller = fixture.sellerToken
+        const slug = (await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })).slug
+        const put = (body: unknown, token = seller) => request("PUT" as "GET", "/seller/shipping-rates", body, token)
+        const preview = (state?: string) => request("GET", state === undefined ? "/checkout/preview" : `/checkout/preview?state=${encodeURIComponent(state)}`)
+
+        // The default: the shop's own policy (free here) everywhere.
+        assert.deepEqual((await request("GET", "/seller/shipping-rates", undefined, seller)).body, { shippingPolicy: "FREE", shippingCost: null, deliversEverywhere: true, rates: [] })
+
+        // Bad lists are refused with a reason, and only sellers can set fees.
+        for (const [body, message] of [
+            [{ rates: "Lagos" }, /must be a list/],
+            [{ rates: [{ state: "Atlantis", cost: 100 }] }, /not a Nigerian state/],
+            [{ rates: [{ state: "Lagos", cost: 100 }, { state: "Lagos", cost: 200 }] }, /listed twice/],
+            [{ rates: [{ state: "Lagos", cost: -5 }] }, /amount in naira/],
+            [{ rates: [{ state: "Lagos", cost: "1.234" }] }, /amount in naira/],
+            [{ rates: [{ state: "Lagos", cost: true }] }, /amount in naira/],
+            [{ deliversEverywhere: "no", rates: [] }, /true or false/],
+            [{ deliversEverywhere: false, rates: [{ state: "Kano", cost: null }] }, /at least one/]
+        ] as const) {
+            const refused = await put(body)
+            assert.equal(refused.status, 400, JSON.stringify(body))
+            assert.match(refused.body.message, message)
+        }
+        assert.equal((await put({ rates: [] }, fixture.token)).status, 403)
+
+        const saved = await put({ rates: [{ state: "Lagos", cost: 1500 }, { state: "Kano", cost: null }, { state: "Oyo", cost: "2000.50" }] })
+        assert.equal(saved.status, 200)
+        assert.deepEqual(saved.body.rates, [{ state: "Kano", cost: null }, { state: "Lagos", cost: "1500.00" }, { state: "Oyo", cost: "2000.50" }])
+        const shop = (await request("GET", `/seller/shop/${slug}`)).body.profile
+        assert.deepEqual([shop.deliversEverywhere, shop.shippingRates], [true, saved.body.rates])
+
+        // Without a state the default fee shows, flagged as depending on the state.
+        const open = await preview()
+        assert.equal(open.status, 200)
+        assert.deepEqual([open.body.sellers[0].shipping, open.body.sellers[0].shippingVaries, open.body.deliveryState], ["0.00", true, null])
+
+        // With the buyer's state, that state's fee; a state not listed gets the default; a state with no delivery is refused.
+        const lagos = await preview("Lagos")
+        assert.deepEqual([lagos.body.sellers[0].shipping, lagos.body.total, lagos.body.sellers[0].shippingVaries, lagos.body.deliveryState], ["1500.00", "4500.00", false, "Lagos"])
+        assert.equal((await preview("Abia")).body.sellers[0].shipping, "0.00")
+        const kano = await preview("Kano")
+        assert.equal(kano.status, 409)
+        assert.equal(kano.body.code, "CHECKOUT_DELIVERY_UNAVAILABLE")
+        assert.equal(kano.body.state, "Kano")
+        assert.match(kano.body.message, /does not deliver to Kano/)
+        assert.equal((await preview("Atlantis")).status, 400)
+
+        // Paying needs the price for the delivery state: a review made without the state is out of date.
+        const stale = await request("POST", "/checkout", { reviewToken: open.body.reviewToken, delivery: fixtureDelivery })
+        assert.equal(stale.status, 409)
+        assert.equal(stale.body.code, "CHECKOUT_REVIEW_REQUIRED")
+        const placed = await request("POST", "/checkout", { reviewToken: lagos.body.reviewToken, delivery: fixtureDelivery })
+        assert.ok(placed.status === 200 || placed.status === 201, String(placed.status))
+        const order = await prisma.order.findFirstOrThrow({ where: { checkoutId: placed.body.checkout.id } })
+        assert.equal(order.shippingCost.toFixed(2), "1500.00")
+        assert.equal(order.total.toFixed(2), "4500.00")
+
+        // Delivering only to listed states: everywhere else is refused, and the cheapest listed fee stands in until the state is known.
+        await put({ deliversEverywhere: false, rates: [{ state: "Lagos", cost: 1500 }, { state: "Oyo", cost: 2500 }] })
+        assert.deepEqual([(await preview()).body.sellers[0].shipping, (await preview()).body.sellers[0].shippingVaries], ["1500.00", true])
+        assert.equal((await preview("Abia")).body.code, "CHECKOUT_DELIVERY_UNAVAILABLE")
+        assert.equal((await preview("Oyo")).body.sellers[0].shipping, "2500.00")
+        assert.equal((await request("GET", `/seller/shop/${slug}`)).body.profile.deliversEverywhere, false)
+
+        // Clearing the list and delivering everywhere again goes back to the default.
+        const cleared = await put({ deliversEverywhere: true, rates: [] })
+        assert.deepEqual([cleared.body.deliversEverywhere, cleared.body.rates], [true, []])
+        assert.deepEqual([(await preview("Lagos")).body.sellers[0].shipping, (await preview()).body.sellers[0].shippingVaries], ["0.00", false])
+    })
+})

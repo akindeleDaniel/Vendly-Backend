@@ -14,6 +14,7 @@ import {
 } from "../controllers/disputeController.js"
 import { getMyEarnings } from "../controllers/sellerEarningsController.js"
 import { getMyStanding } from "../controllers/sellerStandingController.js"
+import { getMyShippingRates, setMyShippingRates } from "../controllers/shippingRatesController.js"
 import { authMiddleware } from "../middleware/authMiddleware.js"
 import { approvePreOrder, countPreOrdersAwaitingAnswer, declinePreOrder, getSellerPreOrder, listSellerPreOrders } from "../controllers/preOrderController.js"
 import { listMyReviews, listShopReviews, reportReview } from "../controllers/reviewController.js"
@@ -34,6 +35,8 @@ router.post("/payout/terms", authMiddleware, requireRole("SELLER"), acceptPayout
 router.get("/liabilities", authMiddleware, requireRole("SELLER"), getMyLiabilities)
 router.get("/earnings", authMiddleware, requireRole("SELLER"), getMyEarnings)
 router.get("/standing", authMiddleware, requireRole("SELLER"), getMyStanding)
+router.get("/shipping-rates", authMiddleware, requireRole("SELLER"), getMyShippingRates)
+router.put("/shipping-rates", authMiddleware, requireRole("SELLER"), setMyShippingRates)
 router.get("/orders", authMiddleware, requireRole("SELLER"), listSellerOrders)
 router.get("/orders/:id", authMiddleware, requireRole("SELLER"), getSellerOrder)
 router.post("/orders/:id/ship", authMiddleware, requireRole("SELLER"), shipSellerOrder)
