@@ -4,6 +4,7 @@ import { Prisma } from "../generated/prisma/client.js"
 import { categories, getCanonicalCategory } from "../lib/categories.js"
 import { heldReservationConditions } from "../lib/inventoryReservations.js"
 import { imagesInclude, readListingImages, withImages } from "../lib/listingImages.js"
+import { confirmedDeliveriesFor, shopTrustFor } from "../lib/trust.js"
 import { countChoices, loadChoices, optionTree, propagateToOptions, readOptions, ReservedStockConflict, syncListingOptions, withOptionSummary } from "../lib/listingOptions.js"
 import {
     isHttpsUrl,
@@ -131,11 +132,16 @@ export const getAllListings = async (req:Request, res:Response) =>{
         }
     })])
 
-    const choices = await loadChoices(listings.map((listing) => listing.id))
+    const [choices, delivered] = await Promise.all([
+        loadChoices(listings.map((listing) => listing.id)),
+        confirmedDeliveriesFor(listings.map((listing) => listing.id))
+    ])
     const listingsWithShop = listings.map((listing) => {
         const {user, ...rest} = withOptionSummary(withImages(listing), choices.get(listing.id))
         return {
             ...rest,
+            // Orders of this product whose buyer confirmed delivery (not refunded).
+            deliveredCount: delivered.get(listing.id) ?? 0,
             sellerSlug: user.sellerProfile?.slug ?? null,
             sellerName: user.sellerProfile?.businessName ?? null
         }
@@ -183,8 +189,11 @@ export const getListingById  = async (req:Request, res:Response) =>{
     // The same shape as the list, so a product page can name the seller and link to the shop.
     // The seller's account id is not part of it.
     const {user, userId: _sellerAccountId, ...listing} = await detailedListing(specificData)
+    const [delivered, trust] = await Promise.all([confirmedDeliveriesFor([specificData.id]), shopTrustFor([specificData.userId])])
     res.send({
         ...listing,
+        deliveredCount: delivered.get(specificData.id) ?? 0,
+        shopTrust: trust.get(specificData.userId) ?? null,
         selectedListingId: found?.parentId ? found.id : null,
         sellerSlug: user.sellerProfile?.slug ?? null,
         sellerName: user.sellerProfile?.businessName ?? null

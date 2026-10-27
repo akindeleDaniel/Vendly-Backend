@@ -10,6 +10,7 @@ import { getCanonicalCategory } from "../lib/categories.js"
 import { isHttpsUrl, maximumBusinessNameLength } from "../lib/inputRules.js"
 import { imagesInclude, withImages } from "../lib/listingImages.js"
 import { loadChoices, withOptionSummary } from "../lib/listingOptions.js"
+import { confirmedDeliveriesFor, shopTrustFor, type ShopTrust } from "../lib/trust.js"
 import { averageRating } from "../lib/reviews.js"
 
 function hasValidCoordinates<T extends { latitude: number | null; longitude: number | null }>(
@@ -380,11 +381,16 @@ export const getPublicShop = async (req: Request, res: Response) => {
             include: { images: imagesInclude }
         })
 
-        const choices = await loadChoices(listings.map((listing) => listing.id))
+        const [choices, delivered, trust] = await Promise.all([
+            loadChoices(listings.map((listing) => listing.id)),
+            confirmedDeliveriesFor(listings.map((listing) => listing.id)),
+            shopTrustFor([profile.userId])
+        ])
 
         res.send({
-            profile: withShopRating(profileFields),
-            listings: listings.map((listing) => withOptionSummary(withImages(listing), choices.get(listing.id)))
+            // trust: numbers the server works out from real orders (confirmed deliveries, complaints, verified payout account).
+            profile: { ...withShopRating(profileFields), trust: trust.get(profile.userId) ?? null },
+            listings: listings.map((listing) => ({ ...withOptionSummary(withImages(listing), choices.get(listing.id)), deliveredCount: delivered.get(listing.id) ?? 0 }))
         })
     }catch(error){
         res.status(500).send({message:"Sorry there is an issue on our end"})
@@ -496,6 +502,7 @@ export const getCategoryShops = async (req: Request, res: Response) => {
                 },
             select: {
                 id: true,
+                userId: true,
                 businessName: true,
                 state: true,
                 lga: true,
@@ -510,9 +517,14 @@ export const getCategoryShops = async (req: Request, res: Response) => {
             },
             orderBy: [{ businessName: "asc" }, { id: "asc" }]
         })
+        const trust = await shopTrustFor(shops.map((shop) => shop.userId))
+        const present = (list: typeof shops) => list.map(({ latitude: _latitude, longitude: _longitude, userId, ...shop }) => ({
+            ...withShopRating(shop),
+            trust: trust.get(userId) ?? (null as ShopTrust | null)
+        }))
 
         if (!consumerCoordinates || shops.length === 0) {
-            res.send(shops.map(({ latitude: _latitude, longitude: _longitude, ...shop }) => withShopRating(shop)))
+            res.send(present(shops))
             return
         }
 
@@ -533,7 +545,7 @@ export const getCategoryShops = async (req: Request, res: Response) => {
             .slice(0, candidateLimit)
 
         if (candidates.length === 0) {
-            res.send(shops.map(({ latitude: _latitude, longitude: _longitude, ...shop }) => withShopRating(shop)))
+            res.send(present(shops))
             return
         }
 
@@ -560,7 +572,7 @@ export const getCategoryShops = async (req: Request, res: Response) => {
                 })
         } catch {
             console.warn("Geoapify route matrix failed; using category shop ordering")
-            res.send(shops.map(({ latitude: _latitude, longitude: _longitude, ...shop }) => withShopRating(shop)))
+            res.send(present(shops))
             return
         }
 
@@ -571,7 +583,7 @@ export const getCategoryShops = async (req: Request, res: Response) => {
             ...remainingShops
         ]
 
-        res.send(orderedShops.map(({ latitude: _latitude, longitude: _longitude, ...shop }) => withShopRating(shop)))
+        res.send(present(orderedShops))
     } catch {
         res.status(500).send({ message: "Sorry there is an issue on our end" })
     }

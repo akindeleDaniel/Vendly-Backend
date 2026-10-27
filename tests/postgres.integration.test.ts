@@ -9776,3 +9776,64 @@ test("a seller who owes too much for refunds takes no new orders, without the bu
         }
     })
 })
+
+// ---- Public trust numbers ----
+
+test("shops and products show trust numbers the server works out from real orders", async () => {
+    await withPaymentCheckout("trust-numbers", async (context) => {
+        const { fixture, request } = context
+        const listing = await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId }, select: { title: true, category: true } })
+        const slug = (await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })).slug
+        const shopTrust = async () => (await request("GET", `/seller/shop/${slug}`)).body.profile.trust
+        const productPage = async (id = fixture.listingId) => (await request("GET", `/listings/${id}`)).body
+
+        // A new shop: nothing delivered yet, but its payout account was checked with the provider.
+        let trust = await shopTrust()
+        assert.deepEqual([trust.confirmedDeliveries, trust.complaintsSettled, trust.complaintsOpen, trust.payoutVerified], [0, 0, 0, true])
+        assert.ok(new Date(trust.sellingSince).getTime() <= Date.now())
+        assert.equal((await productPage()).deliveredCount, 0)
+
+        // Only a delivery the buyer confirms counts.
+        const orderId = await payAndShip(context)
+        await request("POST", `/seller/orders/${orderId}/delivered`, {}, fixture.sellerToken)
+        assert.equal((await shopTrust()).confirmedDeliveries, 0)
+        assert.equal((await request("POST", `/orders/${context.checkoutId}/seller-orders/${orderId}/confirm-delivery`, {})).status, 200)
+        trust = await shopTrust()
+        assert.equal(trust.confirmedDeliveries, 1)
+        const page = await productPage()
+        assert.equal(page.deliveredCount, 1)
+        assert.equal(page.shopTrust.confirmedDeliveries, 1)
+        assert.equal(page.shopTrust.payoutVerified, true)
+
+        // The same numbers on the shop's product cards, in search and on the category's shop cards (with no account id).
+        const shopCards = (await request("GET", `/seller/shop/${slug}`)).body.listings as Array<{ id: number; deliveredCount: number }>
+        assert.equal(shopCards.find((card) => card.id === fixture.listingId)?.deliveredCount, 1)
+        const found = (await request("GET", `/listings?search=${encodeURIComponent(listing.title)}`)).body.listings as Array<{ id: number; deliveredCount: number }>
+        assert.equal(found.find((card) => card.id === fixture.listingId)?.deliveredCount, 1)
+        const shops = (await request("GET", `/seller/shops?category=${encodeURIComponent(listing.category)}`)).body as Array<{ slug: string; trust: { confirmedDeliveries: number }; userId?: number }>
+        const shop = shops.find((candidate) => candidate.slug === slug)
+        assert.equal(shop?.trust.confirmedDeliveries, 1)
+        assert.equal(shop && "userId" in shop, false)
+
+        // Complaints show as open, then settled once withdrawn.
+        const complaint = await complain(context, orderId)
+        assert.equal(complaint.status, 201)
+        trust = await shopTrust()
+        assert.deepEqual([trust.complaintsOpen, trust.complaintsSettled], [1, 0])
+        assert.equal((await request("POST", `/disputes/${complaint.body.dispute.id}/withdraw`, {})).status, 200)
+        trust = await shopTrust()
+        assert.deepEqual([trust.complaintsOpen, trust.complaintsSettled], [0, 1])
+
+        // A product with options counts the deliveries of all its options together.
+        const product = (await request("POST", "/listings", { title: `Trust product ${randomUUID().slice(0, 6)}`, description: "A product with options", price: 1000, category: "Electronics", imageUrls: ["https://img.example.test/p.jpg"], options: [{ label: "Blue", stockQuantity: 3 }] }, fixture.sellerToken)).body
+        assert.equal((await productPage(product.id)).deliveredCount, 0)
+        await prisma.listing.update({ where: { id: fixture.listingId }, data: { parentId: product.id, optionLabel: "Fixture", sizeLabel: null } })
+        assert.equal((await productPage(product.id)).deliveredCount, 1)
+
+        // A delivery closed automatically (no word from the buyer) does not count, and neither does an unchecked bank account.
+        await prisma.order.update({ where: { id: orderId }, data: { deliveryConfirmedAt: null, deliveryAutoClosedAt: new Date() } })
+        await prisma.sellerPayoutAccount.updateMany({ where: { sellerProfile: { userId: fixture.sellerId } }, data: { status: "PENDING" } })
+        trust = await shopTrust()
+        assert.deepEqual([trust.confirmedDeliveries, trust.payoutVerified], [0, false])
+    })
+})
