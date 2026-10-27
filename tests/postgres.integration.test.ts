@@ -10667,3 +10667,65 @@ test("a product page offers a WhatsApp chat with the shop that already names the
         assert.equal((await page(listing.id)).whatsappEnquiry, null)
     })
 })
+
+// ---- The seller's reviews page: rating summary and tab counts ----
+
+test("the seller's reviews come with a rating summary for the open tab and the count on both tabs", async () => {
+    await withPaymentCheckout("seller-review-summary", async (context) => {
+        const { fixture, request, adminToken } = context
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+        const mine = async (type: "shop" | "product") => (await request("GET", `/seller/reviews?type=${type}`, undefined, fixture.sellerToken)).body
+        const empty = { average: null, count: 0, distribution: { "1": 0, "2": 0, "3": 0, "4": 0, "5": 0 }, withPhotos: 0 }
+
+        // No reviews yet.
+        for (const type of ["shop", "product"] as const) {
+            const body = await mine(type)
+            assert.deepEqual(body.summary, empty, type)
+            assert.deepEqual(body.counts, { shop: 0, product: 0 }, type)
+            assert.equal(body.total, 0)
+        }
+
+        // Reviews on two of the seller's products are summed up together.
+        const orderId = await payForCheckout(context)
+        const reviewers = await addOtherReviewers(context, orderId, [5, 4, 3])
+        const listing = await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })
+        const second = await prisma.listing.create({
+            data: { userId: fixture.sellerId, title: "Second summary product", description: listing.description, price: 900, stockQuantity: 4, category: listing.category, imageUrl: listing.imageUrl }
+        })
+
+        try {
+            await prisma.productReview.create({ data: { listingId: second.id, buyerId: reviewers[0]!.id, orderId, rating: 1, photoUrls: ["https://img.example.test/review.jpg"] } })
+            const products = await mine("product")
+            assert.deepEqual(products.summary, { average: 3.3, count: 4, distribution: { "1": 1, "2": 0, "3": 1, "4": 1, "5": 1 }, withPhotos: 1 })
+            assert.deepEqual(products.counts, { shop: 3, product: 4 })
+            assert.equal(products.total, 4)
+            assert.equal(products.reviews.length, 4)
+
+            // A hidden review leaves the summary but stays in the list, the counts and the total.
+            const five = await prisma.productReview.findFirstOrThrow({ where: { listingId: listing.id, rating: 5 } })
+            assert.equal((await request("POST", `/admin/reviews/products/${five.id}/hide`, { reason: "Breaks the rules" }, adminToken)).status, 200)
+            const afterHiding = await mine("product")
+            assert.deepEqual([afterHiding.summary.count, afterHiding.summary.average, afterHiding.summary.distribution["5"]], [3, 2.7, 0])
+            assert.deepEqual([afterHiding.counts.product, afterHiding.total, afterHiding.reviews.length], [4, 4, 4])
+
+            // The shop's summary is the one shoppers see.
+            const shopReview = await prisma.shopReview.findFirstOrThrow({ where: { sellerProfileId: profile.id, rating: 3 } })
+            assert.equal((await request("POST", `/admin/reviews/shops/${shopReview.id}/hide`, { reason: "Breaks the rules" }, adminToken)).status, 200)
+            const shop = await mine("shop")
+            const publicSummary = (await request("GET", `/seller/shop/${profile.slug}/reviews`)).body.summary
+            assert.deepEqual(shop.summary, publicSummary)
+            assert.deepEqual([shop.summary.count, shop.summary.average], [2, 4.5])
+            assert.deepEqual([shop.counts, shop.total], [{ shop: 3, product: 4 }, 3])
+        } finally {
+            await removeUsers(reviewers)
+            await prisma.listing.delete({ where: { id: second.id } })
+        }
+
+        // The same errors as before.
+        assert.equal((await request("GET", "/seller/reviews?type=both", undefined, fixture.sellerToken)).status, 400)
+        assert.equal((await request("GET", "/seller/reviews?page=0", undefined, fixture.sellerToken)).status, 400)
+        await withStrangerSeller(async (stranger) => {
+            assert.equal((await request("GET", "/seller/reviews?type=shop", undefined, stranger)).status, 404)
+        })
+    })
+})

@@ -307,23 +307,20 @@ function toPublicReview(review: ReviewRow) {
     }
 }
 
-// A product's or shop's visible reviews, newest first, with the average, the count, how many of each star and how
-// many have photos. With photosOnly, only the reviews with photos are listed (the summary still covers them all).
-export async function listPublicReviews(kind: ReviewKind, subjectId: number, page: number, photosOnly = false) {
-    const where = kind === "product" ? { listingId: subjectId, hiddenAt: null } : { sellerProfileId: subjectId, hiddenAt: null }
-    const withPhotos = { ...where, photoUrls: { isEmpty: false } }
-    const listed = photosOnly ? withPhotos : where
-    const select = { id: true, rating: true, comment: true, photoUrls: true, createdAt: true, updatedAt: true, buyer: { select: { name: true } } }
-    const paging = { orderBy: [{ createdAt: "desc" as const }, { id: "desc" as const }], skip: (page - 1) * reviewsPageSize, take: reviewsPageSize, select }
-    const [reviews, groups, photoCount] = kind === "product"
+export type ReviewSummary = { average: number | null; count: number; distribution: Record<string, number>; withPhotos: number }
+
+// The average, the count, how many of each star and how many have photos, for the visible reviews matching where
+// (hidden reviews never count, so this matches the stored rating shoppers see).
+export async function reviewSummary(kind: ReviewKind, where: Prisma.ProductReviewWhereInput | Prisma.ShopReviewWhereInput): Promise<ReviewSummary> {
+    const visible = { ...where, hiddenAt: null }
+    const withPhotos = { ...visible, photoUrls: { isEmpty: false } }
+    const [groups, photoCount] = kind === "product"
         ? await Promise.all([
-            prisma.productReview.findMany({ where: listed as Prisma.ProductReviewWhereInput, ...paging }),
-            prisma.productReview.groupBy({ by: ["rating"], where: where as Prisma.ProductReviewWhereInput, _count: { _all: true } }),
+            prisma.productReview.groupBy({ by: ["rating"], where: visible as Prisma.ProductReviewWhereInput, _count: { _all: true } }),
             prisma.productReview.count({ where: withPhotos as Prisma.ProductReviewWhereInput })
         ])
         : await Promise.all([
-            prisma.shopReview.findMany({ where: listed as Prisma.ShopReviewWhereInput, ...paging }),
-            prisma.shopReview.groupBy({ by: ["rating"], where: where as Prisma.ShopReviewWhereInput, _count: { _all: true } }),
+            prisma.shopReview.groupBy({ by: ["rating"], where: visible as Prisma.ShopReviewWhereInput, _count: { _all: true } }),
             prisma.shopReview.count({ where: withPhotos as Prisma.ShopReviewWhereInput })
         ])
     const distribution: Record<string, number> = { "1": 0, "2": 0, "3": 0, "4": 0, "5": 0 }
@@ -336,10 +333,25 @@ export async function listPublicReviews(kind: ReviewKind, subjectId: number, pag
         sum += group.rating * group._count._all
     }
 
+    return { average: averageRating(sum, count), count, distribution, withPhotos: photoCount }
+}
+
+// A product's or shop's visible reviews, newest first, with the average, the count, how many of each star and how
+// many have photos. With photosOnly, only the reviews with photos are listed (the summary still covers them all).
+export async function listPublicReviews(kind: ReviewKind, subjectId: number, page: number, photosOnly = false) {
+    const subject = kind === "product" ? { listingId: subjectId } : { sellerProfileId: subjectId }
+    const visible = { ...subject, hiddenAt: null }
+    const listed = photosOnly ? { ...visible, photoUrls: { isEmpty: false } } : visible
+    const select = { id: true, rating: true, comment: true, photoUrls: true, createdAt: true, updatedAt: true, buyer: { select: { name: true } } }
+    const paging = { orderBy: [{ createdAt: "desc" as const }, { id: "desc" as const }], skip: (page - 1) * reviewsPageSize, take: reviewsPageSize, select }
+    const [reviews, summary] = kind === "product"
+        ? await Promise.all([prisma.productReview.findMany({ where: listed as Prisma.ProductReviewWhereInput, ...paging }), reviewSummary(kind, subject)])
+        : await Promise.all([prisma.shopReview.findMany({ where: listed as Prisma.ShopReviewWhereInput, ...paging }), reviewSummary(kind, subject)])
+
     return {
         page,
         pageSize: reviewsPageSize,
-        summary: { average: averageRating(sum, count), count, distribution, withPhotos: photoCount },
+        summary,
         reviews: reviews.map(toPublicReview)
     }
 }
