@@ -2,6 +2,7 @@ import type { Request, Response } from "express";
 import prisma from "../lib/prisma.js";
 import { Prisma } from "../generated/prisma/client.js";
 import { heldReservationConditions } from "../lib/inventoryReservations.js";
+import { brandColorFor } from "../lib/shopBranding.js";
 
 const cartItemListingSelect = {
     id: true,
@@ -11,17 +12,45 @@ const cartItemListingSelect = {
     stockQuantity: true,
     category: true,
     imageUrl: true,
+    // A chosen option of a product: which option and size the shopper picked.
+    parentId: true,
+    optionLabel: true,
+    sizeLabel: true,
+    parent: {
+        select: {
+            title: true
+        }
+    },
     user: {
         select: {
             sellerProfile: {
                 select: {
                     businessName: true,
-                    slug: true
+                    slug: true,
+                    logoUrl: true,
+                    location: true,
+                    brandColor: true
                 }
             }
         }
     }
 } as const;
+
+type CartItemListing = Prisma.ListingGetPayload<{ select: typeof cartItemListingSelect }>;
+
+// The listing as the cart shows it. A chosen option's own title reads "Product — Blue / M", so productTitle carries
+// the product's plain name, and the shop's colour is sent as the resolved preset, as on the shop page.
+function cartListingView({ parent, user, ...listing }: CartItemListing) {
+    const shop = user.sellerProfile;
+
+    return {
+        ...listing,
+        productTitle: parent?.title ?? listing.title,
+        user: {
+            sellerProfile: shop ? { ...shop, brandColor: brandColorFor(shop.brandColor) } : null
+        }
+    };
+}
 
 class CartRequestError extends Error {
     constructor(
@@ -125,6 +154,7 @@ export async function getCart(req: Request, res: Response) {
                 ...currentCart,
                 cartItems: currentCart.cartItems.map((item) => ({
                     ...item,
+                    listing: cartListingView(item.listing),
                     availableQuantity: availableQuantity(
                         item.listing.stockQuantity,
                         reservedQuantities.get(item.listingId) ?? 0
@@ -359,6 +389,7 @@ export async function updateCartItem(req: Request, res: Response) {
 
             return {
                 ...updatedCartItem,
+                listing: cartListingView(updatedCartItem.listing),
                 availableQuantity: available
             };
         }, {

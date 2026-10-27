@@ -9421,6 +9421,22 @@ test("a product can have options with their own price and stock, and shoppers bu
         const cart = await request("GET", "/cart", undefined, shopper)
         assert.ok(JSON.stringify(cart.body).includes(`${hoodieTitle} — Blue / M`))
         assert.match(JSON.stringify(cart.body), /22000/)
+        // The cart says which option was picked, gives the plain product name, and tells the shop's card what it needs.
+        const cartListing = cart.body.cart.cartItems.find((item: { listingId: number }) => item.listingId === blueM).listing
+        assert.deepEqual(
+            [cartListing.parentId, cartListing.optionLabel, cartListing.sizeLabel, cartListing.productTitle, cartListing.imageUrl],
+            [productId, "Blue", "M", hoodieTitle, "https://img.example.test/blue.jpg"]
+        )
+        assert.equal("parent" in cartListing, false)
+        const cartShop = cartListing.user.sellerProfile
+        assert.deepEqual(Object.keys(cartShop).sort(), ["brandColor", "businessName", "location", "logoUrl", "slug"])
+        assert.equal(cartShop.brandColor.key, "forest")
+        assert.equal(typeof cartShop.brandColor.background, "string")
+        const patchedItem = await request("PATCH" as "GET", `/cart/items/${blueM}`, { quantity: 2 }, shopper)
+        assert.equal(patchedItem.status, 200)
+        assert.equal(patchedItem.body.listing.productTitle, hoodieTitle)
+        assert.equal(patchedItem.body.listing.user.sellerProfile.brandColor.key, "forest")
+        await request("PATCH" as "GET", `/cart/items/${blueM}`, { quantity: 1 }, shopper)
 
         // What can be changed where.
         const patch = (id: number, body: unknown) => request("PATCH" as "GET", `/listings/${id}`, body, seller)
