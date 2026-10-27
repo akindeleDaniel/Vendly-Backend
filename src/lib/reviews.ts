@@ -9,6 +9,8 @@ export const maximumReviewCommentLength = 1000
 export const reviewEditWindowDays = 7
 export const reviewsPageSize = 10
 export const maximumReportReasonLength = 300
+// A review can carry a few photos of what arrived, which is what shoppers check most before trusting a seller.
+export const maximumReviewPhotos = 3
 const dayMs = 24 * 60 * 60 * 1000
 
 export type ReviewKind = "product" | "shop"
@@ -43,6 +45,33 @@ export function parseComment(value: unknown): string | undefined | null {
     // Plain text only: control characters are dropped, and runs of blank lines are collapsed.
     const comment = value.replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/g, "").replace(/\n{3,}/g, "\n\n").trim()
     return comment.length === 0 ? undefined : comment.length <= maximumReviewCommentLength ? comment : null
+}
+
+// Undefined when no photos were given; null when they are not a list of up to 3 https links. Repeats are dropped.
+export function parsePhotoUrls(value: unknown): string[] | undefined | null {
+    if (value === undefined) {
+        return undefined
+    }
+
+    if (!Array.isArray(value) || value.length > maximumReviewPhotos) {
+        return null
+    }
+
+    for (const entry of value) {
+        if (typeof entry !== "string" || entry.length > 500) {
+            return null
+        }
+
+        try {
+            if (new URL(entry).protocol !== "https:") {
+                return null
+            }
+        } catch {
+            return null
+        }
+    }
+
+    return [...new Set(value as string[])]
 }
 
 export function parseReportReason(value: unknown): string | null {
@@ -87,8 +116,8 @@ export type NewReviewInput = {
     checkoutId: number
     orderId: number
     buyerId: number
-    shop?: { rating: number; comment?: string }
-    products: Array<{ listingId: number; rating: number; comment?: string }>
+    shop?: { rating: number; comment?: string; photoUrls?: string[] }
+    products: Array<{ listingId: number; rating: number; comment?: string; photoUrls?: string[] }>
 }
 
 // A product's reviews belong to the product, not to the option that was bought: a review of "Hoodie, Blue / M" is a review
@@ -156,7 +185,7 @@ export async function createOrderReviews(input: NewReviewInput) {
             for (const product of input.products) {
                 const subject = subjectOf.get(product.listingId)!
                 products.push(await tx.productReview.create({
-                    data: { listingId: subject, buyerId: input.buyerId, orderId: order.id, rating: product.rating, comment: product.comment ?? null }
+                    data: { listingId: subject, buyerId: input.buyerId, orderId: order.id, rating: product.rating, comment: product.comment ?? null, photoUrls: product.photoUrls ?? [] }
                 }))
                 await recalculateRating(tx, "product", subject)
             }
@@ -165,7 +194,7 @@ export async function createOrderReviews(input: NewReviewInput) {
 
             if (input.shop && sellerProfileId !== undefined) {
                 shop = await tx.shopReview.create({
-                    data: { sellerProfileId, buyerId: input.buyerId, orderId: order.id, rating: input.shop.rating, comment: input.shop.comment ?? null }
+                    data: { sellerProfileId, buyerId: input.buyerId, orderId: order.id, rating: input.shop.rating, comment: input.shop.comment ?? null, photoUrls: input.shop.photoUrls ?? [] }
                 })
                 await recalculateRating(tx, "shop", sellerProfileId)
             }
@@ -191,10 +220,11 @@ export async function getOrderReviewState(checkoutId: number, orderId: number, b
             : Promise.resolve(null)
     ])
     const now = Date.now()
-    const shown = (review: { id: number; rating: number; comment: string | null; createdAt: Date; hiddenAt: Date | null }) => ({
+    const shown = (review: { id: number; rating: number; comment: string | null; photoUrls: string[]; createdAt: Date; hiddenAt: Date | null }) => ({
         id: review.id,
         rating: review.rating,
         comment: review.comment,
+        photoUrls: review.photoUrls,
         createdAt: review.createdAt,
         hidden: review.hiddenAt !== null,
         canChange: now - review.createdAt.getTime() <= reviewEditWindowDays * dayMs
@@ -218,7 +248,7 @@ export async function changeReview(
     kind: ReviewKind,
     reviewId: number,
     buyerId: number,
-    change: { remove: true } | { remove?: false; rating?: number; comment?: string | null }
+    change: { remove: true } | { remove?: false; rating?: number; comment?: string | null; photoUrls?: string[] }
 ) {
     const where = { id: reviewId, buyerId }
     const review = kind === "product"
@@ -247,7 +277,8 @@ export async function changeReview(
         } else {
             const data = {
                 ...(change.rating !== undefined ? { rating: change.rating } : {}),
-                ...(change.comment !== undefined ? { comment: change.comment } : {})
+                ...(change.comment !== undefined ? { comment: change.comment } : {}),
+                ...(change.photoUrls !== undefined ? { photoUrls: change.photoUrls } : {})
             }
             updated = kind === "product"
                 ? await tx.productReview.update({ where: { id: reviewId }, data })
@@ -261,13 +292,14 @@ export async function changeReview(
 
 // ---- reading reviews (public) ----
 
-type ReviewRow = { id: number; rating: number; comment: string | null; createdAt: Date; updatedAt: Date; buyer: { name: string } }
+type ReviewRow = { id: number; rating: number; comment: string | null; photoUrls: string[]; createdAt: Date; updatedAt: Date; buyer: { name: string } }
 
 function toPublicReview(review: ReviewRow) {
     return {
         id: review.id,
         rating: review.rating,
         comment: review.comment,
+        photoUrls: review.photoUrls,
         reviewer: reviewerLabel(review.buyer.name),
         createdAt: review.createdAt,
         // True when the buyer changed it after writing it.
@@ -275,19 +307,24 @@ function toPublicReview(review: ReviewRow) {
     }
 }
 
-// A product's or shop's visible reviews, newest first, with the average, the count and how many of each star.
-export async function listPublicReviews(kind: ReviewKind, subjectId: number, page: number) {
+// A product's or shop's visible reviews, newest first, with the average, the count, how many of each star and how
+// many have photos. With photosOnly, only the reviews with photos are listed (the summary still covers them all).
+export async function listPublicReviews(kind: ReviewKind, subjectId: number, page: number, photosOnly = false) {
     const where = kind === "product" ? { listingId: subjectId, hiddenAt: null } : { sellerProfileId: subjectId, hiddenAt: null }
-    const select = { id: true, rating: true, comment: true, createdAt: true, updatedAt: true, buyer: { select: { name: true } } }
+    const withPhotos = { ...where, photoUrls: { isEmpty: false } }
+    const listed = photosOnly ? withPhotos : where
+    const select = { id: true, rating: true, comment: true, photoUrls: true, createdAt: true, updatedAt: true, buyer: { select: { name: true } } }
     const paging = { orderBy: [{ createdAt: "desc" as const }, { id: "desc" as const }], skip: (page - 1) * reviewsPageSize, take: reviewsPageSize, select }
-    const [reviews, groups] = kind === "product"
+    const [reviews, groups, photoCount] = kind === "product"
         ? await Promise.all([
-            prisma.productReview.findMany({ where: where as Prisma.ProductReviewWhereInput, ...paging }),
-            prisma.productReview.groupBy({ by: ["rating"], where: where as Prisma.ProductReviewWhereInput, _count: { _all: true } })
+            prisma.productReview.findMany({ where: listed as Prisma.ProductReviewWhereInput, ...paging }),
+            prisma.productReview.groupBy({ by: ["rating"], where: where as Prisma.ProductReviewWhereInput, _count: { _all: true } }),
+            prisma.productReview.count({ where: withPhotos as Prisma.ProductReviewWhereInput })
         ])
         : await Promise.all([
-            prisma.shopReview.findMany({ where: where as Prisma.ShopReviewWhereInput, ...paging }),
-            prisma.shopReview.groupBy({ by: ["rating"], where: where as Prisma.ShopReviewWhereInput, _count: { _all: true } })
+            prisma.shopReview.findMany({ where: listed as Prisma.ShopReviewWhereInput, ...paging }),
+            prisma.shopReview.groupBy({ by: ["rating"], where: where as Prisma.ShopReviewWhereInput, _count: { _all: true } }),
+            prisma.shopReview.count({ where: withPhotos as Prisma.ShopReviewWhereInput })
         ])
     const distribution: Record<string, number> = { "1": 0, "2": 0, "3": 0, "4": 0, "5": 0 }
     let count = 0
@@ -302,7 +339,7 @@ export async function listPublicReviews(kind: ReviewKind, subjectId: number, pag
     return {
         page,
         pageSize: reviewsPageSize,
-        summary: { average: averageRating(sum, count), count, distribution },
+        summary: { average: averageRating(sum, count), count, distribution, withPhotos: photoCount },
         reviews: reviews.map(toPublicReview)
     }
 }

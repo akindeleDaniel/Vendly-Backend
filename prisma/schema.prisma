@@ -720,6 +720,8 @@ model ProductReview {
   order        Order     @relation(fields: [orderId], references: [id])
   rating       Int
   comment      String?
+  // Up to 3 photos of what arrived (https links from the upload flow). Hidden with the review.
+  photoUrls    String[]  @default([])
   hiddenAt     DateTime?
   hiddenReason String?
   hiddenById   Int?
@@ -745,6 +747,8 @@ model ShopReview {
   order           Order         @relation(fields: [orderId], references: [id])
   rating          Int
   comment         String?
+  // Up to 3 photos of what arrived (https links from the upload flow). Hidden with the review.
+  photoUrls       String[]      @default([])
   hiddenAt        DateTime?
   hiddenReason    String?
   hiddenById      Int?

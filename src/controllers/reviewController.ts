@@ -6,7 +6,9 @@ import {
     getOrderReviewState,
     listPublicReviews,
     maximumReviewCommentLength,
+    maximumReviewPhotos,
     parseComment,
+    parsePhotoUrls,
     parseRating,
     parseReportReason,
     recalculateRating,
@@ -48,9 +50,10 @@ function sendReviewError(error: unknown, res: Response): boolean {
 
 const commentProblem = `Comments can be up to ${maximumReviewCommentLength} characters`
 const ratingProblem = "Rating must be a whole number from 1 to 5"
+const photosProblem = `Photos must be up to ${maximumReviewPhotos} https links`
 
-function toBuyerReview(review: { id: number; rating: number; comment: string | null; createdAt: Date; hiddenAt: Date | null }) {
-    return { id: review.id, rating: review.rating, comment: review.comment, createdAt: review.createdAt, hidden: review.hiddenAt !== null }
+function toBuyerReview(review: { id: number; rating: number; comment: string | null; photoUrls: string[]; createdAt: Date; hiddenAt: Date | null }) {
+    return { id: review.id, rating: review.rating, comment: review.comment, photoUrls: review.photoUrls, createdAt: review.createdAt, hidden: review.hiddenAt !== null }
 }
 
 // ---------------------------------------------------------------------------
@@ -91,12 +94,13 @@ export const createMyOrderReviews = async (req: Request, res: Response) => {
         return
     }
 
-    let shopReview: { rating: number; comment?: string } | undefined
+    let shopReview: { rating: number; comment?: string; photoUrls?: string[] } | undefined
 
     if (shop !== undefined) {
-        const input = shop as { rating?: unknown; comment?: unknown } | null
+        const input = shop as { rating?: unknown; comment?: unknown; photoUrls?: unknown } | null
         const rating = typeof input === "object" && input !== null ? parseRating(input.rating) : null
         const comment = typeof input === "object" && input !== null ? parseComment(input.comment) : null
+        const photoUrls = typeof input === "object" && input !== null ? parsePhotoUrls(input.photoUrls) : undefined
 
         if (rating === null) {
             res.status(400).send({ message: ratingProblem })
@@ -108,10 +112,15 @@ export const createMyOrderReviews = async (req: Request, res: Response) => {
             return
         }
 
-        shopReview = { rating, ...(comment !== undefined ? { comment } : {}) }
+        if (photoUrls === null) {
+            res.status(400).send({ message: photosProblem })
+            return
+        }
+
+        shopReview = { rating, ...(comment !== undefined ? { comment } : {}), ...(photoUrls !== undefined ? { photoUrls } : {}) }
     }
 
-    const productReviews: Array<{ listingId: number; rating: number; comment?: string }> = []
+    const productReviews: Array<{ listingId: number; rating: number; comment?: string; photoUrls?: string[] }> = []
 
     if (products !== undefined) {
         if (!Array.isArray(products) || products.length === 0 || products.length > maximumProductsPerRequest) {
@@ -119,10 +128,11 @@ export const createMyOrderReviews = async (req: Request, res: Response) => {
             return
         }
 
-        for (const entry of products as Array<{ listingId?: unknown; rating?: unknown; comment?: unknown } | null>) {
+        for (const entry of products as Array<{ listingId?: unknown; rating?: unknown; comment?: unknown; photoUrls?: unknown } | null>) {
             const listingId = typeof entry === "object" && entry !== null ? parseId(entry.listingId) : null
             const rating = typeof entry === "object" && entry !== null ? parseRating(entry.rating) : null
             const comment = typeof entry === "object" && entry !== null ? parseComment(entry.comment) : null
+            const photoUrls = typeof entry === "object" && entry !== null ? parsePhotoUrls(entry.photoUrls) : undefined
 
             if (listingId === null || rating === null) {
                 res.status(400).send({ message: listingId === null ? "Each product review needs a listingId" : ratingProblem })
@@ -134,7 +144,12 @@ export const createMyOrderReviews = async (req: Request, res: Response) => {
                 return
             }
 
-            productReviews.push({ listingId, rating, ...(comment !== undefined ? { comment } : {}) })
+            if (photoUrls === null) {
+                res.status(400).send({ message: photosProblem })
+                return
+            }
+
+            productReviews.push({ listingId, rating, ...(comment !== undefined ? { comment } : {}), ...(photoUrls !== undefined ? { photoUrls } : {}) })
         }
 
         if (new Set(productReviews.map((review) => review.listingId)).size !== productReviews.length) {
@@ -169,6 +184,8 @@ export const changeMyReview = async (req: Request, res: Response) => {
     const reviewId = parseId(req.params.reviewId)
     const rating = req.body.rating === undefined ? undefined : parseRating(req.body.rating)
     const comment = req.body.comment === undefined ? undefined : req.body.comment === null ? null : parseComment(req.body.comment)
+    // The whole set of photos: an empty list removes them all.
+    const photoUrls = parsePhotoUrls(req.body.photoUrls)
 
     if (!kind || reviewId === null) {
         res.status(404).send({ message: "Review not found" })
@@ -185,14 +202,20 @@ export const changeMyReview = async (req: Request, res: Response) => {
         return
     }
 
-    if (rating === undefined && comment === undefined) {
-        res.status(400).send({ message: "Provide a rating or a comment to change" })
+    if (photoUrls === null) {
+        res.status(400).send({ message: photosProblem })
+        return
+    }
+
+    if (rating === undefined && comment === undefined && photoUrls === undefined) {
+        res.status(400).send({ message: "Provide a rating, a comment or photos to change" })
         return
     }
 
     try {
         const updated = await changeReview(kind, reviewId, req.user!.id, {
             ...(rating !== undefined ? { rating } : {}),
+            ...(photoUrls !== undefined ? { photoUrls } : {}),
             // A blank comment clears it; undefined from the parser (blank text) means "no comment".
             ...(comment !== undefined || req.body.comment !== undefined ? { comment: comment ?? null } : {})
         })
@@ -244,7 +267,7 @@ export const listListingReviews = async (req: Request, res: Response) => {
     }
 
     // A choice of a product shows the product's reviews.
-    res.send(await listPublicReviews("product", listing.parentId ?? listing.id, page))
+    res.send(await listPublicReviews("product", listing.parentId ?? listing.id, page, req.query.withPhotos === "true"))
 }
 
 export const listShopReviews = async (req: Request, res: Response) => {
@@ -263,7 +286,7 @@ export const listShopReviews = async (req: Request, res: Response) => {
         return
     }
 
-    res.send(await listPublicReviews("shop", profile.id, page))
+    res.send(await listPublicReviews("shop", profile.id, page, req.query.withPhotos === "true"))
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +304,7 @@ export const listMyReviews = async (req: Request, res: Response) => {
     }
 
     const paging = { orderBy: [{ createdAt: "desc" as const }, { id: "desc" as const }], skip: (page - 1) * reviewsPageSize, take: reviewsPageSize }
-    const select = { id: true, rating: true, comment: true, createdAt: true, reportedAt: true, hiddenAt: true, buyer: { select: { name: true } } }
+    const select = { id: true, rating: true, comment: true, photoUrls: true, createdAt: true, reportedAt: true, hiddenAt: true, buyer: { select: { name: true } } }
 
     if (type === "shop") {
         const profile = await prisma.sellerProfile.findUnique({ where: { userId: req.user!.id }, select: { id: true, ratingCount: true, ratingSum: true } })
@@ -310,11 +333,12 @@ export const listMyReviews = async (req: Request, res: Response) => {
     })
 }
 
-function toSellerReview(row: { id: number; rating: number; comment: string | null; createdAt: Date; reportedAt: Date | null; hiddenAt: Date | null; buyer: { name: string } }) {
+function toSellerReview(row: { id: number; rating: number; comment: string | null; photoUrls: string[]; createdAt: Date; reportedAt: Date | null; hiddenAt: Date | null; buyer: { name: string } }) {
     return {
         id: row.id,
         rating: row.rating,
         comment: row.comment,
+        photoUrls: row.photoUrls,
         reviewer: row.buyer.name.trim().split(/\s+/)[0] ?? "A buyer",
         createdAt: row.createdAt,
         reported: row.reportedAt !== null,
@@ -380,6 +404,7 @@ export const listAdminReviews = async (req: Request, res: Response) => {
         id: true,
         rating: true,
         comment: true,
+        photoUrls: true,
         createdAt: true,
         reportedAt: true,
         reportReason: true,

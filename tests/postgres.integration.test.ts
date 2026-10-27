@@ -6893,6 +6893,55 @@ test("a trusted device belongs to one account and logging out everywhere forgets
     })
 })
 
+test("one browser stays trusted by each account that entered a code, so switching accounts does not ask again", async () => {
+    await withSessionUser(async (context) => {
+        const others = await Promise.all([1, 2, 3, 4, 5].map(async (n) => prisma.user.create({
+            data: { name: `Other ${n}`, email: `switch-${n}-${randomUUID()}@example.test`, passwordHash: await bcrypt.hash(goodPassword, 4), role: "CONSUMER", emailVerifiedAt: new Date() }
+        })))
+        const asksForCode = async (email: string, password: string, cookie: string) =>
+            (await (await postJson(context.baseUrl, "/users/login", { email, password }, cookie)).json() as { otpRequired?: boolean }).otpRequired === true
+        // Logs in with a code on this browser and returns the browser's new trusted-device cookie.
+        const enterCode = async (email: string, password: string, cookie: string) => {
+            assert.equal(await asksForCode(email, password, cookie), true)
+            const verified = await postJson(context.baseUrl, "/users/login/verify", { email, code: codeSentTo(email) }, cookie)
+            assert.equal(verified.status, 200)
+            return `trustedDevice=${cookiesFrom(verified).trustedDevice?.value}`
+        }
+
+        try {
+            // Account A, then account B on the same browser: both are now trusted.
+            let cookie = await enterCode(context.email, context.password, "")
+            cookie = await enterCode(others[0]!.email, goodPassword, cookie)
+            assert.equal(await asksForCode(context.email, context.password, cookie), false)
+            assert.equal(await asksForCode(others[0]!.email, goodPassword, cookie), false)
+
+            // Logging out everywhere on one account forgets only that account.
+            await prisma.trustedDevice.updateMany({ where: { userId: others[0]!.id }, data: { revokedAt: new Date() } })
+            assert.equal(await asksForCode(others[0]!.email, goodPassword, cookie), true)
+            assert.equal(await asksForCode(context.email, context.password, cookie), false)
+
+            // At most five accounts per browser: with a sixth, the oldest (A) is dropped.
+            cookie = await enterCode(others[0]!.email, goodPassword, cookie)
+            for (const other of others.slice(1)) {
+                cookie = await enterCode(other.email, goodPassword, cookie)
+            }
+            assert.equal(cookie.split("=")[1]!.split(".").length, 5)
+            assert.equal(await asksForCode(context.email, context.password, cookie), true)
+            for (const other of others.slice(1)) {
+                assert.equal(await asksForCode(other.email, goodPassword, cookie), false)
+            }
+
+            // Malformed parts of the cookie are ignored.
+            assert.equal(await asksForCode(others[4]!.email, goodPassword, `${cookie}..%%%.`), false)
+        } finally {
+            await prisma.trustedDevice.deleteMany({ where: { userId: { in: others.map((other) => other.id) } } })
+            await prisma.emailOtp.deleteMany({ where: { userId: { in: others.map((other) => other.id) } } })
+            await prisma.refreshToken.deleteMany({ where: { userId: { in: others.map((other) => other.id) } } })
+            await prisma.user.deleteMany({ where: { id: { in: others.map((other) => other.id) } } })
+        }
+    })
+})
+
 test("administrators enter a code every time and their devices are never remembered", async () => {
     await withSessionUser(async (context) => {
         await setUpAccount(context, { isAdmin: true })
@@ -10422,6 +10471,80 @@ test("pre-order lists have tabs with counts and a waiting-for-payment number, an
             assert.deepEqual([view.items[0].imageUrl, view.items[0].optionLabel, view.items[0].sizeLabel], ["https://img.example.test/parent-photo.jpg", "Blue", null])
             assert.deepEqual([view.seller.businessName, view.seller.slug, view.seller.logoUrl, view.seller.location], [profile.businessName, profile.slug, null, null])
             assert.equal(view.seller.brandColor.key, "forest")
+        }
+    })
+})
+
+// ---- Photo reviews ----
+
+test("buyers can add up to three photos to a review, and shoppers can see and filter by them", async () => {
+    await withPaymentCheckout("review-photos", async (context) => {
+        const { fixture, request, checkoutId, adminToken } = context
+        const orderId = await payAndShip(context)
+        await request("POST", `/seller/orders/${orderId}/delivered`, {}, fixture.sellerToken)
+        await request("POST", `/orders/${checkoutId}/seller-orders/${orderId}/confirm-delivery`, {})
+        const path = `/orders/${checkoutId}/seller-orders/${orderId}/reviews`
+        const listingId = fixture.listingId
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+        const photo = (name: string) => `https://res.cloudinary.com/demo/image/upload/v1/${name}.jpg`
+
+        // Only a list of up to three https links.
+        for (const photoUrls of [[photo("a"), photo("b"), photo("c"), photo("d")], ["http://img.example.test/a.jpg"], ["not a link"], [42], "https://img.example.test/a.jpg", null]) {
+            for (const body of [{ shop: { rating: 5, photoUrls } }, { products: [{ listingId, rating: 5, photoUrls }] }]) {
+                const refused = await request("POST", path, body)
+                assert.equal(refused.status, 400, JSON.stringify(body))
+                assert.equal(refused.body.message, "Photos must be up to 3 https links")
+            }
+        }
+
+        // Saved with the review (a repeated link is kept once).
+        const created = await request("POST", path, {
+            shop: { rating: 5, photoUrls: [photo("parcel")] },
+            products: [{ listingId, rating: 4, comment: "Same as the pictures", photoUrls: [photo("front"), photo("back"), photo("front")] }]
+        })
+        assert.equal(created.status, 201)
+        assert.deepEqual(created.body.shop.photoUrls, [photo("parcel")])
+        assert.deepEqual(created.body.products[0].photoUrls, [photo("front"), photo("back")])
+        const state = (await request("GET", path)).body
+        assert.deepEqual(state.shop.photoUrls, [photo("parcel")])
+        assert.deepEqual(state.products[0].review.photoUrls, [photo("front"), photo("back")])
+        const productReviewId = created.body.products[0].id as number
+
+        // Shoppers see them, with how many reviews have photos, and can list only those.
+        const others = await addOtherReviewers(context, orderId, [3])
+        try {
+            const reviews = (query = "") => request("GET", `/listings/${listingId}/reviews${query}`)
+            const all = (await reviews()).body
+            assert.equal(all.summary.count, 2)
+            assert.equal(all.summary.withPhotos, 1)
+            assert.deepEqual(all.reviews.map((review: { photoUrls: string[] }) => review.photoUrls.length).sort(), [0, 2])
+            const onlyPhotos = (await reviews("?withPhotos=true")).body
+            assert.deepEqual(onlyPhotos.reviews.map((review: { id: number }) => review.id), [productReviewId])
+            assert.equal(onlyPhotos.summary.count, 2)
+            const shop = (await request("GET", `/seller/shop/${profile.slug}/reviews?withPhotos=true`)).body
+            assert.deepEqual(shop.reviews.map((review: { photoUrls: string[] }) => review.photoUrls), [[photo("parcel")]])
+            assert.equal(shop.summary.withPhotos, 1)
+
+            // The seller and administrators see the photos too.
+            const sellerList = (await request("GET", "/seller/reviews?type=product", undefined, fixture.sellerToken)).body.reviews
+            assert.deepEqual(sellerList.find((review: { id: number }) => review.id === productReviewId).photoUrls, [photo("front"), photo("back")])
+            const adminList = (await request("GET", "/admin/reviews?type=product&status=all", undefined, adminToken)).body.reviews
+            assert.deepEqual(adminList.find((review: { id: number }) => review.id === productReviewId).photoUrls, [photo("front"), photo("back")])
+
+            // The buyer can change the photos while the review can still be changed; an empty list removes them.
+            const change = (body: unknown) => request("PATCH" as "GET", `/reviews/products/${productReviewId}`, body)
+            assert.equal((await change({ photoUrls: ["ftp://img.example.test/a.jpg"] })).status, 400)
+            assert.deepEqual((await change({ photoUrls: [photo("side")] })).body.review.photoUrls, [photo("side")])
+            assert.equal((await change({ photoUrls: [] })).body.review.photoUrls.length, 0)
+            assert.equal((await reviews()).body.summary.withPhotos, 0)
+            await change({ photoUrls: [photo("side")] })
+
+            // A hidden review's photos are hidden with it.
+            assert.equal((await request("POST", `/admin/reviews/products/${productReviewId}/hide`, { reason: "Not a photo of the product" }, adminToken)).status, 200)
+            const afterHiding = (await reviews("?withPhotos=true")).body
+            assert.deepEqual([afterHiding.reviews.length, afterHiding.summary.withPhotos], [0, 0])
+        } finally {
+            await removeUsers(others)
         }
     })
 })
