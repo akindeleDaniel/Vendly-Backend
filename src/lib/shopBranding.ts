@@ -180,6 +180,19 @@ export function brandingView(profile: BrandingColumns) {
     }
 }
 
+// "Ask about this product": a WhatsApp chat with the shop that already names the product and links to it, so the
+// shopper does not have to explain which one they mean. Only for shops that switched their WhatsApp number on.
+export function productEnquiry(whatsappNumber: string | null, shop: string, product: { title: string; price: number; from: boolean }, shareUrl: string) {
+    if (!whatsappNumber) {
+        return null
+    }
+
+    const price = `₦${product.price.toLocaleString("en-NG", { maximumFractionDigits: 2 })}`
+    const message = `Hi ${shop}, I'm interested in "${product.title}" (${product.from ? `from ${price}` : price}) on StoreHatch: ${shareUrl}`
+
+    return { number: whatsappNumber, message, url: `https://wa.me/${whatsappNumber.slice(1)}?text=${encodeURIComponent(message)}` }
+}
+
 export const brandingSelect = {
     bannerUrl: true,
     brandColor: true,

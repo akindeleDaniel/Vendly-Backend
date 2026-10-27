@@ -10628,3 +10628,42 @@ test("a sale that takes stock to the seller's alert line emails them once, and t
         assert.deepEqual([soldOutBlue.stockStatus, soldOutBlue.lowStockOptions.map((option) => option.stockStatus)], ["low", ["sold_out", "low"]])
     })
 })
+
+// ---- "Ask about this product" ----
+
+test("a product page offers a WhatsApp chat with the shop that already names the product, only when the shop has WhatsApp on", async () => {
+    await withPaymentCheckout("product-enquiry", async (context) => {
+        const { fixture, request } = context
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+        const listing = await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })
+        const page = async (id: number) => (await request("GET", `/listings/${id}`)).body
+        const messageOf = (url: string) => decodeURIComponent(new URL(url).searchParams.get("text") ?? "")
+
+        // No WhatsApp number, no link.
+        assert.equal((await page(listing.id)).whatsappEnquiry, null)
+
+        assert.equal((await request("PATCH" as "GET", "/seller/profile", { whatsappNumber: "0803 123 4567" }, fixture.sellerToken)).status, 200)
+        const plain = await page(listing.id)
+        assert.equal(plain.whatsappEnquiry.number, "+2348031234567")
+        assert.ok(plain.whatsappEnquiry.url.startsWith("https://wa.me/2348031234567?text="))
+        assert.equal(messageOf(plain.whatsappEnquiry.url), plain.whatsappEnquiry.message)
+        assert.equal(plain.whatsappEnquiry.message, `Hi ${profile.businessName}, I'm interested in "${listing.title}" (₦${listing.price.toLocaleString("en-NG")}) on StoreHatch: ${plain.shareUrl}`)
+        // The seller's own low-stock setting is not shown to shoppers.
+        assert.equal("lowStockThreshold" in plain, false)
+
+        // A product whose options cost different amounts says "from"; opened from one option, it names that option.
+        const product = (await request("POST", "/listings", {
+            title: "Enquiry hoodie", description: "Soft", price: 5000, category: "Electronics",
+            imageUrls: ["https://img.example.test/enquiry-hoodie.jpg"],
+            options: [{ label: "Blue", price: 5000, stockQuantity: 2 }, { label: "Red", price: 7000, stockQuantity: 2 }]
+        }, fixture.sellerToken)).body
+        assert.match((await page(product.id)).whatsappEnquiry.message, /"Enquiry hoodie" \(from ₦5,000\)/)
+        const red = await page(product.options[1].listingId)
+        assert.match(red.whatsappEnquiry.message, /"Enquiry hoodie — Red" \(₦7,000\)/)
+        assert.ok(red.whatsappEnquiry.message.endsWith(`/share/product/${product.id}`))
+
+        // Turning WhatsApp off removes the link.
+        await request("PATCH" as "GET", "/seller/profile", { whatsappNumber: "" }, fixture.sellerToken)
+        assert.equal((await page(listing.id)).whatsappEnquiry, null)
+    })
+})

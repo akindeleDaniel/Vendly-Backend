@@ -1,4 +1,5 @@
 import type { Request, Response } from "express"
+import { productEnquiry } from "../lib/shopBranding.js"
 import { effectiveThreshold, lowStockThresholdProblem, parseLowStockThreshold, stockStatus } from "../lib/stockAlerts.js"
 import prisma from "../lib/prisma.js"
 import { Prisma } from "../generated/prisma/client.js"
@@ -172,7 +173,8 @@ export const getListingById  = async (req:Request, res:Response) =>{
                     select:{
                         slug:true,
                         businessName:true,
-                        blockedAt:true
+                        blockedAt:true,
+                        whatsappNumber:true
                     }
                 }
             }
@@ -190,14 +192,19 @@ export const getListingById  = async (req:Request, res:Response) =>{
 
     // The same shape as the list, so a product page can name the seller and link to the shop.
     // The seller's account id is not part of it.
-    const {user, userId: _sellerAccountId, ...listing} = await detailedListing(specificData)
+    // The seller's own low-stock setting is not for shoppers either.
+    const {user, userId: _sellerAccountId, lowStockThreshold: _lowStockThreshold, ...listing} = await detailedListing(specificData)
     const [delivered, trust] = await Promise.all([confirmedDeliveriesFor([specificData.id]), shopTrustFor([specificData.userId])])
+    const shareUrl = productShareUrl(specificData.id)
+    // Opened from one choice of a product, the message names that choice and its price.
+    const asked = found?.parentId ? { title: found.title, price: found.price, from: false } : { title: listing.title, price: listing.price, from: listing.hasPriceRange }
     res.send({
         ...listing,
         deliveredCount: delivered.get(specificData.id) ?? 0,
         shopTrust: trust.get(specificData.userId) ?? null,
         // A link that shows a picture and title when pasted into WhatsApp, Instagram or Facebook.
-        shareUrl: productShareUrl(specificData.id),
+        shareUrl,
+        whatsappEnquiry: productEnquiry(user.sellerProfile?.whatsappNumber ?? null, user.sellerProfile?.businessName ?? "", asked, shareUrl),
         selectedListingId: found?.parentId ? found.id : null,
         sellerSlug: user.sellerProfile?.slug ?? null,
         sellerName: user.sellerProfile?.businessName ?? null
