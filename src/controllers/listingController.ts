@@ -1,4 +1,5 @@
 import type { Request, Response } from "express"
+import { effectiveThreshold, lowStockThresholdProblem, parseLowStockThreshold, stockStatus } from "../lib/stockAlerts.js"
 import prisma from "../lib/prisma.js"
 import { Prisma } from "../generated/prisma/client.js"
 import { categories, getCanonicalCategory } from "../lib/categories.js"
@@ -297,6 +298,8 @@ export const createListing = async(req: Request, res:Response) =>{
 export const updateListing = async(req:Request, res:Response) =>{
     const id = Number(req.params.id)
     const {title, description, price, category, imageUrl, stockQuantity} = req.body
+    // Allowed on products, products with options (their options use it) and options; null goes back to the default.
+    const lowStockThreshold = parseLowStockThreshold(req.body.lowStockThreshold, true)
 
     if(!Number.isSafeInteger(id)){
         res.status(400).send({message:"Id has to be a number"})
@@ -324,6 +327,11 @@ export const updateListing = async(req:Request, res:Response) =>{
     // A product with options is priced and stocked on its options.
     if ((price !== undefined || stockQuantity !== undefined) && (await countChoices(id)) > 0) {
         res.status(400).send({message:"This product has options. Change price and stock on each option, with PUT /listings/:id/options", code:"LISTING_HAS_OPTIONS"})
+        return
+    }
+
+    if (lowStockThreshold === "invalid") {
+        res.status(400).send({message: lowStockThresholdProblem})
         return
     }
 
@@ -392,6 +400,9 @@ export const updateListing = async(req:Request, res:Response) =>{
     }
     if (stockQuantity !== undefined) {
         data.stockQuantity = stockQuantity
+    }
+    if (lowStockThreshold !== undefined) {
+        data.lowStockThreshold = lowStockThreshold
     }
 
     if (Object.keys(data).length === 0) {
@@ -540,9 +551,50 @@ export const getMyListings = async(req:Request, res:Response) =>{
             include: { images: imagesInclude }
         })
         const choices = await loadChoices(listings.map((listing) => listing.id))
-        res.send(listings.map((listing) => ({ ...withOptionSummary(withImages(listing), choices.get(listing.id)), options: optionTree(choices.get(listing.id)) })))
+        const shop = await prisma.sellerProfile.findUnique({ where: { userId: id }, select: { lowStockThreshold: true } })
+        res.send(listings.map((listing) => ({
+            ...withOptionSummary(withImages(listing), choices.get(listing.id)),
+            options: optionTree(choices.get(listing.id)),
+            ...stockView(listing, choices.get(listing.id), shop?.lowStockThreshold)
+        })))
     }catch(error){
         res.status(500).send({message:"Sorry there is an issue on our end"})
+    }
+}
+
+// For the seller's own list: whether each product is fine, running low or sold out, and which options are.
+// A product with options is "sold_out" when every option is, and "low" when any option is low or sold out.
+function stockView(
+    listing: { stockQuantity: number; lowStockThreshold: number | null },
+    choices: Array<{ id: number; optionLabel: string | null; sizeLabel: string | null; stockQuantity: number; lowStockThreshold: number | null }> | undefined,
+    shopThreshold: number | undefined
+) {
+    const productThreshold = effectiveThreshold(listing.lowStockThreshold, null, shopThreshold)
+
+    if (!choices || choices.length === 0) {
+        return { effectiveLowStockThreshold: productThreshold, stockStatus: stockStatus(listing.stockQuantity, productThreshold), lowStockOptions: [] }
+    }
+
+    const options = choices.map((choice) => {
+        const threshold = effectiveThreshold(choice.lowStockThreshold, listing.lowStockThreshold, shopThreshold)
+        return {
+            listingId: choice.id,
+            optionLabel: choice.optionLabel,
+            sizeLabel: choice.sizeLabel,
+            stockQuantity: choice.stockQuantity,
+            lowStockThreshold: choice.lowStockThreshold,
+            effectiveLowStockThreshold: threshold,
+            stockStatus: stockStatus(choice.stockQuantity, threshold)
+        }
+    })
+    const status = options.every((option) => option.stockStatus === "sold_out")
+        ? "sold_out"
+        : options.some((option) => option.stockStatus !== "in_stock") ? "low" : "in_stock"
+
+    return {
+        effectiveLowStockThreshold: productThreshold,
+        stockStatus: status,
+        lowStockOptions: options.filter((option) => option.stockStatus !== "in_stock")
     }
 }
 

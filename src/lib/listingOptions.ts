@@ -256,6 +256,7 @@ export type ChoiceRow = {
     price: number
     stockQuantity: number
     imageUrl: string
+    lowStockThreshold: number | null
 }
 
 // The choices on sale for each of the given products (only products that have options appear in the map).
@@ -269,7 +270,7 @@ export async function loadChoices(parentIds: number[]): Promise<Map<number, Choi
     const rows = await prisma.listing.findMany({
         where: { parentId: { in: parentIds }, archivedAt: null },
         orderBy: [{ position: "asc" }, { id: "asc" }],
-        select: { id: true, parentId: true, optionLabel: true, sizeLabel: true, price: true, stockQuantity: true, imageUrl: true }
+        select: { id: true, parentId: true, optionLabel: true, sizeLabel: true, price: true, stockQuantity: true, imageUrl: true, lowStockThreshold: true }
     })
 
     for (const row of rows) {

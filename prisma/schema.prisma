@@ -36,6 +36,8 @@ model Listing {
   // Carts, checkouts, stock, orders and refunds therefore work on these exactly as on any listing. The main listing
   // of a product with options is never bought itself.
   parentId      Int?
+  // This product's or option's own low-stock number; null uses its product's, then the shop's (0 turns it off).
+  lowStockThreshold Int?
   optionLabel   String?
   sizeLabel     String?
   position      Int      @default(0)
@@ -110,6 +112,8 @@ model SellerProfile {
   // businessPhone used for payouts).
   bannerUrl       String?
   brandColor      String  @default("forest")
+  // Low-stock alerts: the seller is emailed when an item drops to this many or fewer (0 turns them off).
+  lowStockThreshold Int   @default(3)
   about           String?
   instagramHandle String?
   tiktokHandle    String?

@@ -1,6 +1,7 @@
 import config from "../config.js"
 import prisma from "./prisma.js"
 import { sendEmail, type OutgoingEmail } from "./email/index.js"
+import type { StockAlert } from "./stockAlerts.js"
 
 // Emails about what happens to a person's account, orders, refunds and complaints. Every notification is
 // queued after the change it describes has been saved, and a failure to send is only logged: an email that
@@ -526,6 +527,35 @@ export async function notifyPreOrderUpdate(requestId: number, event: PreOrderEve
 
 async function sellerContact(sellerId: number): Promise<{ email: string } | null> {
     return prisma.user.findUnique({ where: { id: sellerId }, select: { email: true } })
+}
+
+// One email per seller for the items a sale took to their low-stock line or sold out.
+export async function notifyStockAlerts(alerts: StockAlert[]): Promise<void> {
+    const sellerIds = [...new Set(alerts.map((alert) => alert.sellerId))]
+    const emails: OutgoingEmail[] = []
+
+    for (const sellerId of sellerIds) {
+        const seller = await sellerContact(sellerId)
+
+        if (!seller) {
+            continue
+        }
+
+        const mine = alerts.filter((alert) => alert.sellerId === sellerId)
+        const soldOut = mine.filter((alert) => alert.kind === "sold_out")
+        const low = mine.filter((alert) => alert.kind === "low")
+        const subject = mine.length === 1
+            ? (soldOut.length === 1 ? `Sold out: ${mine[0]!.title}` : `Running low: ${mine[0]!.title}`)
+            : `${mine.length} products are running low or sold out`
+
+        emails.push(mail(seller.email, subject, [
+            ...(soldOut.length > 0 ? [`Sold out, so shoppers cannot buy these until you add stock:\n${soldOut.map((alert) => `  ${alert.title}`).join("\n")}`] : []),
+            ...(low.length > 0 ? [`Running low:\n${low.map((alert) => `  ${alert.title}: ${alert.left} left`).join("\n")}`] : []),
+            "Restock soon so you do not miss sales. You can change when these alerts come, or turn them off, in your shop settings or on each product."
+        ], { label: "Update your stock", path: "/seller/myListing" }))
+    }
+
+    await sendAll(emails)
 }
 
 export async function notifySellerWarned(sellerId: number, strikes: number): Promise<void> {

@@ -27,6 +27,7 @@ import { isHttpsUrl, priceProblem } from "../src/lib/inputRules.js"
 import { startPaymentChecker } from "../src/lib/payments/paymentChecker.js"
 import { waitForNotifications } from "../src/lib/notifications.js"
 import { recalculateRating } from "../src/lib/reviews.js"
+import { findStockAlerts } from "../src/lib/stockAlerts.js"
 import { expirePreOrders } from "../src/lib/preOrders.js"
 import { remindAndCloseDeliveries } from "../src/lib/deliveryClosing.js"
 import { reviewSellerStanding } from "../src/lib/sellerStanding.js"
@@ -10546,5 +10547,84 @@ test("buyers can add up to three photos to a review, and shoppers can see and fi
         } finally {
             await removeUsers(others)
         }
+    })
+})
+
+// ---- Low-stock alerts ----
+
+test("a sale that takes stock to the seller's alert line emails them once, and the seller's list shows what is low", async () => {
+    await withPaymentCheckout("low-stock", async (context) => {
+        const { fixture, request } = context
+        const seller = await prisma.user.findUniqueOrThrow({ where: { id: fixture.sellerId } })
+        const listing = await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })
+        const mine = async () => (await request("GET", "/listings/Mylisting", undefined, fixture.sellerToken)).body as Array<{ id: number; stockStatus: string; effectiveLowStockThreshold: number; lowStockThreshold: number | null; lowStockOptions: Array<{ listingId: number; stockStatus: string; effectiveLowStockThreshold: number }> }>
+        const mineListing = async (id: number) => (await mine()).find((item) => item.id === id)!
+
+        // The shop's number is 3 unless changed; 5 in stock is fine.
+        assert.equal((await request("GET", "/seller/profile", undefined, fixture.sellerToken)).body.lowStockThreshold, 3)
+        assert.deepEqual([(await mineListing(listing.id)).stockStatus, (await mineListing(listing.id)).effectiveLowStockThreshold], ["in_stock", 3])
+
+        // The buyer pays for 2 of the 5: 3 left reaches the line, and the seller gets one email.
+        const before = emailsTo(seller.email).length
+        await payForCheckout(context)
+        await waitForNotifications()
+        const alerts = emailsTo(seller.email).slice(before).filter((email) => /Running low|Sold out/.test(email.subject))
+        assert.equal(alerts.length, 1)
+        assert.equal(alerts[0]!.subject, `Running low: ${listing.title}`)
+        assert.match(alerts[0]!.text, new RegExp(`${listing.title}: 3 left`))
+        assert.match(alerts[0]!.text, /\/seller\/myListing/)
+        assert.equal((await mineListing(listing.id)).stockStatus, "low")
+
+        // The alert comes from the sale that crosses the line: once per drop, again after a restock.
+        const sell = async (id: number, stockAfter: number, quantity: number) => {
+            await prisma.listing.update({ where: { id }, data: { stockQuantity: stockAfter } })
+            return prisma.$transaction((tx) => findStockAlerts(tx, new Map([[id, quantity]])))
+        }
+        assert.deepEqual(await sell(listing.id, 2, 1), [])
+        assert.deepEqual((await sell(listing.id, 0, 2)).map((alert) => [alert.kind, alert.left]), [["sold_out", 0]])
+        assert.equal((await mineListing(listing.id)).stockStatus, "sold_out")
+        assert.deepEqual((await sell(listing.id, 3, 7)).map((alert) => [alert.kind, alert.left]), [["low", 3]])
+        // Selling out in one go only sends the sold-out alert.
+        assert.deepEqual((await sell(listing.id, 0, 10)).map((alert) => alert.kind), ["sold_out"])
+
+        // The shop's number can be changed (0 turns alerts off); bad values are refused.
+        const patchShop = (body: unknown) => request("PATCH" as "GET", "/seller/profile", body, fixture.sellerToken)
+        for (const bad of [-1, 1.5, "3", null, 1001]) {
+            const refused = await patchShop({ lowStockThreshold: bad })
+            assert.equal(refused.status, 400, String(bad))
+            assert.equal(refused.body.message, "Low-stock alert must be a whole number from 0 to 1000")
+        }
+        assert.equal((await patchShop({ lowStockThreshold: 0 })).body.lowStockThreshold, 0)
+        assert.deepEqual(await sell(listing.id, 1, 9), [])
+
+        // A product's own number wins over the shop's; null goes back to the shop's.
+        const patchListing = (id: number, body: unknown) => request("PATCH" as "GET", `/listings/${id}`, body, fixture.sellerToken)
+        assert.equal((await patchListing(listing.id, { lowStockThreshold: 2000 })).status, 400)
+        assert.equal((await patchListing(listing.id, { lowStockThreshold: 10 })).status, 200)
+        assert.deepEqual((await sell(listing.id, 8, 4)).map((alert) => [alert.kind, alert.left]), [["low", 8]])
+        assert.deepEqual([(await mineListing(listing.id)).lowStockThreshold, (await mineListing(listing.id)).effectiveLowStockThreshold], [10, 10])
+        assert.equal((await patchListing(listing.id, { lowStockThreshold: null })).status, 200)
+        assert.equal((await mineListing(listing.id)).effectiveLowStockThreshold, 0)
+
+        // Options: each is tracked on its own. An option uses its own number, else its product's, else the shop's.
+        await patchShop({ lowStockThreshold: 3 })
+        const product = (await request("POST", "/listings", {
+            title: "Stock hoodie", description: "Soft", price: 1500, category: "Electronics",
+            imageUrls: ["https://img.example.test/stock-hoodie.jpg"],
+            options: [{ label: "Blue", price: 1500, stockQuantity: 2 }, { label: "Red", price: 1500, stockQuantity: 9 }]
+        }, fixture.sellerToken)).body
+        const [blue, red] = product.options.map((option: { listingId: number }) => option.listingId) as [number, number]
+        const hoodie = await mineListing(product.id)
+        assert.equal(hoodie.stockStatus, "low")
+        assert.deepEqual(hoodie.lowStockOptions.map((option) => [option.listingId, option.stockStatus]), [[blue, "low"]])
+        // The product's number applies to its options; an option's own number wins.
+        assert.equal((await patchListing(product.id, { lowStockThreshold: 10 })).status, 200)
+        assert.deepEqual((await mineListing(product.id)).lowStockOptions.map((option) => [option.listingId, option.effectiveLowStockThreshold]), [[blue, 10], [red, 10]])
+        assert.equal((await patchListing(red, { lowStockThreshold: 4 })).status, 200)
+        assert.deepEqual((await mineListing(product.id)).lowStockOptions.map((option) => option.listingId), [blue])
+        assert.deepEqual((await sell(red, 4, 5)).map((alert) => [alert.listingId, alert.kind]), [[red, "low"]])
+        assert.equal((await sell(blue, 0, 2))[0]!.title, "Stock hoodie — Blue")
+        const soldOutBlue = await mineListing(product.id)
+        assert.deepEqual([soldOutBlue.stockStatus, soldOutBlue.lowStockOptions.map((option) => option.stockStatus)], ["low", ["sold_out", "low"]])
     })
 })

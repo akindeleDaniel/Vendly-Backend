@@ -1,4 +1,5 @@
 import prisma from "../lib/prisma.js"
+import { lowStockThresholdProblem, parseLowStockThreshold } from "../lib/stockAlerts.js"
 import type { Request, Response } from "express"
 import { Prisma } from "../generated/prisma/client.js"
 import { makeSlug } from "../lib/generateSlug.js"
@@ -189,6 +190,7 @@ export const getMySellerProfile = async (req: Request, res: Response) => {
 
 export const updateSeller = async(req: Request, res: Response) => {
     const {businessName, state, lga, logoUrl, shippingPolicy, shippingCost, foodOrderType} = req.body
+    const lowStockThreshold = parseLowStockThreshold(req.body.lowStockThreshold, false)
 
     if(
         businessName === undefined &&
@@ -198,6 +200,7 @@ export const updateSeller = async(req: Request, res: Response) => {
         shippingPolicy === undefined &&
         shippingCost === undefined &&
         foodOrderType === undefined &&
+        lowStockThreshold === undefined &&
         !hasBrandingFields(req.body)
     ){
         res.status(400).send({message:"Provide at least one field to update"})
@@ -238,6 +241,11 @@ export const updateSeller = async(req: Request, res: Response) => {
 
     if ("error" in branding) {
         res.status(400).send({ message: branding.error })
+        return
+    }
+
+    if (lowStockThreshold === "invalid") {
+        res.status(400).send({ message: lowStockThresholdProblem })
         return
     }
 
@@ -337,6 +345,7 @@ export const updateSeller = async(req: Request, res: Response) => {
                 ...(shippingPolicy !== undefined ? { shippingPolicy: nextShippingPolicy } : {}),
                 ...(shippingCostData !== undefined ? { shippingCost: shippingCostData } : {}),
                 ...(foodOrderType !== undefined ? { foodOrderType } : {}),
+                ...(lowStockThreshold !== undefined && lowStockThreshold !== null ? { lowStockThreshold } : {}),
                 ...branding,
                 ...coordinateData
             }

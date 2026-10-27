@@ -1,7 +1,8 @@
 import { Prisma } from "../../generated/prisma/client.js"
 import { acquireCheckoutCreationLock } from "../../controllers/checkoutController.js"
 import prisma from "../prisma.js"
-import { notifyPaymentSettled, queueNotification } from "../notifications.js"
+import { notifyPaymentSettled, notifyStockAlerts, queueNotification } from "../notifications.js"
+import { findStockAlerts, type StockAlert } from "../stockAlerts.js"
 import { allocateProportionally, applyRecoveredAmount } from "../liabilities.js"
 import type { SellerShare } from "./types.js"
 
@@ -21,11 +22,15 @@ class SettlementNeedsReview extends Error {}
 export async function settleCheckoutPayment(attemptId: number): Promise<SettlementResult> {
     for (let attempt = 1; ; attempt++) {
         try {
-            const result = await settleOnce(attemptId)
+            const { result, stockAlerts } = await settleOnce(attemptId)
 
             // Only the call that actually settled the checkout sends the receipt and the new-order alerts.
             if (result === "settled") {
                 queueNotification("payment settled", () => notifyPaymentSettled(attemptId))
+
+                if (stockAlerts.length > 0) {
+                    queueNotification("stock alerts", () => notifyStockAlerts(stockAlerts))
+                }
             }
 
             return result
@@ -56,7 +61,7 @@ async function openRecoveryCase(attemptId: number, reason: string): Promise<void
     }
 }
 
-async function settleOnce(attemptId: number): Promise<SettlementResult> {
+async function settleOnce(attemptId: number): Promise<{ result: SettlementResult; stockAlerts: StockAlert[] }> {
     return prisma.$transaction(async (tx) => {
         const paymentAttempt = await tx.paymentAttempt.findUniqueOrThrow({
             where: { id: attemptId },
@@ -105,7 +110,7 @@ async function settleOnce(attemptId: number): Promise<SettlementResult> {
                 console.error("Checkout has more than one successful payment", { checkoutId: checkout.id, attemptId })
             }
 
-            return "already_settled"
+            return { result: "already_settled" as const, stockAlerts: [] }
         }
 
         const heldReservations = checkout.inventoryReservations.filter(
@@ -129,7 +134,7 @@ async function settleOnce(attemptId: number): Promise<SettlementResult> {
         })
 
         if (completed.count !== 1) {
-            return "already_settled"
+            return { result: "already_settled" as const, stockAlerts: [] }
         }
 
         for (const reservation of heldReservations) {
@@ -142,6 +147,15 @@ async function settleOnce(attemptId: number): Promise<SettlementResult> {
                 throw new SettlementNeedsReview(`Listing ${reservation.listingId} has less stock than was reserved`)
             }
         }
+
+        // Items this sale took to the seller's low-stock line or sold out.
+        const sold = new Map<number, number>()
+
+        for (const reservation of heldReservations) {
+            sold.set(reservation.listingId, (sold.get(reservation.listingId) ?? 0) + reservation.quantity)
+        }
+
+        const stockAlerts = await findStockAlerts(tx, sold)
 
         await tx.inventoryReservation.updateMany({
             where: { checkoutId: checkout.id, status: { in: ["ACTIVE", "PROTECTED"] } },
@@ -222,7 +236,7 @@ async function settleOnce(attemptId: number): Promise<SettlementResult> {
             }
         }
 
-        return "settled"
+        return { result: "settled" as const, stockAlerts }
     }, {
         isolationLevel: Prisma.TransactionIsolationLevel.Serializable
     })
