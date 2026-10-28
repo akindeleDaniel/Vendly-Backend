@@ -844,3 +844,33 @@ model SellerShippingRate {
 
   @@unique([sellerProfileId, state])
 }
+
+enum ViewKind {
+  PRODUCT
+  SHOP
+}
+
+// Views of a product or shop page per Nigerian day, for the seller's figures. No visitor details are kept here.
+model ViewDay {
+  id        Int      @id @default(autoincrement())
+  kind      ViewKind
+  // The product (a product with options counts as one) or the shop's profile id.
+  subjectId Int
+  sellerId  Int
+  day       DateTime @db.Date
+  views     Int      @default(0)
+
+  @@unique([kind, subjectId, day])
+  @@index([sellerId, day])
+}
+
+// "Already counted today": a one-way code for a visitor and day, so a page opened twice counts once. Kept two days.
+model ViewSeen {
+  visitor   String
+  kind      ViewKind
+  subjectId Int
+  createdAt DateTime @default(now())
+
+  @@id([visitor, kind, subjectId])
+  @@index([createdAt])
+}

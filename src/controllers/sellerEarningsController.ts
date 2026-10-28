@@ -159,6 +159,26 @@ export function readLagosPeriod(query: { from?: unknown; to?: unknown }): LagosP
     return { from, to, days, start: lagosDayStart(from), end: lagosDayStart(addDays(to, 1)) }
 }
 
+// A Nigerian calendar day as the date stored for view counts.
+const dateOnly = (day: string) => new Date(`${day}T00:00:00.000Z`)
+
+// Shop and product views over Nigerian days fromDay to toDay.
+async function viewTotals(sellerId: number, fromDay: string, toDay: string) {
+    const groups = await prisma.viewDay.groupBy({
+        by: ["kind"],
+        where: { sellerId, day: { gte: dateOnly(fromDay), lte: dateOnly(toDay) } },
+        _sum: { views: true }
+    })
+    const shop = groups.find((group) => group.kind === "SHOP")?._sum.views ?? 0
+    const products = groups.find((group) => group.kind === "PRODUCT")?._sum.views ?? 0
+    return { shop, products, total: shop + products }
+}
+
+// Orders that included it, out of every 100 product views. Null without views.
+function conversion(orders: number, views: number): number | null {
+    return views === 0 ? null : Math.round((orders / views) * 1000) / 10
+}
+
 async function periodTotals(sellerId: number, start: Date, end: Date) {
     const where: Prisma.OrderWhereInput = { sellerId, status: { in: paidStatuses }, createdAt: { gte: start, lt: end } }
     const [orders, items, customers] = await Promise.all([
@@ -203,9 +223,14 @@ export const getMySalesSummary = async (req: Request, res: Response) => {
     const previousStart = lagosDayStart(addDays(from, -days))
     const now = new Date()
 
-    const [current, previous, top, daily, toShip, awaitingConfirmation, complaintsToAnswer, openComplaints, preOrdersToAnswer] = await Promise.all([
+    const viewsWhere = { sellerId, day: { gte: dateOnly(from), lte: dateOnly(to) } }
+    const [current, previous, currentViews, previousViews, viewsPerDay, viewsPerProduct, top, daily, toShip, awaitingConfirmation, complaintsToAnswer, openComplaints, preOrdersToAnswer] = await Promise.all([
         periodTotals(sellerId, start, end),
         periodTotals(sellerId, previousStart, start),
+        viewTotals(sellerId, from, to),
+        viewTotals(sellerId, addDays(from, -days), addDays(from, -1)),
+        prisma.viewDay.groupBy({ by: ["day"], where: viewsWhere, _sum: { views: true } }),
+        prisma.viewDay.groupBy({ by: ["subjectId"], where: { ...viewsWhere, kind: "PRODUCT" }, _sum: { views: true } }),
         // An option's sales count towards its product.
         prisma.$queryRaw<Array<{ productId: number; quantity: bigint; sales: Prisma.Decimal }>>`
             SELECT coalesce(l."parentId", l.id) AS "productId", sum(oi.quantity) AS quantity, sum(oi."unitPrice" * oi.quantity) AS sales
@@ -232,8 +257,23 @@ export const getMySalesSummary = async (req: Request, res: Response) => {
         prisma.dispute.count({ where: { order: { sellerId }, status: { in: ["OPEN", "SELLER_AGREED", "UNDER_REVIEW"] } } }),
         prisma.preOrderRequest.count({ where: { sellerId, status: "REQUESTED", respondBy: { gt: now } } })
     ])
+    const productViews = new Map(viewsPerProduct.map((group) => [group.subjectId, group._sum.views ?? 0]))
+    const dayViews = new Map(viewsPerDay.map((group) => [group.day.toISOString().slice(0, 10), group._sum.views ?? 0]))
+    // The products people looked at most, with how many orders included them (an option's orders count for its product).
+    const mostViewedIds = [...productViews.entries()].sort((left, right) => right[1] - left[1] || left[0] - right[0]).slice(0, topProductsShown).map(([id]) => id)
+    const viewedOrders = mostViewedIds.length === 0 ? [] : await prisma.$queryRaw<Array<{ productId: number; orders: bigint }>>`
+        SELECT coalesce(l."parentId", l.id) AS "productId", count(DISTINCT o.id) AS orders
+        FROM "OrderItem" oi
+        JOIN "Order" o ON o.id = oi."orderId"
+        JOIN "Listing" l ON l.id = oi."listingId"
+        WHERE o."sellerId" = ${sellerId}
+          AND o.status::text IN ('PAID', 'SHIPPED', 'DELIVERED', 'REFUNDED')
+          AND o."createdAt" >= ${start} AND o."createdAt" < ${end}
+          AND coalesce(l."parentId", l.id) IN (${Prisma.join(mostViewedIds)})
+        GROUP BY 1`
+    const ordersOf = new Map(viewedOrders.map((row) => [row.productId, Number(row.orders)]))
     const products = await prisma.listing.findMany({
-        where: { id: { in: top.map((row) => row.productId) } },
+        where: { id: { in: [...new Set([...top.map((row) => row.productId), ...mostViewedIds])] } },
         select: { id: true, title: true, imageUrl: true, archivedAt: true }
     })
     const byDay = new Map(daily.map((row) => [row.day, row]))
@@ -241,9 +281,9 @@ export const getMySalesSummary = async (req: Request, res: Response) => {
     res.send({
         from,
         to,
-        totals: current,
+        totals: { ...current, views: currentViews },
         // The same figures for the period of the same length just before this one.
-        previous: { from: addDays(from, -days), to: addDays(from, -1), ...previous },
+        previous: { from: addDays(from, -days), to: addDays(from, -1), ...previous, views: previousViews },
         topProducts: top.map((row) => {
             const product = products.find((candidate) => candidate.id === row.productId)
             return {
@@ -252,14 +292,29 @@ export const getMySalesSummary = async (req: Request, res: Response) => {
                 imageUrl: product?.imageUrl || null,
                 onSale: product ? product.archivedAt === null : false,
                 quantity: Number(row.quantity),
-                sales: money(row.sales)
+                sales: money(row.sales),
+                views: productViews.get(row.productId) ?? 0
+            }
+        }),
+        mostViewed: mostViewedIds.map((id) => {
+            const product = products.find((candidate) => candidate.id === id)
+            const views = productViews.get(id) ?? 0
+            const orders = ordersOf.get(id) ?? 0
+            return {
+                listingId: id,
+                title: product?.title ?? "Product",
+                imageUrl: product?.imageUrl || null,
+                onSale: product ? product.archivedAt === null : false,
+                views,
+                orders,
+                conversionRate: conversion(orders, views)
             }
         }),
         // Every day of the period, including days without sales.
         days: Array.from({ length: days }, (_, index) => {
             const day = addDays(from, index)
             const row = byDay.get(day)
-            return { date: day, orders: Number(row?.orders ?? 0), sales: money(row?.sales ?? 0) }
+            return { date: day, orders: Number(row?.orders ?? 0), sales: money(row?.sales ?? 0), views: dayViews.get(day) ?? 0 }
         }),
         // Right now, whatever the period.
         needsAttention: { ordersToShip: toShip, awaitingBuyerConfirmation: awaitingConfirmation, complaintsToAnswer, openComplaints, preOrdersToAnswer }

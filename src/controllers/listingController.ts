@@ -1,4 +1,5 @@
 import type { Request, Response } from "express"
+import { recordView } from "../lib/viewCounts.js"
 import { productStructuredData } from "../lib/structuredData.js"
 import { draftProblems } from "./listingDraftController.js"
 import { productEnquiry } from "../lib/shopBranding.js"
@@ -191,6 +192,9 @@ export const getListingById  = async (req:Request, res:Response) =>{
         res.status(404).send({message:"Listing not found"})
         return
     }
+
+    // One view of the product (opening one of its options counts for the product).
+    await recordView(req, "PRODUCT", specificData.id, specificData.userId)
 
     // The same shape as the list, so a product page can name the seller and link to the shop.
     // The seller's account id is not part of it.

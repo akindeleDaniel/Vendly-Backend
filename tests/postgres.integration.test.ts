@@ -29,6 +29,7 @@ import { waitForNotifications } from "../src/lib/notifications.js"
 import { recalculateRating } from "../src/lib/reviews.js"
 import { findStockAlerts } from "../src/lib/stockAlerts.js"
 import { sendCartReminders } from "../src/lib/cartReminders.js"
+import { purgeOldViewVisitors } from "../src/lib/viewCounts.js"
 import { cleanUpUnusedPhotos, cloudinaryPublicId, purgeAbandonedCheckouts, purgeOldPaymentEvents, setCloudinaryAdminForTesting, type CloudinaryPhoto } from "../src/lib/housekeeping.js"
 import { expirePreOrders } from "../src/lib/preOrders.js"
 import { remindAndCloseDeliveries } from "../src/lib/deliveryClosing.js"
@@ -10829,7 +10830,7 @@ test("the sales summary shows a period's sales, the period before, top products,
         // Nothing sold yet: the last 30 days, all zero.
         const empty = await summary()
         assert.deepEqual([empty.from, empty.to, empty.days.length], [lagosDay(-29), today, 30])
-        assert.deepEqual(empty.totals, { orders: 0, sales: "0.00", refunded: "0.00", netSales: "0.00", itemsSold: 0, customers: 0, averageOrder: null })
+        assert.deepEqual(empty.totals, { orders: 0, sales: "0.00", refunded: "0.00", netSales: "0.00", itemsSold: 0, customers: 0, averageOrder: null, views: { shop: 0, products: 0, total: 0 } })
         assert.deepEqual(empty.topProducts, [])
 
         // One paid order of 2 × ₦1,500, bought as an option of a product: it counts towards the product.
@@ -10844,10 +10845,10 @@ test("the sales summary shows a period's sales, the period before, top products,
         await prisma.order.update({ where: { id: orderId }, data: { createdAt: new Date(`${lagosDay(-1)}T23:30:00.000Z`) } })
 
         const sold = await summary()
-        assert.deepEqual(sold.totals, { orders: 1, sales: "3000.00", refunded: "0.00", netSales: "3000.00", itemsSold: 2, customers: 1, averageOrder: "3000.00" })
-        assert.deepEqual(sold.topProducts, [{ listingId: product.id, title: "Summary hoodie", imageUrl: "https://img.example.test/summary-hoodie.jpg", onSale: true, quantity: 2, sales: "3000.00" }])
-        assert.deepEqual(sold.days.at(-1), { date: today, orders: 1, sales: "3000.00" })
-        assert.deepEqual(sold.days.at(-2), { date: lagosDay(-1), orders: 0, sales: "0.00" })
+        assert.deepEqual(sold.totals, { orders: 1, sales: "3000.00", refunded: "0.00", netSales: "3000.00", itemsSold: 2, customers: 1, averageOrder: "3000.00", views: { shop: 0, products: 0, total: 0 } })
+        assert.deepEqual(sold.topProducts, [{ listingId: product.id, title: "Summary hoodie", imageUrl: "https://img.example.test/summary-hoodie.jpg", onSale: true, quantity: 2, sales: "3000.00", views: 0 }])
+        assert.deepEqual(sold.days.at(-1), { date: today, orders: 1, sales: "3000.00", views: 0 })
+        assert.deepEqual(sold.days.at(-2), { date: lagosDay(-1), orders: 0, sales: "0.00", views: 0 })
         assert.deepEqual(sold.needsAttention, { ordersToShip: 1, awaitingBuyerConfirmation: 0, complaintsToAnswer: 0, openComplaints: 0, preOrdersToAnswer: 0 })
         assert.equal(sold.previous.orders, 0)
 
@@ -11513,5 +11514,60 @@ test("housekeeping deletes Cloudinary photos nobody uses, once a day, and never 
 
         // Off unless switched on in .env: with no admin keys it does nothing.
         assert.equal(await cleanUpUnusedPhotos(), null)
+    })
+})
+
+// ---- View counts for sellers ----
+
+test("product and shop views are counted once per visitor per day, robots are left out, and sellers see views and conversion", async () => {
+    await withPaymentCheckout("view-counts", async (context) => {
+        const { fixture, request, baseUrl } = context
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+        const visit = (path: string, userAgent: string) => fetch(`${baseUrl}${path}`, { headers: { "user-agent": userAgent } })
+        const phone = "Mozilla/5.0 (Linux; Android 14) Chrome/130 Mobile"
+        const laptop = "Mozilla/5.0 (Windows NT 10.0) Firefox/131"
+        const today = new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 10)
+
+        // The same visitor twice in a day counts once; another visitor counts; robots do not.
+        await visit(`/listings/${fixture.listingId}`, phone)
+        await visit(`/listings/${fixture.listingId}`, phone)
+        await visit(`/listings/${fixture.listingId}`, laptop)
+        for (const robot of ["WhatsApp/2.24 A", "facebookexternalhit/1.1", "Googlebot/2.1", ""]) {
+            await visit(`/listings/${fixture.listingId}`, robot)
+        }
+        // Opening one option of a product counts for the product; a shop page counts for the shop.
+        const product = (await request("POST", "/listings", {
+            title: "Viewed hoodie", description: "Soft", price: 5000, category: "Electronics",
+            imageUrls: ["https://img.example.test/viewed.jpg"], options: [{ label: "Blue", price: 5000, stockQuantity: 2 }]
+        }, fixture.sellerToken)).body
+        await visit(`/listings/${product.options[0].listingId}`, phone)
+        await visit(`/seller/shop/${profile.slug}`, phone)
+        await visit("/seller/shop/no-such-shop", phone)
+
+        const rows = await prisma.viewDay.findMany({ where: { sellerId: fixture.sellerId }, orderBy: [{ kind: "asc" }, { subjectId: "asc" }] })
+        assert.deepEqual(rows.map((row) => [row.kind, row.subjectId, row.views, row.day.toISOString().slice(0, 10)]), [
+            ["PRODUCT", fixture.listingId, 2, today],
+            ["PRODUCT", product.id, 1, today],
+            ["SHOP", profile.id, 1, today]
+        ])
+        // Nothing about the visitor is kept with the counts; the "counted today" codes are one-way.
+        const seen = await prisma.viewSeen.findMany({ where: { subjectId: { in: [fixture.listingId, product.id, profile.id] } } })
+        assert.ok(seen.every((row) => /^[0-9a-f]{64}$/.test(row.visitor)))
+
+        // The seller's summary: views for the period and each day, views on top products, most viewed with conversion.
+        await payForCheckout(context)
+        const summary = (await request("GET", "/seller/summary", undefined, fixture.sellerToken)).body
+        assert.deepEqual(summary.totals.views, { shop: 1, products: 3, total: 4 })
+        assert.deepEqual(summary.previous.views, { shop: 0, products: 0, total: 0 })
+        assert.equal(summary.days.at(-1).views, 4)
+        assert.equal(summary.topProducts[0].views, 2)
+        assert.deepEqual(summary.mostViewed.map((item: { listingId: number; views: number; orders: number; conversionRate: number | null }) => [item.listingId, item.views, item.orders, item.conversionRate]),
+            [[fixture.listingId, 2, 1, 50], [product.id, 1, 0, 0]])
+
+        // The "counted today" codes are removed after two days.
+        await prisma.viewSeen.updateMany({ where: { subjectId: { in: [fixture.listingId, product.id, profile.id] } }, data: { createdAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000) } })
+        await purgeOldViewVisitors()
+        assert.equal(await prisma.viewSeen.count({ where: { subjectId: { in: [fixture.listingId, product.id, profile.id] } } }), 0)
+        await prisma.viewDay.deleteMany({ where: { sellerId: fixture.sellerId } })
     })
 })

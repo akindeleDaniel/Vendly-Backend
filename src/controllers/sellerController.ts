@@ -1,4 +1,5 @@
 import prisma from "../lib/prisma.js"
+import { recordView } from "../lib/viewCounts.js"
 import { lowStockThresholdProblem, parseLowStockThreshold } from "../lib/stockAlerts.js"
 import type { Request, Response } from "express"
 import { Prisma } from "../generated/prisma/client.js"
@@ -399,6 +400,8 @@ export const getPublicShop = async (req: Request, res: Response) => {
             res.status(404).send({message:"Store not found"})
             return
         }
+
+        await recordView(req, "SHOP", profile.id, profile.userId)
 
         const {
             blockedAt: _blockedAt, shippingRates, bannerUrl: _bannerUrl, brandColor: _brandColor, about: _about,

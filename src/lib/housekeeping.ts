@@ -1,4 +1,5 @@
 import prisma from "./prisma.js"
+import { purgeOldViewVisitors } from "./viewCounts.js"
 
 // Housekeeping that nobody asks for: leftovers no one needs any more are removed so the database stays small and
 // the free Cloudinary plan lasts. Runs with the other background checks. Nothing here touches anything that money
@@ -194,5 +195,6 @@ export async function cleanUpUnusedPhotos(now = new Date()): Promise<number | nu
 export async function runHousekeeping(now = new Date()): Promise<void> {
     await purgeAbandonedCheckouts(now)
     await purgeOldPaymentEvents(now)
+    await purgeOldViewVisitors(now)
     await cleanUpUnusedPhotos(now)
 }
