@@ -3,6 +3,7 @@ import { becomeSeller, checkAuth, createUser, updateEmailPreferences, loginUser,
 import { changePassword, forgotPassword, resendCode, resetPassword, sendSetPasswordCode, setPassword, verifyEmail, verifyLogin } from "../controllers/accountController.js";
 import { googleLink, googleSignIn } from "../controllers/googleController.js";
 import { authMiddleware } from "../middleware/authMiddleware.js";
+import { deleteMyAccount, downloadMyData, getDeletionCheck } from "../controllers/accountDataController.js";
 import {
     codeRequestByEmailLimiter,
     codeRequestByIpLimiter,
@@ -37,5 +38,8 @@ router.post("/refresh", refreshLimiter, refresh)
 router.get("/check", authMiddleware, checkAuth)
 router.post("/become-seller", authMiddleware, becomeSeller)
 router.patch("/preferences", authMiddleware, updateEmailPreferences)
+router.get("/me/data", authMiddleware, passwordChangeLimiter, downloadMyData)
+router.get("/me/deletion-check", authMiddleware, getDeletionCheck)
+router.post("/me/delete", authMiddleware, passwordChangeLimiter, deleteMyAccount)
 
 export default router

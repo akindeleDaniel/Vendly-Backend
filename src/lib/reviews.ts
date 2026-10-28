@@ -1,5 +1,6 @@
 import { Prisma } from "../generated/prisma/client.js"
 import prisma from "./prisma.js"
+import { deletedUserName } from "./accountDeletion.js"
 
 // Star reviews of products and shops. Only a buyer whose order was delivered can review it, once per product and
 // once per shop, so reviews cannot be written by sellers or strangers. There is no seller reply. A buyer can
@@ -92,6 +93,10 @@ export function averageRating(sum: number, count: number): number | null {
 
 // How the person who wrote a review is shown: first name and the first letter of the last name.
 export function reviewerLabel(name: string): string {
+    if (name === deletedUserName) {
+        return "A former buyer"
+    }
+
     const parts = name.trim().split(/\s+/).filter(Boolean)
     const first = parts[0] ?? "A buyer"
     const last = parts.length > 1 ? parts[parts.length - 1] : undefined

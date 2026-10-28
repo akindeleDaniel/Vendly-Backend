@@ -56,6 +56,11 @@ const openYourShop = () => `Sell online too? Open your own StoreHatch shop for f
 // One email failing must not stop the others in the same event.
 async function sendAll(emails: OutgoingEmail[]): Promise<void> {
     for (const email of emails) {
+        // A deleted account's address is a placeholder that goes nowhere.
+        if (email.to.endsWith("@deleted.invalid")) {
+            continue
+        }
+
         try {
             await sendEmail(email)
         } catch (error) {

@@ -73,6 +73,8 @@ model User {
   isSuperAdmin  Boolean        @default(false)
   // Set when the person asked not to get "you left something in your cart" emails.
   cartRemindersOff Boolean     @default(false)
+  // Set when the person deleted their account: their details were removed; orders and payments were kept.
+  deletedAt     DateTime?
   listings      Listing[]
   role          Role
   sellerProfile SellerProfile?

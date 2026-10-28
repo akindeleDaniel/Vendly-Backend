@@ -158,7 +158,7 @@ export async function endAllSessions(userId: number, now = new Date()) {
 // id (issued before sessions existed) is only checked against "log out everywhere".
 export async function isAccessTokenLive(userId: number, loginId: unknown, issuedAtSeconds: unknown, now = new Date()): Promise<boolean> {
     const [user, liveLogin] = await Promise.all([
-        prisma.user.findUnique({ where: { id: userId }, select: { sessionsValidFrom: true } }),
+        prisma.user.findUnique({ where: { id: userId }, select: { sessionsValidFrom: true, deletedAt: true } }),
         typeof loginId === "string"
             ? prisma.refreshToken.findFirst({
                 where: { familyId: loginId, userId, revokedAt: null, expiresAt: { gt: now } },
@@ -167,7 +167,8 @@ export async function isAccessTokenLive(userId: number, loginId: unknown, issued
             : Promise.resolve(true)
     ])
 
-    if (!user || !liveLogin) {
+    // A deleted account has no logins at all, whatever the token says.
+    if (!user || !liveLogin || user.deletedAt) {
         return false
     }
 
