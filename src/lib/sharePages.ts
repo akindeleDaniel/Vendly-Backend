@@ -1,3 +1,5 @@
+import { jsonLdScript } from "./structuredData.js"
+
 // Small HTML pages that WhatsApp, Facebook, X, Telegram and Google can read. The app itself is a single-page app,
 // so a pasted shop or product link shows no picture or title. A share link points here instead: link-preview robots
 // read the title, description and picture from this page, and people are sent straight on to the app.
@@ -37,6 +39,8 @@ export type SharePage = {
     // Where people are sent: the shop or product page in the app.
     targetUrl: string
     type: "website" | "product"
+    // Product details for Google (schema.org JSON-LD), when the page is a product.
+    structuredData?: unknown
 }
 
 export function renderSharePage(page: SharePage): string {
@@ -62,7 +66,7 @@ ${image ? `<meta property="og:image" content="${image}">\n<meta property="og:ima
 <meta name="twitter:description" content="${description}">
 ${image ? `<meta name="twitter:image" content="${image}">\n` : ""}<link rel="canonical" href="${target}">
 <meta http-equiv="refresh" content="0; url=${target}">
-</head>
+${page.structuredData ? `${jsonLdScript(page.structuredData)}\n` : ""}</head>
 <body style="font-family:system-ui,sans-serif;padding:24px">
 <p><a href="${target}">Continue to ${title}</a></p>
 </body>

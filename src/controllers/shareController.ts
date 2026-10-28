@@ -3,6 +3,8 @@ import prisma from "../lib/prisma.js"
 import config from "../config.js"
 import { loadChoices, withOptionSummary } from "../lib/listingOptions.js"
 import { renderSharePage, shorten, escapeHtml } from "../lib/sharePages.js"
+import { productStructuredData } from "../lib/structuredData.js"
+import { averageRating } from "../lib/reviews.js"
 
 const naira = (amount: number) => `₦${amount.toLocaleString("en-NG", { maximumFractionDigits: 2 })}`
 
@@ -68,6 +70,7 @@ export const shareProduct = async (req: Request, res: Response) => {
 
     const select = {
         id: true, title: true, description: true, price: true, stockQuantity: true, imageUrl: true, archivedAt: true, parentId: true,
+        ratingSum: true, ratingCount: true, images: { orderBy: { position: "asc" as const }, select: { url: true } },
         user: { select: { sellerProfile: { select: { businessName: true, blockedAt: true } } } }
     } as const
     const found = await prisma.listing.findUnique({ where: { id }, select })
@@ -80,7 +83,8 @@ export const shareProduct = async (req: Request, res: Response) => {
         return
     }
 
-    const summary = withOptionSummary(listing, (await loadChoices([listing.id])).get(listing.id))
+    const choices = (await loadChoices([listing.id])).get(listing.id)
+    const summary = withOptionSummary(listing, choices)
     const price = summary.hasPriceRange ? `from ${naira(summary.price)}` : naira(summary.price)
 
     sendPage(res, 200, renderSharePage({
@@ -89,7 +93,20 @@ export const shareProduct = async (req: Request, res: Response) => {
         imageUrl: listing.imageUrl,
         shareUrl: productShareUrl(listing.id),
         targetUrl: `${config.frontendUrl}/product/${listing.id}`,
-        type: "product"
+        type: "product",
+        structuredData: productStructuredData({
+            id: listing.id,
+            title: listing.title,
+            description: listing.description,
+            images: listing.images.length > 0 ? listing.images.map((image) => image.url) : [listing.imageUrl],
+            price: summary.price,
+            highestPrice: Math.max(summary.price, ...(choices ?? []).map((choice) => choice.price)),
+            optionCount: choices?.length ?? 0,
+            stockQuantity: summary.stockQuantity,
+            shopName: shop.businessName,
+            ratingCount: listing.ratingCount,
+            ratingAverage: averageRating(listing.ratingSum, listing.ratingCount)
+        })
     }))
 }
 

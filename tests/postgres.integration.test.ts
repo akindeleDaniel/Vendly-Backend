@@ -7857,10 +7857,15 @@ test("a seller's earnings summarise paid orders, optionally within dates, and no
         assert.equal(earnings.body.months.length, 1)
         assert.equal(earnings.body.months[0].orders, 1)
         assert.equal(earnings.body.months[0].sales, "3000.00")
-        assert.equal(earnings.body.months[0].month, new Date().toISOString().slice(0, 7))
-
-        const today = new Date().toISOString().slice(0, 10)
+        // Days and months are Nigerian ones (UTC+1).
+        const lagosDay = (offsetDays = 0) => new Date(Date.now() + 60 * 60 * 1000 + offsetDays * 24 * 60 * 60 * 1000).toISOString().slice(0, 10)
+        const today = lagosDay()
+        assert.equal(earnings.body.months[0].month, today.slice(0, 7))
         assert.equal((await request("GET", `/seller/earnings?from=${today}&to=${today}`, undefined, fixture.sellerToken)).body.totals.orders, 1)
+        // Paid at 00:30 Nigerian time today (23:30 UTC yesterday): it counts today, not yesterday.
+        await prisma.order.updateMany({ where: { checkoutId: context.checkoutId }, data: { createdAt: new Date(`${lagosDay(-1)}T23:30:00.000Z`) } })
+        assert.equal((await request("GET", `/seller/earnings?from=${today}&to=${today}`, undefined, fixture.sellerToken)).body.totals.orders, 1)
+        assert.equal((await request("GET", `/seller/earnings?from=${lagosDay(-1)}&to=${lagosDay(-1)}`, undefined, fixture.sellerToken)).body.totals.orders, 0)
         const past = await request("GET", "/seller/earnings?from=2020-01-01&to=2020-01-31", undefined, fixture.sellerToken)
         assert.equal(past.body.totals.orders, 0)
         assert.equal(past.body.from, "2020-01-01")
@@ -11272,5 +11277,56 @@ test("a Shopify product export imports as it is, as drafts with their variants a
         assert.equal(refused.body.code, "IMPORT_INVALID")
         assert.deepEqual(refused.body.problems.map((problem: { row: number; column: string }) => `${problem.row}:${problem.column}`), ["2:Title", "3:Image Src", "4:Variant Price", "4:Variant Price"])
         assert.equal(await prisma.listing.count({ where: { userId: fixture.sellerId } }), before)
+    })
+})
+
+// ---- Product details for Google ----
+
+test("product pages carry the details Google reads for price, stock and stars, and the share page does too", async () => {
+    await withPaymentCheckout("structured-data", async (context) => {
+        const { fixture, request, baseUrl } = context
+        const listing = await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+        const data = async (id: number) => (await request("GET", `/listings/${id}`)).body.structuredData
+
+        // A plain product: one price, in stock, no rating yet.
+        const plain = await data(listing.id)
+        assert.equal(plain["@context"], "https://schema.org/")
+        assert.equal(plain["@type"], "Product")
+        assert.deepEqual([plain.name, plain.sku, plain.url, plain.brand.name], [listing.title, String(listing.id), `${config.frontendUrl}/product/${listing.id}`, profile.businessName])
+        assert.deepEqual(plain.image, [listing.imageUrl])
+        assert.deepEqual(plain.offers, { "@type": "Offer", priceCurrency: "NGN", price: "1500.00", availability: "https://schema.org/InStock", url: plain.url, seller: { "@type": "Organization", name: profile.businessName } })
+        assert.equal("aggregateRating" in plain, false)
+
+        // Real buyer reviews give a rating; a product with no stock says so.
+        const orderId = await payForCheckout(context)
+        const reviewers = await addOtherReviewers(context, orderId, [5, 4])
+        try {
+            assert.deepEqual((await data(listing.id)).aggregateRating, { "@type": "AggregateRating", ratingValue: 4.5, reviewCount: 2, bestRating: 5, worstRating: 1 })
+        } finally {
+            await removeUsers(reviewers)
+        }
+        await prisma.listing.update({ where: { id: listing.id }, data: { stockQuantity: 0 } })
+        assert.equal((await data(listing.id)).offers.availability, "https://schema.org/OutOfStock")
+
+        // Options with different prices give a price range.
+        const product = (await request("POST", "/listings", {
+            title: "Gown </script><b>x</b>", description: "Silk", price: 5000, category: "Fashion & Clothing",
+            imageUrls: ["https://img.example.test/gown-1.jpg", "https://img.example.test/gown-2.jpg"],
+            options: [{ label: "S", price: 5000, stockQuantity: 2 }, { label: "L", price: 7000, stockQuantity: 0 }]
+        }, fixture.sellerToken)).body
+        const ranged = await data(product.id)
+        assert.deepEqual([ranged.offers["@type"], ranged.offers.lowPrice, ranged.offers.highPrice, ranged.offers.offerCount, ranged.offers.availability],
+            ["AggregateOffer", "5000.00", "7000.00", 2, "https://schema.org/InStock"])
+        assert.deepEqual(ranged.image, ["https://img.example.test/gown-1.jpg", "https://img.example.test/gown-2.jpg"])
+
+        // The share page carries the same details, and a name can never close the script tag.
+        const html = await (await fetch(`${baseUrl}/share/product/${product.id}`)).text()
+        const script = /<script type="application\/ld\+json">(.*?)<\/script>/.exec(html)?.[1]
+        assert.ok(script)
+        assert.equal(script.includes("</script>"), false)
+        assert.ok(script.includes("\\u003c/script>"))
+        const shared = JSON.parse(script)
+        assert.deepEqual([shared.name, shared.offers.lowPrice, shared.offers.highPrice], ["Gown </script><b>x</b>", "5000.00", "7000.00"])
     })
 })

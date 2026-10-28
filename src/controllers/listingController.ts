@@ -1,4 +1,5 @@
 import type { Request, Response } from "express"
+import { productStructuredData } from "../lib/structuredData.js"
 import { draftProblems } from "./listingDraftController.js"
 import { productEnquiry } from "../lib/shopBranding.js"
 import { effectiveThreshold, lowStockThresholdProblem, parseLowStockThreshold, stockStatus } from "../lib/stockAlerts.js"
@@ -205,6 +206,20 @@ export const getListingById  = async (req:Request, res:Response) =>{
         shopTrust: trust.get(specificData.userId) ?? null,
         // A link that shows a picture and title when pasted into WhatsApp, Instagram or Facebook.
         shareUrl,
+        // For the product page's <script type="application/ld+json"> tag, so Google can show price, stock and stars.
+        structuredData: productStructuredData({
+            id: specificData.id,
+            title: listing.title,
+            description: listing.description,
+            images: listing.images,
+            price: listing.price,
+            highestPrice: Math.max(listing.price, ...listing.options.map((option) => option.price)),
+            optionCount: listing.options.reduce((count, option) => count + Math.max(option.sizes.length, 1), 0),
+            stockQuantity: listing.stockQuantity,
+            shopName: user.sellerProfile?.businessName ?? null,
+            ratingCount: listing.ratingCount,
+            ratingAverage: listing.ratingAverage
+        }),
         whatsappEnquiry: productEnquiry(user.sellerProfile?.whatsappNumber ?? null, user.sellerProfile?.businessName ?? "", asked, shareUrl),
         selectedListingId: found?.parentId ? found.id : null,
         sellerSlug: user.sellerProfile?.slug ?? null,

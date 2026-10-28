@@ -43,17 +43,20 @@ export const getMyEarnings = async (req: Request, res: Response) => {
         return
     }
 
-    // "to" is a whole day, so the range ends at the start of the next day.
-    const until = to ? new Date(to.getTime() + 24 * 60 * 60 * 1000) : undefined
+    // Days and months are Nigerian ones, as in the sales summary. "to" is a whole day, so the range ends when the next
+    // Nigerian day starts.
+    const fromDay = from ? from.toISOString().slice(0, 10) : null
+    const toDay = to ? to.toISOString().slice(0, 10) : null
+    const since = fromDay ? lagosDayStart(fromDay) : undefined
+    const until = toDay ? lagosDayStart(addDays(toDay, 1)) : undefined
     const where: Prisma.OrderWhereInput = {
         sellerId,
         status: { in: paidStatuses },
-        ...(from || until ? { createdAt: { ...(from ? { gte: from } : {}), ...(until ? { lt: until } : {}) } } : {})
+        ...(since || until ? { createdAt: { ...(since ? { gte: since } : {}), ...(until ? { lt: until } : {}) } } : {})
     }
-    const monthsStart = new Date()
-    monthsStart.setUTCDate(1)
-    monthsStart.setUTCHours(0, 0, 0, 0)
-    monthsStart.setUTCMonth(monthsStart.getUTCMonth() - (monthsShown - 1))
+    const thisMonth = new Date(`${lagosToday().slice(0, 7)}-01T00:00:00.000Z`)
+    thisMonth.setUTCMonth(thisMonth.getUTCMonth() - (monthsShown - 1))
+    const monthsStart = lagosDayStart(thisMonth.toISOString().slice(0, 10))
 
     const [totals, byStatus, unreported, openLiabilities, months] = await Promise.all([
         prisma.order.aggregate({
@@ -66,7 +69,7 @@ export const getMyEarnings = async (req: Request, res: Response) => {
         prisma.order.count({ where: { ...where, sellerReceives: null } }),
         prisma.sellerLiability.aggregate({ where: { sellerId, status: "OPEN" }, _count: { _all: true }, _sum: { amount: true, recovered: true } }),
         prisma.$queryRaw<Array<{ month: string; orders: bigint; sales: Prisma.Decimal; fees: Prisma.Decimal; received: Prisma.Decimal; refunded: Prisma.Decimal }>>`
-            SELECT to_char(date_trunc('month', o."createdAt"), 'YYYY-MM') AS month,
+            SELECT to_char(date_trunc('month', (o."createdAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Africa/Lagos'), 'YYYY-MM') AS month,
                    count(*) AS orders,
                    sum(o.total) AS sales,
                    sum(coalesce(o."providerFee", 0)) AS fees,
@@ -83,8 +86,8 @@ export const getMyEarnings = async (req: Request, res: Response) => {
     const stillOwed = new Prisma.Decimal(openLiabilities._sum.amount ?? 0).minus(openLiabilities._sum.recovered ?? 0)
 
     res.send({
-        from: from ? from.toISOString().slice(0, 10) : null,
-        to: to ? to.toISOString().slice(0, 10) : null,
+        from: fromDay,
+        to: toDay,
         totals: {
             orders: totals._count._all,
             sales: money(sum.total),
