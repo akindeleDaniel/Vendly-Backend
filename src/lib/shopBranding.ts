@@ -2,17 +2,16 @@ import { isHttpsUrl } from "./inputRules.js"
 
 // A shop's own look: a banner, one preset colour, an "about" text, social handles and an optional WhatsApp button.
 // Colours are presets rather than any colour, so every shop stays readable: each pairs a background with the text
-// colour that passes contrast on it (white on the dark ones, charcoal on the light ones). Checkout and payment always
-// use StoreHatch's own colours.
+// colour that passes contrast on it (white text on every one of them). Checkout and payment always use StoreHatch's
+// own colours.
 
 export type BrandColor = { key: string; name: string; background: string; text: string; tint: string; light: boolean }
 
-const charcoal = "#242923"
 const white = "#FFFFFF"
 
-// Contrast of the text colour on the background, checked when chosen (WCAG; 4.5:1 is the minimum for text):
-// forest 9.98, navy 11.48, teal 7.50, indigo 9.16, plum 11.13, wine 10.20, terracotta 6.77, charcoal 13.49,
-// brown 8.97 (all white text); cream 12.52, beige 10.08 (charcoal text).
+// Contrast of the white text on each background, checked when chosen (WCAG; 4.5:1 is the minimum for text):
+// forest 9.98, navy 11.48, teal 7.50, indigo 9.16, plum 11.13, wine 10.20, terracotta 6.77, charcoal 13.49, brown 8.97.
+// Cream and beige were offered until 28 October 2026; shops that had them were moved to forest.
 export const brandColors: BrandColor[] = [
     { key: "forest", name: "Forest", background: "#174B3A", text: white, tint: "#E8EEEB", light: false },
     { key: "navy", name: "Navy", background: "#1F3A5F", text: white, tint: "#E9EBEF", light: false },
@@ -22,10 +21,7 @@ export const brandColors: BrandColor[] = [
     { key: "wine", name: "Wine", background: "#7A1F2B", text: white, tint: "#F2E9EA", light: false },
     { key: "terracotta", name: "Terracotta", background: "#9C3D22", text: white, tint: "#F5ECE9", light: false },
     { key: "charcoal", name: "Charcoal", background: "#2B2F33", text: white, tint: "#EAEAEB", light: false },
-    { key: "brown", name: "Brown", background: "#6B3E26", text: white, tint: "#F0ECE9", light: false },
-    // The light ones are very close to the page background: show them with a thin border.
-    { key: "cream", name: "Cream", background: "#F3EBDD", text: charcoal, tint: "#FBF8F3", light: true },
-    { key: "beige", name: "Beige", background: "#E3D3B8", text: charcoal, tint: "#F8F3EB", light: true }
+    { key: "brown", name: "Brown", background: "#6B3E26", text: white, tint: "#F0ECE9", light: false }
 ]
 
 export const maximumAboutLength = 500
@@ -155,6 +151,7 @@ type BrandingColumns = {
     whatsappNumber: string | null
 }
 
+// A colour key that is no longer offered (or was never valid) shows as forest, so an old row cannot break a shop page.
 export function brandColorFor(key: string): BrandColor {
     return brandColors.find((color) => color.key === key) ?? brandColors[0]!
 }
