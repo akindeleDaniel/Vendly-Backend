@@ -10923,3 +10923,56 @@ test("a seller can download their paid orders as a spreadsheet, safely and witho
         assert.equal((await request("GET", "/seller/orders/export?from=2025-01-01&to=2026-06-01", undefined, fixture.sellerToken)).status, 400)
     })
 })
+
+// ---- The seller's customer list ----
+
+test("a seller sees their own customers with orders and spend, repeat buyers counted, and no contact details", async () => {
+    await withPaymentCheckout("customer-list", async (context) => {
+        const { fixture, request } = context
+        const list = async (query = "", token = fixture.sellerToken) => (await request("GET", `/seller/customers${query}`, undefined, token)).body
+        type Customer = { name: string; orders: number; spent: string; refunded: string; repeat: boolean }
+
+        assert.deepEqual(await list(), { page: 1, pageSize: 20, total: 0, counts: { customers: 0, repeatCustomers: 0 }, customers: [] })
+
+        // Ada pays for 2 × ₦1,500.
+        await prisma.user.update({ where: { id: fixture.consumerId }, data: { name: "Ada Chioma Obi" } })
+        const adaOrder = await payForCheckout(context)
+
+        // Bola's checkout is not paid yet, so she is not a customer yet.
+        const bola = await fixture.addConsumer(1)
+        await prisma.user.update({ where: { id: bola.id }, data: { name: "Bola Ade" } })
+        const bolaCheckout = await fixture.createCheckout(bola.token)
+        assert.equal((await list()).total, 1)
+        await prisma.order.updateMany({ where: { checkoutId: bolaCheckout }, data: { status: "PAID" } })
+        const bolaTotal = (await prisma.order.findFirstOrThrow({ where: { checkoutId: bolaCheckout } })).total.toFixed(2)
+
+        const both = await list()
+        assert.deepEqual(both.counts, { customers: 2, repeatCustomers: 0 })
+        // Most recent first by default; by spend, Ada is first.
+        assert.deepEqual(both.customers.map((customer: Customer) => [customer.name, customer.orders, customer.spent, customer.repeat]), [["Bola A.", 1, bolaTotal, false], ["Ada O.", 1, "3000.00", false]])
+        assert.deepEqual((await list("?sort=spent")).customers.map((customer: Customer) => customer.name), ["Ada O.", "Bola A."])
+        // Only what the seller needs: no email, phone, address or account id.
+        assert.deepEqual(Object.keys(both.customers[0]).sort(), ["firstOrderAt", "lastOrderAt", "name", "orders", "refunded", "repeat", "spent"])
+        assert.equal(JSON.stringify(both).includes("@example.test"), false)
+
+        // A second paid order makes Ada a repeat customer; refunds are shown beside what she spent.
+        const extra = await fixture.addConsumer(1)
+        const extraCheckout = await fixture.createCheckout(extra.token)
+        await prisma.order.updateMany({ where: { checkoutId: extraCheckout }, data: { status: "PAID" } })
+        await prisma.checkout.update({ where: { id: extraCheckout }, data: { userId: fixture.consumerId } })
+        await prisma.order.update({ where: { id: adaOrder }, data: { refundedAmount: 500 } })
+        const repeat = await list("?sort=orders")
+        assert.deepEqual(repeat.counts, { customers: 2, repeatCustomers: 1 })
+        const ada = repeat.customers[0] as Customer
+        assert.deepEqual([ada.name, ada.orders, ada.repeat, ada.refunded], ["Ada O.", 2, true, "500.00"])
+
+        // Another seller sees none of them; buyers cannot see the list; bad values are refused.
+        await withStrangerSeller(async (stranger) => {
+            assert.equal((await list("", stranger)).total, 0)
+        })
+        assert.equal((await request("GET", "/seller/customers", undefined, fixture.token)).status, 403)
+        assert.equal((await request("GET", "/seller/customers?sort=name", undefined, fixture.sellerToken)).status, 400)
+        assert.equal((await request("GET", "/seller/customers?page=0", undefined, fixture.sellerToken)).status, 400)
+        assert.deepEqual((await list("?page=2")).customers, [])
+    })
+})
