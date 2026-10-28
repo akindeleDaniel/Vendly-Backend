@@ -11,7 +11,8 @@ import { listingTextProblem, stockProblem } from "./listingController.js"
 // One screen to change many products and options at once: after a restock, when prices go up, or to finish products
 // added from photos. Every change is checked first and nothing is saved unless all of them are fine, so the screen
 // never ends up half saved. A product with options is priced and stocked on its options; an option only has its own
-// price, stock and low-stock number (its name, description and category come from its product).
+// price, stock and low-stock number (its name, description and category come from its product). Sizes share their
+// option's price, so a new price on one size goes to every size of that option, and the product's "from" price follows.
 export const maximumBulkChanges = 200
 
 type BulkProblem = { listingId: number | null; field: string | null; message: string }
@@ -142,6 +143,26 @@ export const bulkUpdateListings = async (req: Request, res: Response) => {
         }
     }
 
+    // Two sizes of one option given different prices cannot both be kept.
+    const sizePrices = new Map<string, number>()
+
+    for (const change of read.changes) {
+        const listing = byId.get(change.listingId)
+
+        if (change.price === undefined || !listing || listing.parentId === null || listing.sizeLabel === null) {
+            continue
+        }
+
+        const key = `${listing.parentId}:${listing.optionLabel ?? ""}`
+        const earlier = sizePrices.get(key)
+
+        if (earlier !== undefined && earlier !== change.price) {
+            problems.push({ listingId: change.listingId, field: "price", message: `All sizes of "${listing.optionLabel}" share one price` })
+        }
+
+        sizePrices.set(key, change.price)
+    }
+
     if (problems.length > 0) {
         res.status(400).send({
             message: `Nothing was saved. Fix ${problems.length === 1 ? "this problem" : `these ${problems.length} problems`} and try again`,
@@ -183,7 +204,29 @@ export const bulkUpdateListings = async (req: Request, res: Response) => {
                     await propagateToOptions(tx, before, after)
                 }
 
+                // Every size of an option has the option's price.
+                if (data.price !== undefined && before.parentId !== null && before.sizeLabel !== null) {
+                    await tx.listing.updateMany({
+                        where: { parentId: before.parentId, optionLabel: before.optionLabel, id: { not: listingId }, ...currentChoices },
+                        data: { price: data.price }
+                    })
+                }
+
                 results.push(after)
+            }
+
+            // A product with options shows the lowest price of its options.
+            const repriced = [...new Set(read.changes
+                .filter((change) => change.price !== undefined)
+                .map((change) => byId.get(change.listingId)!.parentId)
+                .filter((id): id is number => id !== null))]
+
+            for (const parentId of repriced) {
+                const lowest = await tx.listing.aggregate({ where: { parentId, ...currentChoices }, _min: { price: true } })
+
+                if (lowest._min.price !== null) {
+                    await tx.listing.update({ where: { id: parentId }, data: { price: lowest._min.price } })
+                }
             }
 
             return results

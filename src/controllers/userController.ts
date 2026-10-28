@@ -220,6 +220,13 @@ export const becomeSeller = async (req: Request, res: Response) => {
     const userId = req.user!.id
 
     try {
+        const account = await prisma.user.findUnique({ where: { id: userId }, select: { isAdmin: true } })
+
+        if (account?.isAdmin) {
+            res.status(403).send({ message: "Administrator accounts can't shop or sell. Use a separate account for that", code: "ADMIN_ACCOUNT" })
+            return
+        }
+
         await prisma.user.updateMany({ where: { id: userId, role: "CONSUMER" }, data: { role: "SELLER" } })
         const user = await prisma.user.findUnique({ where: { id: userId }, select: { role: true } })
 

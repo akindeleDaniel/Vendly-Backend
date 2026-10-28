@@ -11130,6 +11130,62 @@ test("a seller can change the price, stock and details of many products and opti
     })
 })
 
+test("quick edit gives every size of an option the same new price, and the product's lowest price follows", async () => {
+    await withPaymentCheckout("bulk-sizes", async (context) => {
+        const { fixture, request } = context
+        const bulk = (changes: unknown) => request("PATCH" as "GET", "/listings/bulk", { changes }, fixture.sellerToken)
+        const product = (await request("POST", "/listings", {
+            title: "Sized hoodie", description: "Soft", price: 5000, category: "Electronics",
+            imageUrls: ["https://img.example.test/sized-hoodie.jpg"],
+            options: [
+                { label: "Blue", price: 5000, stockQuantity: 2 },
+                { label: "Black", price: 6000, sizes: [{ label: "M", stockQuantity: 2 }, { label: "L", stockQuantity: 2 }] }
+            ]
+        }, fixture.sellerToken)).body
+        const blue = product.options[0].listingId as number
+        const [medium, large] = product.options[1].sizes.map((size: { listingId: number }) => size.listingId) as [number, number]
+        const priceOf = async (id: number) => (await prisma.listing.findUniqueOrThrow({ where: { id } })).price
+
+        // A new price on one size goes to the other sizes of that option, and the product shows the lowest price.
+        assert.equal((await bulk([{ listingId: medium, price: 4000 }])).status, 200)
+        assert.deepEqual([await priceOf(medium), await priceOf(large), await priceOf(blue), await priceOf(product.id)], [4000, 4000, 5000, 4000])
+        assert.equal((await bulk([{ listingId: blue, price: 3000 }])).status, 200)
+        assert.equal(await priceOf(product.id), 3000)
+        assert.equal((await bulk([{ listingId: blue, price: 9000 }])).status, 200)
+        assert.equal(await priceOf(product.id), 4000)
+
+        // Two sizes of one option cannot be given different prices.
+        const refused = await bulk([{ listingId: medium, price: 4500 }, { listingId: large, price: 4600 }])
+        assert.equal(refused.status, 400)
+        assert.deepEqual(refused.body.problems.map((problem: { listingId: number; field: string }) => [problem.listingId, problem.field]), [[large, "price"]])
+        assert.equal(await priceOf(medium), 4000)
+        assert.equal((await bulk([{ listingId: medium, price: 4500 }, { listingId: large, price: 4500 }])).status, 200)
+        assert.deepEqual([await priceOf(medium), await priceOf(large)], [4500, 4500])
+    })
+})
+
+// ---- Administrators do not shop or sell ----
+
+test("an administrator account cannot shop, sell or open a shop", async () => {
+    await withPaymentCheckout("admin-no-shopping", async (context) => {
+        const { fixture, request, adminToken } = context
+        for (const [method, path, body] of [
+            ["GET", "/cart", undefined],
+            ["POST", "/cart/items", { listingId: fixture.listingId, quantity: 1 }],
+            ["GET", "/orders", undefined],
+            ["GET", "/seller/profile", undefined],
+            ["POST", "/listings", { title: "Admin product", description: "No", price: 100, category: "Electronics", stockQuantity: 1 }],
+            ["POST", "/users/become-seller", {}]
+        ] as const) {
+            const response = await request(method as "GET", path, body, adminToken)
+            assert.equal(response.status, 403, path)
+            assert.equal(response.body.code, "ADMIN_ACCOUNT", path)
+        }
+        // The same account's administrator work is not affected.
+        assert.equal((await request("GET", "/admin/summary", undefined, adminToken)).status, 200)
+    })
+})
+
 // ---- Adding products from photos (drafts) ----
 
 test("a seller can add products from photos as hidden drafts, fill them in, and publish the ones that are complete", async () => {
