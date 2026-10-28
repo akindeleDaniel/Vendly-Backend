@@ -172,7 +172,8 @@ type ParentFields = { id: number; userId: number; title: string; description: st
 // Makes the stored options match the list given: choices that are new are created, ones that match (by name) are
 // updated, and ones that are missing are deleted, or hidden when a cart, checkout or order refers to them. Shoppers'
 // carts lose the choices that are removed.
-export async function syncListingOptions(tx: Prisma.TransactionClient, parent: ParentFields, options: OptionInput[]): Promise<void> {
+// A draft's options are made hidden with it (hiddenAt is the draft's archivedAt) and go on sale when it is published.
+export async function syncListingOptions(tx: Prisma.TransactionClient, parent: ParentFields, options: OptionInput[], hiddenAt: Date | null = null): Promise<void> {
     await tx.$executeRaw`SELECT id FROM "Listing" WHERE id = ${parent.id} FOR UPDATE`
     const now = new Date()
     const existing = await tx.listing.findMany({ where: { parentId: parent.id } })
@@ -195,7 +196,7 @@ export async function syncListingOptions(tx: Prisma.TransactionClient, parent: P
                 optionLabel: option.label,
                 sizeLabel: choice.size,
                 position: optionIndex * 1000 + sizeIndex,
-                archivedAt: null
+                archivedAt: hiddenAt
             }
             const row = byKey.get(choiceKey(option.label, choice.size))
 
@@ -259,6 +260,10 @@ export type ChoiceRow = {
     lowStockThreshold: number | null
 }
 
+// A product's current choices: the ones on sale, or all of a draft's (they are hidden with it until it is published).
+// Choices a seller removed but that order history still needs are archived on a product that is not a draft.
+export const currentChoices = { OR: [{ archivedAt: null }, { parent: { isDraft: true } }] } satisfies Prisma.ListingWhereInput
+
 // The choices on sale for each of the given products (only products that have options appear in the map).
 export async function loadChoices(parentIds: number[]): Promise<Map<number, ChoiceRow[]>> {
     const result = new Map<number, ChoiceRow[]>()
@@ -268,7 +273,7 @@ export async function loadChoices(parentIds: number[]): Promise<Map<number, Choi
     }
 
     const rows = await prisma.listing.findMany({
-        where: { parentId: { in: parentIds }, archivedAt: null },
+        where: { parentId: { in: parentIds }, ...currentChoices },
         orderBy: [{ position: "asc" }, { id: "asc" }],
         select: { id: true, parentId: true, optionLabel: true, sizeLabel: true, price: true, stockQuantity: true, imageUrl: true, lowStockThreshold: true }
     })
@@ -354,5 +359,5 @@ export async function propagateToOptions(
 
 // How many choices a product has on sale; zero for an ordinary listing.
 export async function countChoices(parentId: number): Promise<number> {
-    return prisma.listing.count({ where: { parentId, archivedAt: null } })
+    return prisma.listing.count({ where: { parentId, ...currentChoices } })
 }

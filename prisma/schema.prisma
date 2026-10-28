@@ -26,6 +26,9 @@ model Listing {
   userId        Int
   // Set when the seller takes the listing off sale without deleting it (it may be in order history).
   archivedAt    DateTime?
+  // A product added from a photo that the seller has not finished yet. It is kept off sale (archivedAt is set) until
+  // it is complete and published.
+  isDraft       Boolean  @default(false)
   images        ListingImage[]
   // Star totals over the reviews that are not hidden; the average is ratingSum / ratingCount.
   ratingCount   Int      @default(0)

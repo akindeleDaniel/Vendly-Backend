@@ -42,7 +42,10 @@ app.use(generalLimiter)
 app.use("/email", emailRoutes)
 // Refuses changes asked for by another website using a visitor's cookies.
 app.use(requireTrustedOrigin)
-app.use(express.json())
+// Spreadsheet imports send a whole file (a Shopify export can be a few megabytes); everything else stays small.
+const importBodyParser = express.json({ limit: "3mb" })
+const bodyParser = express.json()
+app.use((req, res, next) => (req.method === "POST" && req.path === "/listings/import" ? importBodyParser : bodyParser)(req, res, next))
 app.use(ensureRequestBody)
 app.use(cookieParser())
 app.use("/users", userRoutes)

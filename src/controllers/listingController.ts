@@ -1,4 +1,5 @@
 import type { Request, Response } from "express"
+import { draftProblems } from "./listingDraftController.js"
 import { productEnquiry } from "../lib/shopBranding.js"
 import { effectiveThreshold, lowStockThresholdProblem, parseLowStockThreshold, stockStatus } from "../lib/stockAlerts.js"
 import prisma from "../lib/prisma.js"
@@ -27,7 +28,7 @@ async function detailedListing<T extends { id: number; imageUrl: string; images:
 }
 
 // The text fields that were given must be text of a sensible size, and the image must be an https link.
-function listingTextProblem(fields: { title?: unknown; description?: unknown; category?: unknown; imageUrl?: unknown }): string | null {
+export function listingTextProblem(fields: { title?: unknown; description?: unknown; category?: unknown; imageUrl?: unknown }): string | null {
     const { title, description, category, imageUrl } = fields
 
     for (const [name, value] of [["Title", title], ["Description", description], ["Category", category], ["Image URL", imageUrl]] as const) {
@@ -51,7 +52,7 @@ function listingTextProblem(fields: { title?: unknown; description?: unknown; ca
     return null
 }
 
-function stockProblem(stockQuantity: unknown): string | null {
+export function stockProblem(stockQuantity: unknown): string | null {
     if (!Number.isInteger(stockQuantity) || (stockQuantity as number) < 0) {
         return "Stock quantity must be a whole number greater than or equal to 0"
     }
@@ -542,9 +543,15 @@ export const deleteListing = async(req:Request, res:Response) =>{
 export const getMyListings = async(req:Request, res:Response) =>{
     const id = req.user!.id
     const archived = req.query.archived
+    const drafts = req.query.drafts
 
     if (archived !== undefined && archived !== "only" && archived !== "all") {
         res.status(400).send({message:"Archived must be only or all"})
+        return
+    }
+
+    if (drafts !== undefined && drafts !== "only") {
+        res.status(400).send({message:"Drafts must be only"})
         return
     }
 
@@ -553,7 +560,9 @@ export const getMyListings = async(req:Request, res:Response) =>{
             where: {
                 userId: id,
                 parentId: null,
-                ...(archived === "only" ? { archivedAt: { not: null } } : archived === "all" ? {} : { archivedAt: null })
+                ...(drafts === "only"
+                    ? { isDraft: true }
+                    : archived === "only" ? { archivedAt: { not: null }, isDraft: false } : archived === "all" ? { isDraft: false } : { archivedAt: null })
             },
             include: { images: imagesInclude }
         })
@@ -562,7 +571,9 @@ export const getMyListings = async(req:Request, res:Response) =>{
         res.send(listings.map((listing) => ({
             ...withOptionSummary(withImages(listing), choices.get(listing.id)),
             options: optionTree(choices.get(listing.id)),
-            ...stockView(listing, choices.get(listing.id), shop?.lowStockThreshold)
+            ...stockView(listing, choices.get(listing.id), shop?.lowStockThreshold),
+            // For a draft: what it still needs before it can be published.
+            ...(listing.isDraft ? { draftMissing: draftProblems(listing).map((problem) => problem.field) } : {})
         })))
     }catch(error){
         res.status(500).send({message:"Sorry there is an issue on our end"})
@@ -674,6 +685,11 @@ export const unarchiveListing = async(req:Request, res:Response) =>{
         return
     }
 
+    if (listing.isDraft) {
+        res.status(400).send({message: "This is a draft. Finish it and publish it with POST /listings/drafts/publish", code:"LISTING_IS_DRAFT"})
+        return
+    }
+
     try{
         const restored = await prisma.$transaction(async (tx) => {
             // Only the choices that went off sale together with the product come back; ones the seller removed stay removed.
@@ -714,6 +730,16 @@ export const setListingOptions = async(req: Request, res: Response) =>{
 
     if (listing.parentId !== null) {
         res.status(400).send({message: "Options are set on the product, not on one of its choices", code:"LISTING_IS_OPTION"})
+        return
+    }
+
+    if (listing.isDraft) {
+        res.status(400).send({message: "Publish this draft first, then add its options", code:"LISTING_IS_DRAFT"})
+        return
+    }
+
+    if (listing.archivedAt) {
+        res.status(400).send({message: "Put this product back on sale before changing its options", code:"LISTING_ARCHIVED"})
         return
     }
 

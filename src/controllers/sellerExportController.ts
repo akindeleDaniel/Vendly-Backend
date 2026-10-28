@@ -2,6 +2,7 @@ import type { Request, Response } from "express"
 import prisma from "../lib/prisma.js"
 import type { OrderStatus, Prisma } from "../generated/prisma/client.js"
 import { readLagosPeriod } from "./sellerEarningsController.js"
+import { csvCell } from "../lib/csv.js"
 
 // The seller's orders as a spreadsheet (CSV, which Excel and Google Sheets open), for their own records, accounts or
 // a bookkeeper. Only paid orders, one row per order. Buyers are named by first name and state only: their phone
@@ -18,18 +19,6 @@ function money(amount: Prisma.Decimal | null): string {
 // The date and time in Nigeria, as 2026-10-28 14:05.
 function lagosDateTime(date: Date | null): string {
     return date ? new Date(date.getTime() + 60 * 60 * 1000).toISOString().slice(0, 16).replace("T", " ") : ""
-}
-
-// One spreadsheet cell. Text a spreadsheet would run as a formula (starting with =, +, -, @ or a tab) is kept as
-// text, so a product title or a buyer's name can never run anything on the seller's computer.
-function cell(value: string | number): string {
-    let text = String(value)
-
-    if (typeof value === "string" && /^[=+\-@\t\r]/.test(text)) {
-        text = `'${text}`
-    }
-
-    return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
 }
 
 export const exportMyOrders = async (req: Request, res: Response) => {
@@ -94,7 +83,7 @@ export const exportMyOrders = async (req: Request, res: Response) => {
         lagosDateTime(order.deliveryConfirmedAt ?? order.deliveryAutoClosedAt)
     ])
     // The byte-order mark makes Excel read the file as UTF-8, so names with accents and the naira sign show properly.
-    const csv = "\uFEFF" + [header, ...rows].map((row) => row.map(cell).join(",")).join("\r\n") + "\r\n"
+    const csv = "\uFEFF" + [header, ...rows].map((row) => row.map(csvCell).join(",")).join("\r\n") + "\r\n"
 
     res.set("Cache-Control", "no-store")
         .attachment(`storehatch-orders-${period.from}-to-${period.to}.csv`)

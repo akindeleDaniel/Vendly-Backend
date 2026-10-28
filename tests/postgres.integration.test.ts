@@ -10004,7 +10004,7 @@ test("a seller can brand their shop with a banner, a preset colour, an about tex
         // Each field is checked.
         for (const [body, message] of [
             [{ bannerUrl: "http://img.example.test/banner.jpg" }, /https link/],
-            [{ brandColor: "pink" }, /one of: forest, navy, teal, indigo, plum, wine, terracotta, charcoal, brown, cream, beige/],
+            [{ brandColor: "pink" }, /one of: forest, navy, teal, indigo, plum, wine, terracotta, charcoal, brown$/],
             [{ about: "x".repeat(501) }, /500 characters or fewer/],
             [{ about: "Order at https://elsewhere.example.test" }, /cannot contain links/],
             [{ about: "Find us at mystore.com for cheaper prices" }, /cannot contain links/],
@@ -10022,7 +10022,7 @@ test("a seller can brand their shop with a banner, a preset colour, an about tex
         // Branding alone is a valid update. Handles lose their @, the number is stored in one form, blank lines are tidied.
         const saved = await patch({
             bannerUrl: "https://img.example.test/banner.jpg",
-            brandColor: "cream",
+            brandColor: "plum",
             about: "Handmade Ankara pieces.\n\n\n\nCustom sizes in 5 days.",
             instagram: "@adaskloset",
             tiktok: "adas.kloset",
@@ -10032,7 +10032,7 @@ test("a seller can brand their shop with a banner, a preset colour, an about tex
         })
         assert.equal(saved.status, 200)
         const branding = saved.body.branding
-        assert.deepEqual(branding.brandColor, { key: "cream", name: "Cream", background: "#F3EBDD", text: "#242923", tint: "#FBF8F3", light: true })
+        assert.deepEqual(branding.brandColor, { key: "plum", name: "Plum", background: "#5B2A4E", text: "#FFFFFF", tint: "#EFEAED", light: false })
         assert.equal(branding.about, "Handmade Ankara pieces.\n\nCustom sizes in 5 days.")
         assert.deepEqual(branding.social.instagram, { handle: "adaskloset", url: "https://instagram.com/adaskloset" })
         assert.deepEqual(branding.social.tiktok, { handle: "adas.kloset", url: "https://www.tiktok.com/@adas.kloset" })
@@ -10050,12 +10050,12 @@ test("a seller can brand their shop with a banner, a preset colour, an about tex
         const listing = await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId }, select: { category: true } })
         const cards = (await request("GET", `/seller/shops?category=${encodeURIComponent(listing.category)}`)).body as Array<{ slug: string; branding: { bannerUrl: string; brandColor: { key: string } } }>
         const card = cards.find((candidate) => candidate.slug === profile.slug)
-        assert.deepEqual([card?.branding.bannerUrl, card?.branding.brandColor.key], ["https://img.example.test/banner.jpg", "cream"])
+        assert.deepEqual([card?.branding.bannerUrl, card?.branding.brandColor.key], ["https://img.example.test/banner.jpg", "plum"])
 
         // Any form of a Nigerian number works; blank or null clears a field, and the colour stays.
         assert.equal((await patch({ whatsappNumber: "+234 703 000 1111" })).body.branding.whatsapp.number, "+2347030001111")
         const cleared = (await patch({ bannerUrl: null, instagram: "", whatsappNumber: null, about: "" })).body.branding
-        assert.deepEqual([cleared.bannerUrl, cleared.social.instagram, cleared.whatsapp, cleared.about, cleared.brandColor.key], [null, null, null, null, "cream"])
+        assert.deepEqual([cleared.bannerUrl, cleared.social.instagram, cleared.whatsapp, cleared.about, cleared.brandColor.key], [null, null, null, null, "plum"])
         assert.equal(cleared.social.tiktok.handle, "adas.kloset")
     })
 })
@@ -10974,5 +10974,303 @@ test("a seller sees their own customers with orders and spend, repeat buyers cou
         assert.equal((await request("GET", "/seller/customers?sort=name", undefined, fixture.sellerToken)).status, 400)
         assert.equal((await request("GET", "/seller/customers?page=0", undefined, fixture.sellerToken)).status, 400)
         assert.deepEqual((await list("?page=2")).customers, [])
+    })
+})
+
+// ---- Product import from a spreadsheet ----
+
+test("a seller can add many products from a spreadsheet: every row is checked first, and it is all or nothing", async () => {
+    await withPaymentCheckout("product-import", async (context) => {
+        const { fixture, request, baseUrl } = context
+        const listing = await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })
+        const upload = (body: unknown, token = fixture.sellerToken) => request("POST", "/listings/import", body, token)
+        const productCount = () => prisma.listing.count({ where: { userId: fixture.sellerId } })
+        const photo = (name: string) => `https://img.example.test/${name}.jpg`
+
+        // The template: the columns and one example row.
+        const template = await fetch(`${baseUrl}/listings/import/template`, { headers: { cookie: `token=${fixture.sellerToken}` } })
+        assert.match(template.headers.get("content-disposition") ?? "", /storehatch-products-template\.csv/)
+        const templateLines = new TextDecoder().decode(new Uint8Array(await template.arrayBuffer())).trim().split("\r\n")
+        assert.equal(templateLines[0], "title,description,price,stock,category,photo_1,photo_2,photo_3,photo_4,photo_5")
+        assert.equal(templateLines.length, 2)
+
+        // Wrong or missing columns are reported before any row is read.
+        const badHeader = await upload({ csv: "title,price,colour\nShirt,100,red" })
+        assert.equal(badHeader.status, 400)
+        assert.equal(badHeader.body.code, "IMPORT_INVALID")
+        assert.deepEqual(badHeader.body.problems.map((problem: { row: number; column: string }) => [problem.row, problem.column]),
+            [[1, "colour"], [1, "description"], [1, "stock"], [1, "category"], [1, "photo_1"]])
+
+        // Every problem in every row is listed with its spreadsheet row and column, and nothing is saved.
+        const before = await productCount()
+        const broken = [
+            "Title,Description,Price,Stock,Category,Photo 1,Photo 2",
+            `Good shirt,Fine,5000,3,Fashion & Clothing,${photo("a")},`,
+            `,No title,abc,-1,Shoes,http://img.example.test/a.jpg,`,
+            `${"T".repeat(121)},Long title,10.555,2.5,Other,,${photo("b")}`
+        ].join("\r\n")
+        const refused = await upload({ csv: broken })
+        assert.equal(refused.status, 400)
+        assert.match(refused.body.message, /^Nothing was imported/)
+        assert.deepEqual(refused.body.problems.map((problem: { row: number; column: string }) => `${problem.row}:${problem.column}`), [
+            "3:title", "3:price", "3:stock", "3:category", "3:photo_1", "4:title", "4:price", "4:stock", "4:photo_1"
+        ])
+        assert.match(refused.body.problems.find((problem: { column: string }) => problem.column === "category").message, /Fashion & Clothing/)
+        assert.equal(await productCount(), before)
+
+        // A dry run checks a good file without saving: prices with ₦ and commas, any letter case for categories,
+        // quoted text with commas and line breaks, and blank lines at the end. Likely repeats are flagged.
+        const good = [
+            "title,description,price,stock,category,photo_1,photo_2",
+            `Linen shirt,"Breathable, cool.\nSizes M to XL.","₦15,000",12,fashion & clothing,${photo("linen-1")},${photo("linen-2")}`,
+            `"${listing.title}",Already in the shop,900,1,Other,${photo("again")},`,
+            `Linen shirt,Same title twice,"1,250.50",0,Other,${photo("twice")},`,
+            "",
+            ""
+        ].join("\n")
+        const dryRun = await upload({ csv: good, dryRun: true })
+        assert.equal(dryRun.status, 200)
+        assert.equal(dryRun.body.count, 3)
+        assert.deepEqual(dryRun.body.products[0], { row: 2, title: "Linen shirt", price: 15000, stockQuantity: 12, category: "Fashion & Clothing", imageUrl: photo("linen-1"), photos: 2 })
+        assert.deepEqual(dryRun.body.warnings.map((warning: { row: number; message: string }) => [warning.row, warning.message]),
+            [[3, "You already have a product with this title"], [4, "Same title as row 2"]])
+        assert.equal(await productCount(), before)
+
+        // The real import saves them all, with their photos in order.
+        const imported = await upload({ csv: good })
+        assert.equal(imported.status, 201)
+        assert.equal(imported.body.count, 3)
+        const linen = await prisma.listing.findUniqueOrThrow({ where: { id: imported.body.listings[0].id }, include: { images: { orderBy: { position: "asc" } } } })
+        assert.deepEqual([linen.title, linen.description, linen.price, linen.stockQuantity, linen.category, linen.imageUrl], ["Linen shirt", "Breathable, cool.\nSizes M to XL.", 15000, 12, "Fashion & Clothing", photo("linen-1")])
+        assert.deepEqual(linen.images.map((image) => image.url), [photo("linen-1"), photo("linen-2")])
+        assert.equal((await prisma.listing.findUniqueOrThrow({ where: { id: imported.body.listings[2].id } })).price, 1250.5)
+        assert.equal(await productCount(), before + 3)
+
+        // Limits and other refusals.
+        const header = "title,description,price,stock,category,photo_1"
+        const tooMany = [header, ...Array.from({ length: 201 }, (_, index) => `P${index},D,100,1,Other,${photo("p")}`)].join("\n")
+        assert.match((await upload({ csv: tooMany })).body.message, /at most 200 products/)
+        assert.match((await upload({ csv: `${header}\n"Open quote,D,100,1,Other,${photo("p")}` })).body.message, /quote mark is not closed/)
+        assert.match((await upload({ csv: header })).body.message, /no products/)
+        assert.equal((await upload({})).status, 400)
+        assert.equal((await upload({ csv: good }, fixture.token)).status, 403)
+        await withStrangerSeller(async (stranger) => {
+            assert.match((await upload({ csv: good }, stranger)).body.message, /Set up your store/)
+        })
+    })
+})
+
+// ---- Quick edit of many products ----
+
+test("a seller can change the price, stock and details of many products and options at once, all or nothing", async () => {
+    await withPaymentCheckout("bulk-edit", async (context) => {
+        const { fixture, request } = context
+        const bulk = (changes: unknown, token = fixture.sellerToken) => request("PATCH" as "GET", "/listings/bulk", { changes }, token)
+        const product = (await request("POST", "/listings", {
+            title: "Bulk hoodie", description: "Soft", price: 5000, category: "Electronics",
+            imageUrls: ["https://img.example.test/bulk-hoodie.jpg"],
+            options: [{ label: "Blue", price: 5000, stockQuantity: 2 }, { label: "Red", price: 5000, stockQuantity: 2 }]
+        }, fixture.sellerToken)).body
+        const [blue, red] = product.options.map((option: { listingId: number }) => option.listingId) as [number, number]
+        const plain = fixture.listingId
+
+        // Every problem is listed, and nothing is saved.
+        const refused = await bulk([
+            { listingId: plain, price: 0 },
+            { listingId: product.id, stockQuantity: 5 },
+            { listingId: blue, title: "Renamed option" },
+            { listingId: red, category: "Shoes", stockQuantity: -2 },
+            { listingId: 999999999, price: 100 },
+            { listingId: plain },
+            { listingId: blue, price: 100 },
+            { price: 100 }
+        ])
+        assert.equal(refused.status, 400)
+        assert.equal(refused.body.code, "BULK_INVALID")
+        assert.deepEqual(refused.body.problems.map((problem: { listingId: number | null; field: string }) => `${problem.listingId}:${problem.field}`).sort(), [
+            `${blue}:listingId`, `${blue}:title`, `${plain}:listingId`, `${plain}:price`, `${product.id}:stockQuantity`, `${red}:category`, `${red}:stockQuantity`, "999999999:listingId", "null:listingId"
+        ].sort())
+        assert.equal((await prisma.listing.findUniqueOrThrow({ where: { id: plain } })).price, 1500)
+
+        // A good set saves together. Renaming a product renames its options too.
+        const saved = await bulk([
+            { listingId: plain, price: "1750.50", stockQuantity: 9, lowStockThreshold: 4 },
+            { listingId: product.id, title: "Cotton hoodie", category: "fashion & clothing" },
+            { listingId: blue, price: 5500, stockQuantity: 7 },
+            { listingId: red, lowStockThreshold: null }
+        ])
+        assert.equal(saved.status, 200)
+        assert.equal(saved.body.count, 4)
+        const plainNow = await prisma.listing.findUniqueOrThrow({ where: { id: plain } })
+        assert.deepEqual([plainNow.price, plainNow.stockQuantity, plainNow.lowStockThreshold], [1750.5, 9, 4])
+        const blueNow = await prisma.listing.findUniqueOrThrow({ where: { id: blue } })
+        assert.deepEqual([blueNow.price, blueNow.stockQuantity, blueNow.title, blueNow.category], [5500, 7, "Cotton hoodie — Blue", "Fashion & Clothing"])
+
+        // Stock cannot go below what shoppers are paying for right now (the fixture's checkout holds 2).
+        const reserved = await bulk([{ listingId: plain, stockQuantity: 1 }, { listingId: blue, stockQuantity: 1 }])
+        assert.equal(reserved.status, 409)
+        assert.equal(reserved.body.code, "BULK_STOCK_RESERVED")
+        assert.deepEqual(reserved.body.problems.map((problem: { listingId: number }) => problem.listingId), [plain])
+        assert.equal((await prisma.listing.findUniqueOrThrow({ where: { id: blue } })).stockQuantity, 7)
+
+        // Other sellers' products look like products that do not exist; buyers cannot use it; the list is limited.
+        await withStrangerSeller(async (stranger) => {
+            assert.equal((await bulk([{ listingId: plain, price: 1 }], stranger)).body.problems[0].message, "Product not found")
+        })
+        assert.equal((await bulk([{ listingId: plain, price: 1 }], fixture.token)).status, 403)
+        assert.equal((await bulk([])).status, 400)
+        assert.equal((await bulk(Array.from({ length: 201 }, (_, index) => ({ listingId: index + 1, price: 1 })))).status, 400)
+    })
+})
+
+// ---- Adding products from photos (drafts) ----
+
+test("a seller can add products from photos as hidden drafts, fill them in, and publish the ones that are complete", async () => {
+    await withPaymentCheckout("photo-drafts", async (context) => {
+        const { fixture, request } = context
+        const photo = (name: string) => `https://img.example.test/${name}.jpg`
+
+        // One draft per photo; the name comes from the photo, or "Untitled product".
+        assert.equal((await request("POST", "/listings/drafts", { photos: [{ imageUrl: "http://img.example.test/a.jpg" }] }, fixture.sellerToken)).status, 400)
+        assert.equal((await request("POST", "/listings/drafts", { photos: [] }, fixture.sellerToken)).status, 400)
+        const created = await request("POST", "/listings/drafts", { photos: [{ imageUrl: photo("red-gown"), title: "  Red   gown " }, { imageUrl: photo("img-2041") }] }, fixture.sellerToken)
+        assert.equal(created.status, 201)
+        const [gown, untitled] = created.body.drafts as Array<{ listingId: number; title: string }>
+        assert.deepEqual([gown!.title, untitled!.title], ["Red gown", "Untitled product"])
+
+        // Drafts are hidden from shoppers everywhere and cannot be bought.
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+        assert.equal((await request("GET", `/listings/${gown!.listingId}`)).status, 404)
+        assert.equal(((await request("GET", `/seller/shop/${profile.slug}`)).body.listings as Array<{ id: number }>).some((listing) => listing.id === gown!.listingId), false)
+        assert.equal((await request("POST", "/cart/items", { listingId: gown!.listingId, quantity: 1 })).status, 404)
+
+        // The seller sees them on their own, with what each still needs; they are not in the normal or archived lists.
+        const mine = async (query: string) => (await request("GET", `/listings/Mylisting${query}`, undefined, fixture.sellerToken)).body as Array<{ id: number; isDraft: boolean; draftMissing?: string[] }>
+        const drafts = await mine("?drafts=only")
+        assert.deepEqual(drafts.map((draft) => draft.id).sort(), [gown!.listingId, untitled!.listingId].sort())
+        assert.deepEqual(drafts.find((draft) => draft.id === gown!.listingId)!.draftMissing, ["description", "price", "category"])
+        assert.deepEqual(drafts.find((draft) => draft.id === untitled!.listingId)!.draftMissing, ["title", "description", "price", "category"])
+        assert.equal((await mine("")).some((listing) => listing.isDraft), false)
+        assert.equal((await mine("?archived=only")).some((listing) => listing.isDraft), false)
+
+        // Drafts are published, not put back on sale, and get options only after publishing.
+        assert.equal((await request("POST", `/listings/${gown!.listingId}/unarchive`, {}, fixture.sellerToken)).body.code, "LISTING_IS_DRAFT")
+        assert.equal((await request("PUT" as "GET", `/listings/${gown!.listingId}/options`, { options: [{ label: "S", stockQuantity: 1 }] }, fixture.sellerToken)).body.code, "LISTING_IS_DRAFT")
+
+        // Fill one in with the quick edit, then publish both: the complete one goes on sale, the other says what is missing.
+        assert.equal((await request("PATCH" as "GET", "/listings/bulk", { changes: [{ listingId: gown!.listingId, description: "Silk, floor length", price: 25000, stockQuantity: 3, category: "Fashion & Clothing" }] }, fixture.sellerToken)).status, 200)
+        const published = await request("POST", "/listings/drafts/publish", { listingIds: [gown!.listingId, untitled!.listingId, 999999999] }, fixture.sellerToken)
+        assert.equal(published.status, 200)
+        assert.deepEqual(published.body.published, [gown!.listingId])
+        assert.deepEqual(published.body.problems.map((problem: { listingId: number; field: string }) => `${problem.listingId}:${problem.field}`), [
+            "999999999:listingId", `${untitled!.listingId}:title`, `${untitled!.listingId}:description`, `${untitled!.listingId}:price`, `${untitled!.listingId}:category`
+        ])
+        const live = await request("GET", `/listings/${gown!.listingId}`)
+        assert.deepEqual([live.status, live.body.title, live.body.price], [200, "Red gown", 25000])
+        assert.equal((await mine("")).some((listing) => listing.id === gown!.listingId), true)
+        assert.deepEqual((await mine("?drafts=only")).map((draft) => draft.id), [untitled!.listingId])
+
+        // Options on a product that is off sale are refused (they would be on sale on their own).
+        await request("POST", `/listings/${gown!.listingId}/archive`, {}, fixture.sellerToken)
+        assert.equal((await request("PUT" as "GET", `/listings/${gown!.listingId}/options`, { options: [{ label: "S", stockQuantity: 1 }] }, fixture.sellerToken)).body.code, "LISTING_ARCHIVED")
+        assert.equal((await request("GET", "/listings/Mylisting?drafts=all", undefined, fixture.sellerToken)).status, 400)
+        assert.equal((await request("POST", "/listings/drafts", { photos: [{ imageUrl: photo("x") }] }, fixture.token)).status, 403)
+    })
+})
+
+// ---- Retired shop colours ----
+
+test("cream and beige are no longer offered, and a shop still saved with one shows as forest", async () => {
+    await withPaymentCheckout("retired-colours", async (context) => {
+        const { fixture, request } = context
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+
+        for (const brandColor of ["cream", "beige"]) {
+            const refused = await request("PATCH" as "GET", "/seller/profile", { brandColor }, fixture.sellerToken)
+            assert.equal(refused.status, 400, brandColor)
+            assert.equal(refused.body.message, "The colour must be one of: forest, navy, teal, indigo, plum, wine, terracotta, charcoal, brown")
+        }
+
+        // A row the migration missed still reads back as forest everywhere the colour is shown.
+        await prisma.sellerProfile.update({ where: { id: profile.id }, data: { brandColor: "cream" } })
+        assert.equal((await request("GET", `/seller/shop/${profile.slug}`)).body.profile.branding.brandColor.key, "forest")
+        assert.equal((await request("GET", "/cart")).body.cart.cartItems[0].listing.user.sellerProfile.brandColor.key, "forest")
+        await prisma.sellerProfile.update({ where: { id: profile.id }, data: { brandColor: "forest" } })
+    })
+})
+
+// ---- Importing a Shopify product export ----
+
+test("a Shopify product export imports as it is, as drafts with their variants as options", async () => {
+    await withPaymentCheckout("shopify-import", async (context) => {
+        const { fixture, request } = context
+        const upload = (csv: string, dryRun = false) => request("POST", "/listings/import", { csv, dryRun }, fixture.sellerToken)
+        const img = (name: string) => `https://cdn.shopify.com/s/files/1/${name}.jpg`
+        const header = "Handle,Title,Body (HTML),Vendor,Option1 Name,Option1 Value,Option2 Name,Option2 Value,Option3 Name,Option3 Value,Variant Inventory Qty,Variant Price,Image Src,Image Position,Variant Image,Gift Card,Status"
+        const shopifyFile = [
+            header,
+            `ankara-set,Ankara set,"<p>Cotton <strong>ankara</strong></p><ul><li>Soft</li></ul>",Ada,Color,Blue,Size,M,,,3,15000.00,${img("front")},1,${img("blue")},false,active`,
+            `ankara-set,,,,,Blue,,L,,,-2,15000.00,${img("back")},2,,,`,
+            `ankara-set,,,,,Red,,M,,,4,15000.00,,,,,`,
+            `plain-cap,Plain cap,<p>One size</p>,Ada,Title,Default Title,,,,,7,"2,500.00",${img("cap")},1,,false,draft`,
+            `sized-shoe,Leather shoe,Handmade,Ada,Color,Black,Size,40,,,2,20000.00,${img("shoe")},1,,false,active`,
+            `sized-shoe,,,,,Black,,44,,,1,22000.00,,,,,`,
+            `gift-card,Gift card,,Ada,Denomination,5000,,,,,0,5000.00,,,,true,active`
+        ].join("\n")
+
+        // A dry run reads the file as Shopify's and lists what would come in.
+        const preview = await upload(shopifyFile, true)
+        assert.equal(preview.status, 200)
+        assert.deepEqual([preview.body.source, preview.body.asDrafts, preview.body.count], ["shopify", true, 3])
+        assert.deepEqual(preview.body.products.map((product: { title: string; price: number; options: number }) => [product.title, product.price, product.options]),
+            [["Ankara set", 15000, 3], ["Plain cap", 2500, 0], ["Leather shoe", 20000, 2]])
+        assert.deepEqual(preview.body.warnings.map((warning: { row: number; message: string }) => [warning.row, warning.message]),
+            [[3, "Stock below zero was set to 0"], [8, "Gift cards are not imported"]])
+
+        // The import: three hidden drafts, with their variants as hidden options.
+        const imported = await upload(shopifyFile)
+        assert.equal(imported.status, 201)
+        assert.equal(imported.body.count, 3)
+        const [ankaraId, capId, shoeId] = imported.body.drafts.map((draft: { listingId: number }) => draft.listingId) as [number, number, number]
+        const ankara = await prisma.listing.findUniqueOrThrow({ where: { id: ankaraId }, include: { images: { orderBy: { position: "asc" } }, options: { orderBy: { position: "asc" } } } })
+        assert.deepEqual([ankara.isDraft, ankara.category, ankara.description], [true, "", "Cotton ankara\n\n• Soft"])
+        assert.deepEqual(ankara.images.map((image) => image.url), [img("front"), img("back")])
+        assert.deepEqual(ankara.options.map((option) => [option.title, option.stockQuantity, option.imageUrl, option.archivedAt?.getTime()]), [
+            ["Ankara set — Blue / M", 3, img("blue"), ankara.archivedAt!.getTime()],
+            ["Ankara set — Blue / L", 0, img("blue"), ankara.archivedAt!.getTime()],
+            ["Ankara set — Red / M", 4, img("front"), ankara.archivedAt!.getTime()]
+        ])
+        const cap = await prisma.listing.findUniqueOrThrow({ where: { id: capId } })
+        assert.deepEqual([cap.price, cap.stockQuantity, cap.description], [2500, 7, "One size"])
+        // Sizes with different prices become options of their own, so every price is right.
+        const shoe = await prisma.listing.findMany({ where: { parentId: shoeId }, orderBy: { position: "asc" } })
+        assert.deepEqual(shoe.map((option) => [option.optionLabel, option.sizeLabel, option.price]), [["Black / 40", null, 20000], ["Black / 44", null, 22000]])
+
+        // Hidden until published: not on the shop, and the options cannot be bought.
+        assert.equal((await request("GET", `/listings/${ankaraId}`)).status, 404)
+        assert.equal((await request("POST", "/cart/items", { listingId: ankara.options[0]!.id, quantity: 1 })).status, 404)
+        const draftView = ((await request("GET", "/listings/Mylisting?drafts=only", undefined, fixture.sellerToken)).body as Array<{ id: number; options: unknown[]; draftMissing: string[] }>).find((draft) => draft.id === ankaraId)!
+        assert.deepEqual([draftView.options.length, draftView.draftMissing], [2, ["category"]])
+
+        // The seller picks a category and publishes: the product and its options go on sale together.
+        assert.equal((await request("PATCH" as "GET", "/listings/bulk", { changes: [{ listingId: ankaraId, category: "Fashion & Clothing" }] }, fixture.sellerToken)).status, 200)
+        assert.deepEqual((await request("POST", "/listings/drafts/publish", { listingIds: [ankaraId] }, fixture.sellerToken)).body.published, [ankaraId])
+        const live = await request("GET", `/listings/${ankaraId}`)
+        assert.deepEqual([live.status, live.body.options.map((option: { label: string }) => option.label)], [200, ["Blue", "Red"]])
+        assert.equal((await request("POST", "/cart/items", { listingId: ankara.options[0]!.id, quantity: 1 })).status, 201)
+
+        // Problems in a Shopify file are listed by row and nothing is imported.
+        const before = await prisma.listing.count({ where: { userId: fixture.sellerId } })
+        const broken = [
+            header,
+            `no-title,,Text,Ada,Title,Default Title,,,,,1,1000,${img("x")},1,,false,active`,
+            "bad-photo,Bad photo,Text,Ada,Title,Default Title,,,,,1,1000,http://example.test/x.jpg,1,,false,active",
+            `bad-price,Bad price,Text,Ada,Title,Default Title,,,,,1,abc,${img("y")},1,,false,active`
+        ].join("\n")
+        const refused = await upload(broken)
+        assert.equal(refused.status, 400)
+        assert.equal(refused.body.code, "IMPORT_INVALID")
+        assert.deepEqual(refused.body.problems.map((problem: { row: number; column: string }) => `${problem.row}:${problem.column}`), ["2:Title", "3:Image Src", "4:Variant Price", "4:Variant Price"])
+        assert.equal(await prisma.listing.count({ where: { userId: fixture.sellerId } }), before)
     })
 })
