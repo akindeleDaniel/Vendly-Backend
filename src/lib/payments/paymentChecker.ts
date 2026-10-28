@@ -6,6 +6,7 @@ import { remindAndCloseDeliveries } from "../deliveryClosing.js"
 import { expirePreOrders } from "../preOrders.js"
 import { purgeOldRefreshTokens } from "../sessions.js"
 import { sendCartReminders } from "../cartReminders.js"
+import { runHousekeeping } from "../housekeeping.js"
 import prisma from "../prisma.js"
 
 const checkIntervalMs = 5 * 60 * 1000
@@ -92,6 +93,7 @@ async function runBackgroundChecks(): Promise<void> {
         ["Delivery reminders failed", () => remindAndCloseDeliveries()],
         ["Pre-order expiry failed", () => expirePreOrders()],
         ["Cart reminders failed", () => sendCartReminders()],
+        ["Housekeeping failed", () => runHousekeeping()],
         ["Old login cleanup failed", async () => {
             await purgeOldRefreshTokens()
             await purgeStaleAccountRecords()

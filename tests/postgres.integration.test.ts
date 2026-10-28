@@ -29,6 +29,7 @@ import { waitForNotifications } from "../src/lib/notifications.js"
 import { recalculateRating } from "../src/lib/reviews.js"
 import { findStockAlerts } from "../src/lib/stockAlerts.js"
 import { sendCartReminders } from "../src/lib/cartReminders.js"
+import { cleanUpUnusedPhotos, cloudinaryPublicId, purgeAbandonedCheckouts, purgeOldPaymentEvents, setCloudinaryAdminForTesting, type CloudinaryPhoto } from "../src/lib/housekeeping.js"
 import { expirePreOrders } from "../src/lib/preOrders.js"
 import { remindAndCloseDeliveries } from "../src/lib/deliveryClosing.js"
 import { reviewSellerStanding } from "../src/lib/sellerStanding.js"
@@ -11328,5 +11329,189 @@ test("product pages carry the details Google reads for price, stock and stars, a
         assert.ok(script.includes("\\u003c/script>"))
         const shared = JSON.parse(script)
         assert.deepEqual([shared.name, shared.offers.lowPrice, shared.offers.highPrice], ["Gown </script><b>x</b>", "5000.00", "7000.00"])
+    })
+})
+
+// ---- Download my data, and delete my account ----
+
+test("a person can download everything StoreHatch holds about them, without any secrets", async () => {
+    await withPaymentCheckout("my-data", async (context) => {
+        const { fixture, request, baseUrl } = context
+        await payForCheckout(context)
+        const download = async (token: string) => {
+            const response = await fetch(`${baseUrl}/users/me/data`, { headers: { cookie: `token=${token}` } })
+            return { response, text: await response.text() }
+        }
+
+        const buyer = await download(fixture.token)
+        assert.equal(buyer.response.status, 200)
+        assert.match(buyer.response.headers.get("content-disposition") ?? "", /attachment; filename="storehatch-my-data-\d{4}-\d{2}-\d{2}\.json"/)
+        const data = JSON.parse(buyer.text)
+        const user = await prisma.user.findUniqueOrThrow({ where: { id: fixture.consumerId } })
+        assert.equal(data.account.email, user.email)
+        assert.equal(data.orders.length, 1)
+        assert.equal(data.orders[0].shops[0].items[0].quantity, 2)
+        assert.equal(data.orders[0].delivery.address, "1 Test Street")
+        assert.equal(data.seller, null)
+        for (const secret of ["passwordHash", "tokenHash", "integration-test-not-a-password"]) {
+            assert.equal(buyer.text.includes(secret), false, secret)
+        }
+
+        // A seller's file adds the shop, products and sales, with buyers by first name only.
+        const seller = JSON.parse((await download(fixture.sellerToken)).text)
+        assert.ok(seller.seller.shop.businessName)
+        assert.equal(seller.seller.products.some((product: { id: number }) => product.id === fixture.listingId), true)
+        assert.equal(seller.seller.sales.length, 1)
+        assert.equal(JSON.stringify(seller.seller.sales).includes("1 Test Street"), false)
+    })
+})
+
+test("deleting an account waits until nothing is open, then removes the person's details and keeps the records", async () => {
+    await withPaymentCheckout("delete-account", async (context) => {
+        const { fixture, request, checkoutId, adminToken } = context
+        const password = "a-long-delete-password"
+        await prisma.user.updateMany({ where: { id: { in: [fixture.consumerId, fixture.sellerId] } }, data: { passwordHash: await bcrypt.hash(password, 4) } })
+        const check = async (token: string) => (await request("GET", "/users/me/deletion-check", undefined, token)).body
+        const remove = (token: string, body: unknown = { password }) => request("POST", "/users/me/delete", body, token)
+
+        // An order on its way stops both the buyer and the seller; administrators cannot delete here.
+        const orderId = await payForCheckout(context)
+        assert.deepEqual((await check(fixture.token)).blockers.map((blocker: { code: string }) => blocker.code), ["ORDERS_ON_THE_WAY"])
+        assert.deepEqual((await check(fixture.sellerToken)).blockers.map((blocker: { code: string }) => blocker.code), ["ORDERS_TO_FULFIL"])
+        assert.equal((await check(adminToken)).blockers[0].code, "ADMIN_ACCOUNT")
+        const blocked = await remove(fixture.token)
+        assert.equal(blocked.status, 409)
+        assert.equal(blocked.body.code, "ACCOUNT_HAS_OPEN_ITEMS")
+
+        // The password is checked first; an account with no password must set one.
+        assert.equal((await remove(fixture.token, { password: "wrong-password" })).status, 400)
+        const googleOnly = await fixture.addConsumer(1)
+        await prisma.user.update({ where: { id: googleOnly.id }, data: { passwordHash: null } })
+        assert.equal((await remove(googleOnly.token)).body.code, "PASSWORD_REQUIRED")
+
+        // Once delivered, and reviewed, the buyer can delete.
+        await prisma.order.update({ where: { id: orderId }, data: { status: "DELIVERED", deliveryConfirmedAt: new Date() } })
+        assert.equal((await request("POST", `/orders/${checkoutId}/seller-orders/${orderId}/reviews`, { products: [{ listingId: fixture.listingId, rating: 5, comment: "Lovely" }] })).status, 201)
+        assert.deepEqual(await check(fixture.token), { canDelete: true, blockers: [] })
+        const deleted = await fetch(`${context.baseUrl}/users/me/delete`, { method: "POST", headers: { cookie: `token=${fixture.token}`, "content-type": "application/json" }, body: JSON.stringify({ password }) })
+        assert.equal(deleted.status, 200)
+        // The login cookies are cleared.
+        assert.ok(deleted.headers.getSetCookie().some((cookie) => cookie.startsWith("token=;")))
+
+        const gone = await prisma.user.findUniqueOrThrow({ where: { id: fixture.consumerId } })
+        assert.deepEqual([gone.name, gone.email, gone.passwordHash, gone.googleId], ["Deleted user", `deleted-${fixture.consumerId}@deleted.invalid`, null, null])
+        assert.ok(gone.deletedAt)
+        // The order and its money stay; the delivery details do not.
+        const order = await prisma.order.findUniqueOrThrow({ where: { id: orderId } })
+        assert.deepEqual([order.status, order.total.toFixed(2), order.deliveryName, order.deliveryPhone, order.deliveryAddress], ["DELIVERED", "3000.00", "Deleted user", "Removed", "Removed"])
+        assert.equal(await prisma.cart.count({ where: { userId: fixture.consumerId } }), 0)
+        // Every login has ended, and the review stays without a name.
+        assert.equal((await request("GET", "/users/check", undefined, fixture.token)).status, 401)
+        const reviews = (await request("GET", `/listings/${fixture.listingId}/reviews`)).body.reviews
+        assert.deepEqual(reviews.map((review: { reviewer: string; comment: string }) => [review.reviewer, review.comment]), [["A former buyer", "Lovely"]])
+
+        // The seller can then delete too: the shop closes and its products come off sale; its sales stay.
+        const profile = await prisma.sellerProfile.findUniqueOrThrow({ where: { userId: fixture.sellerId } })
+        await request("PATCH" as "GET", "/seller/profile", { whatsappNumber: "08031234567" }, fixture.sellerToken)
+        assert.equal((await remove(fixture.sellerToken)).status, 200)
+        assert.equal((await request("GET", `/seller/shop/${profile.slug}`)).status, 404)
+        const closed = await prisma.sellerProfile.findUniqueOrThrow({ where: { id: profile.id } })
+        assert.deepEqual([closed.whatsappNumber, closed.blockReason], [null, "Account deleted by its owner"])
+        assert.ok((await prisma.listing.findUniqueOrThrow({ where: { id: fixture.listingId } })).archivedAt)
+        assert.equal(await prisma.order.count({ where: { id: orderId } }), 1)
+    })
+})
+
+// ---- Housekeeping ----
+
+test("housekeeping removes checkouts that were never paid, a month on, and keeps every paid one", async () => {
+    await withPaymentCheckout("housekeeping-checkouts", async (context) => {
+        const { fixture, checkoutId, startPayment } = context
+        const monthAgo = new Date(Date.now() - 31 * 24 * 60 * 60 * 1000)
+
+        // A checkout someone started paying for and gave up on (the payment failed), and another never paid at all.
+        await startPayment()
+        assert.equal(await prisma.paymentAttempt.count({ where: { checkoutId } }), 1)
+        await prisma.paymentAttempt.updateMany({ where: { checkoutId }, data: { status: "FAILED" } })
+        const other = await fixture.addConsumer(1)
+        const unpaid = await fixture.createCheckout(other.token)
+        // A paid one from the same time.
+        const payer = await fixture.addConsumer(1)
+        const paidCheckout = await fixture.createCheckout(payer.token)
+        await prisma.checkout.update({ where: { id: paidCheckout }, data: { status: "COMPLETED" } })
+        await prisma.order.updateMany({ where: { checkoutId: paidCheckout }, data: { status: "PAID" } })
+
+        // Not yet a month old: nothing is removed.
+        await purgeAbandonedCheckouts()
+        assert.equal(await prisma.checkout.count({ where: { id: { in: [checkoutId, unpaid, paidCheckout] } } }), 3)
+
+        await prisma.checkout.updateMany({ where: { id: { in: [checkoutId, unpaid, paidCheckout] } }, data: { createdAt: monthAgo, status: "EXPIRED" } })
+        await prisma.checkout.update({ where: { id: paidCheckout }, data: { status: "COMPLETED" } })
+        await purgeAbandonedCheckouts()
+        assert.deepEqual((await prisma.checkout.findMany({ where: { id: { in: [checkoutId, unpaid, paidCheckout] } }, select: { id: true } })).map((checkout) => checkout.id), [paidCheckout])
+        assert.equal(await prisma.order.count({ where: { checkoutId: { in: [checkoutId, unpaid] } } }), 0)
+        assert.equal(await prisma.inventoryReservation.count({ where: { checkoutId: { in: [checkoutId, unpaid] } } }), 0)
+        assert.equal(await prisma.paymentAttempt.count({ where: { checkoutId } }), 0)
+        assert.equal(await prisma.order.count({ where: { checkoutId: paidCheckout } }), 1)
+    })
+})
+
+test("housekeeping clears old payment notification logs that were handled", async () => {
+    const old = new Date(Date.now() - 91 * 24 * 60 * 60 * 1000)
+    const key = randomUUID()
+    await prisma.paymentEvent.createMany({ data: [
+        { provider: "PAYSTACK", eventKey: `${key}-old`, eventType: "charge.success", receivedAt: old, processedAt: old },
+        { provider: "PAYSTACK", eventKey: `${key}-unhandled`, eventType: "charge.success", receivedAt: old, processedAt: null },
+        { provider: "PAYSTACK", eventKey: `${key}-recent`, eventType: "charge.success", processedAt: new Date() }
+    ] })
+
+    try {
+        await purgeOldPaymentEvents()
+        const left = await prisma.paymentEvent.findMany({ where: { eventKey: { startsWith: key } }, select: { eventKey: true }, orderBy: { eventKey: "asc" } })
+        assert.deepEqual(left.map((event) => event.eventKey), [`${key}-recent`, `${key}-unhandled`])
+    } finally {
+        await prisma.paymentEvent.deleteMany({ where: { eventKey: { startsWith: key } } })
+    }
+})
+
+test("housekeeping deletes Cloudinary photos nobody uses, once a day, and never one that is used or still new", async () => {
+    await withPaymentCheckout("housekeeping-photos", async (context) => {
+        const { fixture } = context
+        const day = 24 * 60 * 60 * 1000
+        const url = (id: string) => `https://res.cloudinary.com/demo/image/upload/v1712345678/${id}.jpg`
+        assert.equal(cloudinaryPublicId("https://res.cloudinary.com/demo/image/upload/c_fill,w_400/v17/shops/ankara%20set.jpg"), "shops/ankara set")
+        assert.equal(cloudinaryPublicId("https://img.example.test/a.jpg"), null)
+
+        // In use: a product photo, a review photo. Not in use: an old photo, and a new one (it may still be saved).
+        const used = `storehatch/used-${randomUUID()}`
+        const reviewPhoto = `storehatch/review-${randomUUID()}`
+        await prisma.listing.update({ where: { id: fixture.listingId }, data: { imageUrl: url(used) } })
+        const orderId = await payForCheckout(context)
+        const reviewers = await addOtherReviewers(context, orderId, [5])
+        await prisma.productReview.updateMany({ where: { buyerId: reviewers[0]!.id }, data: { photoUrls: [url(reviewPhoto)] } })
+        const photos: CloudinaryPhoto[] = [
+            { publicId: used, createdAt: new Date(Date.now() - 30 * day) },
+            { publicId: reviewPhoto, createdAt: new Date(Date.now() - 30 * day) },
+            { publicId: "storehatch/never-saved", createdAt: new Date(Date.now() - 8 * day) },
+            { publicId: "storehatch/just-uploaded", createdAt: new Date(Date.now() - day) }
+        ]
+        const deleted: string[] = []
+        setCloudinaryAdminForTesting({
+            listPhotos: async (cursor) => cursor === null ? { photos: photos.slice(0, 2), nextCursor: "page-2" } : { photos: photos.slice(2), nextCursor: null },
+            deletePhotos: async (ids) => { deleted.push(...ids) }
+        })
+
+        try {
+            assert.equal(await cleanUpUnusedPhotos(), 1)
+            assert.deepEqual(deleted, ["storehatch/never-saved"])
+            // Once a day only.
+            assert.equal(await cleanUpUnusedPhotos(), null)
+        } finally {
+            setCloudinaryAdminForTesting(null)
+            await removeUsers(reviewers)
+        }
+
+        // Off unless switched on in .env: with no admin keys it does nothing.
+        assert.equal(await cleanUpUnusedPhotos(), null)
     })
 })
