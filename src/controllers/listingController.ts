@@ -24,9 +24,10 @@ const ownedByOptionsMessage = "This is one choice of a product. Change its title
 
 // A listing as the API returns it, with its photos, its rating and its options. A product with options shows its lowest
 // price and its total stock; the options themselves (with the listingId to put in the cart) are in `options`.
-async function detailedListing<T extends { id: number; imageUrl: string; images: Array<{ url: string }>; ratingSum: number; ratingCount: number; price: number; stockQuantity: number }>(listing: T) {
+// forSeller adds each option's low-stock alert number, for the seller's own responses only.
+async function detailedListing<T extends { id: number; imageUrl: string; images: Array<{ url: string }>; ratingSum: number; ratingCount: number; price: number; stockQuantity: number }>(listing: T, forSeller = true) {
     const choices = (await loadChoices([listing.id])).get(listing.id)
-    return { ...withOptionSummary(withImages(listing), choices), options: optionTree(choices) }
+    return { ...withOptionSummary(withImages(listing), choices), options: optionTree(choices, forSeller) }
 }
 
 // The text fields that were given must be text of a sensible size, and the image must be an https link.
@@ -199,7 +200,7 @@ export const getListingById  = async (req:Request, res:Response) =>{
     // The same shape as the list, so a product page can name the seller and link to the shop.
     // The seller's account id is not part of it.
     // The seller's own low-stock setting is not for shoppers either.
-    const {user, userId: _sellerAccountId, lowStockThreshold: _lowStockThreshold, ...listing} = await detailedListing(specificData)
+    const {user, userId: _sellerAccountId, lowStockThreshold: _lowStockThreshold, ...listing} = await detailedListing(specificData, false)
     const [delivered, trust] = await Promise.all([confirmedDeliveriesFor([specificData.id]), shopTrustFor([specificData.userId])])
     const shareUrl = productShareUrl(specificData.id)
     // Opened from one choice of a product, the message names that choice and its price.
@@ -589,7 +590,7 @@ export const getMyListings = async(req:Request, res:Response) =>{
         const shop = await prisma.sellerProfile.findUnique({ where: { userId: id }, select: { lowStockThreshold: true } })
         res.send(listings.map((listing) => ({
             ...withOptionSummary(withImages(listing), choices.get(listing.id)),
-            options: optionTree(choices.get(listing.id)),
+            options: optionTree(choices.get(listing.id), true),
             ...stockView(listing, choices.get(listing.id), shop?.lowStockThreshold),
             // For a draft: what it still needs before it can be published.
             ...(listing.isDraft ? { draftMissing: draftProblems(listing).map((problem) => problem.field) } : {})

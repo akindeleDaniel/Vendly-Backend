@@ -11164,6 +11164,56 @@ test("quick edit gives every size of an option the same new price, and the produ
     })
 })
 
+test("options and sizes keep their own low-stock alert numbers, shown only to the seller", async () => {
+    await withPaymentCheckout("option-alerts", async (context) => {
+        const { fixture, request } = context
+        const created = await request("POST", "/listings", {
+            title: "Alert hoodie", description: "Soft", price: 5000, category: "Electronics",
+            imageUrls: ["https://img.example.test/alert-hoodie.jpg"],
+            options: [
+                { label: "Blue", stockQuantity: 9, lowStockThreshold: 2 },
+                { label: "Black", sizes: [{ label: "M", stockQuantity: 9, lowStockThreshold: 5 }, { label: "L", stockQuantity: 9 }] }
+            ]
+        }, fixture.sellerToken)
+        assert.equal(created.status, 201)
+        const product = created.body
+        const [medium, large] = product.options[1].sizes.map((size: { listingId: number }) => size.listingId) as [number, number]
+        const alerts = (options: Array<{ lowStockThreshold?: number | null; sizes: Array<{ lowStockThreshold?: number | null }> }>) =>
+            options.map((option) => option.sizes.length > 0 ? option.sizes.map((size) => size.lowStockThreshold) : option.lowStockThreshold)
+        assert.deepEqual(alerts(product.options), [2, [5, null]])
+
+        // The seller's list shows them; the public product page does not.
+        const mine = (await request("GET", "/listings/Mylisting", undefined, fixture.sellerToken)).body.find((listing: { id: number }) => listing.id === product.id)
+        assert.deepEqual(alerts(mine.options), [2, [5, null]])
+        const shown = (await request("GET", `/listings/${product.id}`)).body
+        assert.equal(JSON.stringify(shown.options).includes("lowStockThreshold"), false)
+
+        // Saving the options without alert numbers keeps them; null goes back to the product's number.
+        const resaved = await request("PUT", `/listings/${product.id}/options`, {
+            options: [
+                { label: "Blue", price: 5000, stockQuantity: 9 },
+                { label: "Black", price: 5000, sizes: [{ label: "M", stockQuantity: 9, lowStockThreshold: null }, { label: "L", stockQuantity: 9, lowStockThreshold: 0 }] }
+            ]
+        }, fixture.sellerToken)
+        assert.equal(resaved.status, 200)
+        assert.deepEqual(alerts(resaved.body.options), [2, [null, 0]])
+
+        // An option with sizes takes its alert numbers on each size; numbers must be sensible.
+        for (const options of [
+            [{ label: "Black", sizes: [{ label: "M", stockQuantity: 1 }], lowStockThreshold: 3 }],
+            [{ label: "Blue", stockQuantity: 1, lowStockThreshold: -1 }],
+            [{ label: "Black", sizes: [{ label: "M", stockQuantity: 1, lowStockThreshold: "3" }] }]
+        ]) {
+            assert.equal((await request("PUT", `/listings/${product.id}/options`, { options }, fixture.sellerToken)).status, 400)
+        }
+
+        // Quick edit on one size changes that size only.
+        assert.equal((await request("PATCH" as "GET", "/listings/bulk", { changes: [{ listingId: medium, lowStockThreshold: 7 }] }, fixture.sellerToken)).status, 200)
+        const rows = await prisma.listing.findMany({ where: { id: { in: [medium, large] } }, orderBy: { id: "asc" } })
+        assert.deepEqual(rows.map((row) => [row.id, row.lowStockThreshold]), [[medium, 7], [large, 0]].sort((left, right) => left[0]! - right[0]!))
+    })
+})
+
 // ---- Administrators do not shop or sell ----
 
 test("an administrator account cannot shop, sell or open a shop", async () => {

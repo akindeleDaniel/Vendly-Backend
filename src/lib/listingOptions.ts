@@ -2,6 +2,7 @@ import prisma from "./prisma.js"
 import type { Prisma } from "../generated/prisma/client.js"
 import { heldReservationConditions } from "./inventoryReservations.js"
 import { isHttpsUrl, maximumStockQuantity, priceProblem } from "./inputRules.js"
+import { lowStockThresholdProblem, parseLowStockThreshold } from "./stockAlerts.js"
 
 // Options of a product, for example colour and then size. A listing can have none (it then works exactly as it
 // always has), or a list of options, each with its own price and optional photo. An option either has sizes, each
@@ -27,7 +28,9 @@ export type OptionInput = {
     imageUrl: string | null
     // Set when the option has no sizes.
     stockQuantity: number | null
-    sizes: Array<{ label: string; stockQuantity: number }>
+    // The option's own low-stock alert number when it has no sizes: undefined leaves it as it is, null uses the product's.
+    lowStockThreshold?: number | null | undefined
+    sizes: Array<{ label: string; stockQuantity: number; lowStockThreshold?: number | null | undefined }>
 }
 
 function stockProblem(value: unknown): string | null {
@@ -133,14 +136,29 @@ export function readOptions(value: unknown, defaultPrice: number): OptionInput[]
                 return { error: `Option "${label}", size "${sizeLabel}": ${problem}` }
             }
 
-            sizes.push({ label: sizeLabel, stockQuantity: size.stockQuantity as number })
+            const sizeThreshold = parseLowStockThreshold(size.lowStockThreshold, true)
+
+            if (sizeThreshold === "invalid") {
+                return { error: `Option "${label}", size "${sizeLabel}": ${lowStockThresholdProblem}` }
+            }
+
+            sizes.push({ label: sizeLabel, stockQuantity: size.stockQuantity as number, lowStockThreshold: sizeThreshold })
         }
 
         let stockQuantity: number | null = null
+        const threshold = parseLowStockThreshold(item.lowStockThreshold, true)
+
+        if (threshold === "invalid") {
+            return { error: `Option "${label}": ${lowStockThresholdProblem}` }
+        }
 
         if (sizes.length > 0) {
             if (item.stockQuantity !== undefined && item.stockQuantity !== null) {
                 return { error: `Option "${label}" has sizes, so give the stock on each size and not on the option` }
+            }
+
+            if (threshold !== undefined) {
+                return { error: `Option "${label}" has sizes, so give the low-stock alert on each size and not on the option` }
             }
         } else {
             const problem = stockProblem(item.stockQuantity)
@@ -153,7 +171,7 @@ export function readOptions(value: unknown, defaultPrice: number): OptionInput[]
         }
 
         choices += Math.max(sizes.length, 1)
-        options.push({ label, price, imageUrl: typeof item.imageUrl === "string" ? item.imageUrl : null, stockQuantity, sizes })
+        options.push({ label, price, imageUrl: typeof item.imageUrl === "string" ? item.imageUrl : null, stockQuantity, lowStockThreshold: threshold, sizes })
     }
 
     return choices > maximumOptionChoices ? { error: `A product can have at most ${maximumOptionChoices} things to choose between in total` } : options
@@ -182,8 +200,8 @@ export async function syncListingOptions(tx: Prisma.TransactionClient, parent: P
 
     for (const [optionIndex, option] of options.entries()) {
         const choices = option.sizes.length > 0
-            ? option.sizes.map((size) => ({ size: size.label as string | null, stockQuantity: size.stockQuantity }))
-            : [{ size: null as string | null, stockQuantity: option.stockQuantity ?? 0 }]
+            ? option.sizes.map((size) => ({ size: size.label as string | null, stockQuantity: size.stockQuantity, lowStockThreshold: size.lowStockThreshold }))
+            : [{ size: null as string | null, stockQuantity: option.stockQuantity ?? 0, lowStockThreshold: option.lowStockThreshold }]
 
         for (const [sizeIndex, choice] of choices.entries()) {
             const data = {
@@ -196,7 +214,9 @@ export async function syncListingOptions(tx: Prisma.TransactionClient, parent: P
                 optionLabel: option.label,
                 sizeLabel: choice.size,
                 position: optionIndex * 1000 + sizeIndex,
-                archivedAt: hiddenAt
+                archivedAt: hiddenAt,
+                // Left out when not given, so an alert number set earlier stays.
+                ...(choice.lowStockThreshold !== undefined ? { lowStockThreshold: choice.lowStockThreshold } : {})
             }
             const row = byKey.get(choiceKey(option.label, choice.size))
 
@@ -305,15 +325,16 @@ export function withOptionSummary<T extends { price: number; stockQuantity: numb
 }
 
 // The options as the product page needs them. listingId is what goes in the cart (the option itself when it has
-// no sizes, otherwise each size).
-export function optionTree(choices: ChoiceRow[] | undefined) {
+// no sizes, otherwise each size). The seller's own views also get each choice's low-stock alert number.
+export function optionTree(choices: ChoiceRow[] | undefined, forSeller = false) {
     const tree: Array<{
         label: string
         price: number
         imageUrl: string
         listingId: number | null
         stockQuantity: number | null
-        sizes: Array<{ label: string; listingId: number; stockQuantity: number }>
+        lowStockThreshold?: number | null
+        sizes: Array<{ label: string; listingId: number; stockQuantity: number; lowStockThreshold?: number | null }>
     }> = []
 
     for (const choice of choices ?? []) {
@@ -324,11 +345,14 @@ export function optionTree(choices: ChoiceRow[] | undefined) {
             tree.push(option)
         }
 
+        const alert = forSeller ? { lowStockThreshold: choice.lowStockThreshold } : {}
+
         if (choice.sizeLabel === null) {
             option.listingId = choice.id
             option.stockQuantity = choice.stockQuantity
+            Object.assign(option, alert)
         } else {
-            option.sizes.push({ label: choice.sizeLabel, listingId: choice.id, stockQuantity: choice.stockQuantity })
+            option.sizes.push({ label: choice.sizeLabel, listingId: choice.id, stockQuantity: choice.stockQuantity, ...alert })
         }
     }
 
