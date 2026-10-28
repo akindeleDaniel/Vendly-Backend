@@ -10871,3 +10871,55 @@ test("the sales summary shows a period's sales, the period before, top products,
         await prisma.orderItem.updateMany({ where: { orderId }, data: { listingId: fixture.listingId } })
     })
 })
+
+// ---- Spreadsheet export of the seller's orders ----
+
+test("a seller can download their paid orders as a spreadsheet, safely and without buyers' contact details", async () => {
+    await withPaymentCheckout("orders-export", async (context) => {
+        const { fixture, request, baseUrl } = context
+        const download = (query = "", token = fixture.sellerToken) => fetch(`${baseUrl}/seller/orders/export${query}`, { headers: { cookie: `token=${token}` } })
+        const lagosToday = new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 10)
+
+        // Unpaid orders are not in it: just the column names.
+        const before = await download()
+        assert.equal(before.status, 200)
+        assert.match(before.headers.get("content-type") ?? "", /text\/csv/)
+        // Starts with the UTF-8 byte-order mark (reading it as text drops the mark), then the column names.
+        const bytes = new Uint8Array(await before.arrayBuffer())
+        assert.deepEqual([...bytes.slice(0, 3)], [0xef, 0xbb, 0xbf])
+        const beforeText = new TextDecoder().decode(bytes)
+        assert.ok(beforeText.startsWith("Order,Date,Status,"))
+        assert.equal(beforeText.trim().split("\r\n").length, 1)
+
+        // One paid order. A title or name that a spreadsheet would run as a formula is kept as plain text.
+        const orderId = await payForCheckout(context)
+        await prisma.orderItem.updateMany({ where: { orderId }, data: { title: "=HYPERLINK(\"http://evil.example\",\"Click\")" } })
+        const order = await prisma.order.update({ where: { id: orderId }, data: { deliveryName: "+Ada Obi" } })
+        const response = await download()
+        assert.match(response.headers.get("content-disposition") ?? "", new RegExp(`attachment; filename="storehatch-orders-.*-to-${lagosToday}\\.csv"`))
+        const lines = (await response.text()).replace(/^\uFEFF/, "").trim().split("\r\n")
+        assert.equal(lines.length, 2)
+        const header = lines[0]!.split(",")
+        assert.deepEqual(header.slice(0, 6), ["Order", "Date", "Status", "Type", "Ready at", "Items"])
+        const row = lines[1]!
+        assert.ok(row.startsWith(`${orderId},`))
+        assert.match(row, /,Paid, to ship,|,"Paid, to ship",/)
+        // The items cell starts with the quantity, so it cannot run; its quotes and commas are escaped.
+        assert.ok(row.includes('"2 x =HYPERLINK(""http://evil.example"",""Click"") @ 1500.00"'), row)
+        assert.ok(row.includes(",3000.00,"))
+        assert.ok(row.includes(",'+Ada,"), row)
+        // No phone number or street address.
+        assert.equal(row.includes(order.deliveryPhone), false)
+        assert.equal(row.includes(order.deliveryAddress), false)
+
+        // Another seller's download does not include it; buyers cannot download; dates are checked.
+        await withStrangerSeller(async (stranger) => {
+            assert.equal((await (await download("", stranger)).text()).trim().split("\r\n").length, 1)
+        })
+        assert.equal((await download("", fixture.token)).status, 403)
+        assert.equal((await download("?from=2026-02-30")).status, 400)
+        const outside = await download("?from=2026-01-01&to=2026-01-31")
+        assert.equal((await outside.text()).trim().split("\r\n").length, 1)
+        assert.equal((await request("GET", "/seller/orders/export?from=2025-01-01&to=2026-06-01", undefined, fixture.sellerToken)).status, 400)
+    })
+})

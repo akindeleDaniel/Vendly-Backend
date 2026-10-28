@@ -129,6 +129,33 @@ function addDays(day: string, days: number): string {
     return new Date(new Date(`${day}T00:00:00.000Z`).getTime() + days * dayMs).toISOString().slice(0, 10)
 }
 
+export type LagosPeriod = { from: string; to: string; days: number; start: Date; end: Date }
+
+// Reads ?from=&to= as Nigerian calendar days (default: the last 30 days up to today, at most 366 days).
+export function readLagosPeriod(query: { from?: unknown; to?: unknown }): LagosPeriod | { error: string } {
+    const fromDate = parseDate(query.from)
+    const toDate = parseDate(query.to)
+
+    if (fromDate === null || toDate === null) {
+        return { error: "Dates must be written as YYYY-MM-DD" }
+    }
+
+    const to = toDate ? toDate.toISOString().slice(0, 10) : lagosToday()
+    const from = fromDate ? fromDate.toISOString().slice(0, 10) : addDays(to, -(defaultSummaryDays - 1))
+
+    if (from > to) {
+        return { error: "The start date must not be after the end date" }
+    }
+
+    const days = Math.round((Date.parse(to) - Date.parse(from)) / dayMs) + 1
+
+    if (days > maximumSummaryDays) {
+        return { error: `Choose a period of at most ${maximumSummaryDays} days` }
+    }
+
+    return { from, to, days, start: lagosDayStart(from), end: lagosDayStart(addDays(to, 1)) }
+}
+
 async function periodTotals(sellerId: number, start: Date, end: Date) {
     const where: Prisma.OrderWhereInput = { sellerId, status: { in: paidStatuses }, createdAt: { gte: start, lt: end } }
     const [orders, items, customers] = await Promise.all([
@@ -162,31 +189,14 @@ async function periodTotals(sellerId: number, start: Date, end: Date) {
 // down), the best-selling products, sales for each day, and what needs the seller's attention now.
 export const getMySalesSummary = async (req: Request, res: Response) => {
     const sellerId = req.user!.id
-    const fromDate = parseDate(req.query.from)
-    const toDate = parseDate(req.query.to)
+    const period = readLagosPeriod(req.query)
 
-    if (fromDate === null || toDate === null) {
-        res.status(400).send({ message: "Dates must be written as YYYY-MM-DD" })
+    if ("error" in period) {
+        res.status(400).send({ message: period.error })
         return
     }
 
-    const to = toDate ? toDate.toISOString().slice(0, 10) : lagosToday()
-    const from = fromDate ? fromDate.toISOString().slice(0, 10) : addDays(to, -(defaultSummaryDays - 1))
-
-    if (from > to) {
-        res.status(400).send({ message: "The start date must not be after the end date" })
-        return
-    }
-
-    const days = Math.round((Date.parse(to) - Date.parse(from)) / dayMs) + 1
-
-    if (days > maximumSummaryDays) {
-        res.status(400).send({ message: `Choose a period of at most ${maximumSummaryDays} days` })
-        return
-    }
-
-    const start = lagosDayStart(from)
-    const end = lagosDayStart(addDays(to, 1))
+    const { from, to, days, start, end } = period
     const previousStart = lagosDayStart(addDays(from, -days))
     const now = new Date()
 
